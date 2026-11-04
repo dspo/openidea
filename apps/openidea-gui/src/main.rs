@@ -24,7 +24,7 @@ use gpui_kit_assets::AllAssets;
 
 use crate::bus::Bus;
 use crate::host::Host;
-use crate::workbench::{CloseTab, OpenFile, Quit, Save, Workbench};
+use crate::workbench::{CloseTab, OpenFile, Quit, Redo, Save, Undo, Workbench};
 
 const WINDOW_WIDTH: f32 = 1200.0;
 const WINDOW_HEIGHT: f32 = 800.0;
@@ -60,6 +60,8 @@ fn main() {
                 KeyBinding::new("cmd-o", OpenFile, None),
                 KeyBinding::new("cmd-s", Save, None),
                 KeyBinding::new("cmd-w", CloseTab, None),
+                KeyBinding::new("cmd-z", Undo, None),
+                KeyBinding::new("shift-cmd-z", Redo, None),
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
             let (bus, rx) = Bus::channel();
