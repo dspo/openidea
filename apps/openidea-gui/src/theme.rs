@@ -23,6 +23,9 @@ pub const FONT_SIZE: f32 = 14.0;
 pub const LINE_HEIGHT: f32 = 1.5;
 /// Inset between the editor element bounds and the text.
 pub const TEXT_INSET: f32 = 16.0;
+/// Gutter paddings: element edge to line numbers, numbers to the text area.
+pub const GUTTER_PAD_L: f32 = 12.0;
+pub const GUTTER_PAD_R: f32 = 14.0;
 
 pub fn app_bg() -> gpui::Hsla {
     rgba((BG_APP << 8) | 0xff).into()
