@@ -29,9 +29,9 @@ use gpui_kit_assets::AllAssets;
 use crate::actions::{
     Cancel, CloseTab, Commit, CursorDocEnd, CursorDocStart, CursorDown, CursorLeft, CursorLineEnd, CursorLineHome,
     CursorRight, CursorUp, CursorWordLeft, CursorWordRight, DeleteBackward, DeleteForward, DeleteWordBackward,
-    DeleteWordForward, FindUsages, GoToFile, GotoDefinition, Newline, OpenFile, Paste, Quit, Redo, Rename, Run, Save,
-    SelectDocEnd, SelectDocStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineHome, SelectRight, SelectUp,
-    SelectWordLeft, SelectWordRight, ShowDiff, StopRun, TogglePerfHud, Undo,
+    DeleteWordForward, FindUsages, GoToFile, GotoDefinition, Newline, OpenFile, OutdentLine, Paste, Quit, Redo, Rename,
+    Run, Save, SelectDocEnd, SelectDocStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineHome, SelectRight,
+    SelectUp, SelectWordLeft, SelectWordRight, ShowDiff, StopRun, TabIndent, TogglePerfHud, Undo,
 };
 use crate::actions::{SelectNext, SelectPrev};
 use crate::bus::Bus;
@@ -125,6 +125,9 @@ fn main() {
                     KeyBinding::new("delete", DeleteForward, Some("Editor")),
                     KeyBinding::new("alt-backspace", DeleteWordBackward, Some("Editor")),
                     KeyBinding::new("alt-delete", DeleteWordForward, Some("Editor")),
+                    // M5: language-driven indentation (tab / shift-tab).
+                    KeyBinding::new("tab", TabIndent, Some("Editor")),
+                    KeyBinding::new("shift-tab", OutdentLine, Some("Editor")),
                     // Paste rides the editor context (the gpui-component inputs
                     // keep their own clipboard handling).
                     KeyBinding::new("cmd-v", Paste, Some("Editor")),
