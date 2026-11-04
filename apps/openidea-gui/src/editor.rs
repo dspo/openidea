@@ -27,7 +27,9 @@ use gpui::{
 };
 use ide_core::{ChangeSet, DocId, TextChange};
 use ide_workspace::DocumentInfo;
+use tree_sitter::Tree;
 
+use crate::highlight::{Highlighter, Kind, ParseResult, input_edit};
 use crate::host::Host;
 use crate::theme;
 
@@ -236,6 +238,21 @@ pub struct EditorPane {
     /// Top visible line, in lines (clamped on use).
     scroll: Cell<f32>,
     focused_once: Cell<bool>,
+    /// Syntax highlighting (phase 3): the query, the incrementally parsed
+    /// tree, and the whole-document spans the paint path slices per line.
+    highlighter: Option<Arc<Highlighter>>,
+    language: ide_core::LanguageId,
+    large: bool,
+    tree: Option<Tree>,
+    spans: Vec<(Range<usize>, Kind)>,
+    parse_in_flight: bool,
+    /// An edit landed while a parse ran; reschedule when it lands.
+    parse_dirty: bool,
+    /// Edits that landed while the tree was handed to an in-flight parse.
+    pending_edits: Vec<ide_text::ByteEdit>,
+    /// Bumped when the buffer is replaced wholesale; landed parses from an
+    /// older generation are dropped.
+    parse_generation: u32,
 }
 
 impl Focusable for EditorPane {
@@ -246,7 +263,8 @@ impl Focusable for EditorPane {
 
 impl EditorPane {
     pub fn new(host: Arc<Host>, info: DocumentInfo, cx: &mut gpui::Context<Self>) -> Self {
-        Self {
+        let language = info.language.clone();
+        let mut pane = Self {
             host,
             doc_id: info.id,
             buf: Buffer::new(&info.text),
@@ -254,6 +272,98 @@ impl EditorPane {
             geometry: Cell::new(None),
             scroll: Cell::new(0.0),
             focused_once: Cell::new(false),
+            highlighter: None,
+            language,
+            large: info.large,
+            tree: None,
+            spans: Vec::new(),
+            parse_in_flight: false,
+            parse_dirty: false,
+            pending_edits: Vec::new(),
+            parse_generation: 0,
+        };
+        pane.start_syntax(cx);
+        pane
+    }
+
+    /// Starts syntax highlighting when the language has a bundled grammar and
+    /// the file is not flagged large.
+    fn start_syntax(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.large {
+            return;
+        }
+        let Some(highlighter) = Highlighter::for_language(&self.language) else { return };
+        self.highlighter = Some(highlighter.clone());
+        self.schedule_parse(highlighter, cx);
+    }
+
+    /// Schedules an incremental re-parse on the background executor. The tree
+    /// is handed to the parse as its incremental base; edits landing mid-parse
+    /// are journalled in `pending_edits` and folded into the fresh tree when
+    /// it lands.
+    fn schedule_parse(&mut self, highlighter: Arc<Highlighter>, cx: &mut gpui::Context<Self>) {
+        if self.parse_in_flight {
+            self.parse_dirty = true;
+            return;
+        }
+        self.parse_in_flight = true;
+        let rope = self.buf.doc.rope().clone();
+        let old_tree = self.tree.take();
+        let version = self.buf.doc.version();
+        let generation = self.parse_generation;
+        cx.spawn(async move |this, cx| {
+            let parsed = cx
+                .background_executor()
+                .spawn(async move { highlighter.parse(&rope.to_string(), old_tree.as_ref(), version) })
+                .await;
+            let _ = this.update(cx, |pane, cx| pane.tree_swapped(parsed, version, generation, cx));
+        })
+        .detach();
+    }
+
+    /// Lands a finished parse: folds the journalled edits into the fresh tree
+    /// (which may then be edited further), keeps its spans, and re-schedules
+    /// when edits queued behind it. Results from an older generation (the
+    /// buffer was replaced wholesale) are dropped.
+    fn tree_swapped(
+        &mut self,
+        parsed: Option<ParseResult>,
+        _parsed_for: u32,
+        generation: u32,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.parse_in_flight = false;
+        if generation == self.parse_generation
+            && let (Some((tree, spans, _)), None) = (parsed, self.tree.as_ref())
+        {
+            let mut tree = tree;
+            for edit in self.pending_edits.drain(..) {
+                tree.edit(&input_edit(&edit));
+            }
+            self.tree = Some(tree);
+            self.spans = spans;
+        }
+        if self.parse_dirty {
+            self.parse_dirty = false;
+            if let Some(highlighter) = self.highlighter.clone() {
+                self.schedule_parse(highlighter, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Applies byte-coordinate edits to the syntax tree and schedules an
+    /// incremental re-parse.
+    fn after_edits(&mut self, byte_edits: &[ide_text::ByteEdit], cx: &mut gpui::Context<Self>) {
+        if let Some(tree) = &mut self.tree {
+            for edit in byte_edits {
+                tree.edit(&input_edit(edit));
+            }
+        } else if self.parse_in_flight {
+            self.pending_edits.extend_from_slice(byte_edits);
+        }
+        if let Some(highlighter) = self.highlighter.clone() {
+            self.schedule_parse(highlighter, cx);
         }
     }
 
@@ -263,13 +373,18 @@ impl EditorPane {
     fn edit(&mut self, change: TextChange, cx: &mut gpui::Context<Self>) {
         let version = self.buf.doc.version();
         let set = ChangeSet { changes: vec![change] };
-        if let Err(e) = self.buf.doc.apply_detailed(version, &set) {
-            eprintln!("[editor] local apply failed: {}", e.message);
-            return;
-        }
+        let byte_edits = match self.buf.doc.apply_detailed(version, &set) {
+            Ok((_, byte_edits)) => byte_edits,
+            Err(e) => {
+                eprintln!("[editor] local apply failed: {}", e.message);
+                return;
+            }
+        };
         if let Err(e) = self.host.edit(self.doc_id, version, set) {
             eprintln!("[editor] backend rejected the edit ({}); resyncing", e.message);
-            self.resync();
+            self.resync(cx);
+        } else {
+            self.after_edits(&byte_edits, cx);
         }
         self.clamp_scroll_to_caret();
         cx.notify();
@@ -282,24 +397,34 @@ impl EditorPane {
     pub fn backend_patched(&mut self, base_version: u32, changes: Vec<TextChange>, cx: &mut gpui::Context<Self>) {
         if self.buf.doc.version() == base_version {
             match self.buf.doc.apply_detailed(base_version, &ChangeSet { changes }) {
-                Ok(_) => {
+                Ok((_, byte_edits)) => {
                     self.buf.marked = None;
                     self.buf.caret = self.buf.caret.min(self.buf.utf16_len());
                     self.clamp_scroll();
+                    self.after_edits(&byte_edits, cx);
                 }
-                Err(_) => self.resync(),
+                Err(_) => self.resync(cx),
             }
         } else {
-            self.resync();
+            self.resync(cx);
         }
         cx.notify();
     }
 
     /// Replaces the buffer from the backend's snapshot (out-of-sync recovery).
-    fn resync(&mut self) {
+    fn resync(&mut self, cx: &mut gpui::Context<Self>) {
         if let Ok(info) = self.host.snapshot(self.doc_id) {
             self.buf = Buffer::new(&info.text);
             self.scroll.set(0.0);
+            // The old tree and its queued edits describe text that no longer
+            // exists anywhere; the in-flight parse (if any) is invalidated.
+            self.parse_generation += 1;
+            self.tree = None;
+            self.spans.clear();
+            self.pending_edits.clear();
+            if let Some(highlighter) = self.highlighter.clone() {
+                self.schedule_parse(highlighter, cx);
+            }
         }
     }
 
@@ -436,35 +561,90 @@ struct PrepaintState {
     numbers_w: Pixels,
 }
 
-/// The text runs for one visible line: committed text plain; the marked
-/// range's intersection with the line gets a distinct background and an
-/// accent underline. `marked` is a buffer-wide UTF-16 range, `span` the
-/// line's.
-fn line_runs(line: &str, marked: Option<Range<usize>>, span: Range<usize>, fg: gpui::Hsla) -> Vec<TextRun> {
-    let relative = marked.map(|marked| {
-        let start = marked.start.clamp(span.start, span.end) - span.start;
-        let end = marked.end.clamp(span.start, span.end) - span.start;
-        start..end
-    });
-    let Some(relative) = relative.filter(|r| r.start < r.end) else {
-        return vec![plain_run(line.len(), fg)];
-    };
-    let start = byte_at_utf16(line, relative.start);
-    let end = byte_at_utf16(line, relative.end);
-    let mut runs = Vec::with_capacity(3);
-    if start > 0 {
-        runs.push(plain_run(start, fg));
-    }
-    runs.push(TextRun {
-        len: end - start,
+fn text_run(range: Range<usize>, color: gpui::Hsla) -> TextRun {
+    TextRun {
+        len: range.len(),
         font: theme::font(),
-        color: fg,
-        background_color: Some(rgba_of(theme::MARKED_BG).into()),
-        underline: Some(UnderlineStyle { thickness: px(1.0), color: Some(rgba_of(theme::ACCENT).into()), wavy: false }),
+        color,
+        background_color: None,
+        underline: None,
         strikethrough: None,
-    });
-    if end < line.len() {
-        runs.push(plain_run(line.len() - end, fg));
+    }
+}
+
+/// The text runs for one visible line. Syntax spans (byte ranges of the whole
+/// document) are sliced onto the line; the marked range's intersection keeps
+/// the M0 composition style (tinted background + accent underline) and
+/// overrides highlighting on its line.
+fn line_runs(
+    line: &str,
+    span: Range<usize>,
+    marked: Option<Range<usize>>,
+    line_start_byte: usize,
+    spans: &[(Range<usize>, Kind)],
+    fg: gpui::Hsla,
+) -> Vec<TextRun> {
+    let len = line.len();
+    if let Some(marked) = marked
+        && marked.start < span.end
+        && marked.end > span.start
+    {
+        let mut runs = vec![plain_run(len, fg)];
+        let relative =
+            marked.start.clamp(span.start, span.end) - span.start..marked.end.clamp(span.start, span.end) - span.start;
+        let start = byte_at_utf16(line, relative.start);
+        let end = byte_at_utf16(line, relative.end);
+        if end > start {
+            runs[0] = TextRun {
+                len: start,
+                font: theme::font(),
+                color: fg,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            runs.push(TextRun {
+                len: end - start,
+                font: theme::font(),
+                color: fg,
+                background_color: Some(rgba_of(theme::MARKED_BG).into()),
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.0),
+                    color: Some(rgba_of(theme::ACCENT).into()),
+                    wavy: false,
+                }),
+                strikethrough: None,
+            });
+            if end < len {
+                runs.push(plain_run(len - end, fg));
+            }
+        }
+        return runs;
+    }
+
+    // Highlight runs: slice the whole-document spans onto this line's bytes.
+    let mut runs: Vec<TextRun> = Vec::new();
+    let mut cursor = 0usize;
+    let idx = spans.partition_point(|s| s.0.end <= line_start_byte);
+    for (range, kind) in &spans[idx..] {
+        if range.start >= line_start_byte + len {
+            break;
+        }
+        let start = range.start.saturating_sub(line_start_byte).min(len);
+        let end = range.end.saturating_sub(line_start_byte).min(len);
+        if start > cursor {
+            runs.push(text_run(cursor..start, fg));
+        }
+        if end > start {
+            runs.push(text_run(start..end, theme::syntax_color(*kind)));
+            cursor = end;
+        }
+    }
+    if cursor < len {
+        runs.push(text_run(cursor..len, fg));
+    }
+    if runs.is_empty() {
+        runs.push(plain_run(len, fg));
     }
     runs
 }
@@ -585,7 +765,8 @@ impl Element for EditorElement {
             .map(|line| {
                 let span = pane.buf.line_span(line);
                 let content = pane.buf.slice_utf16(span.clone());
-                let runs = line_runs(&content, marked.clone(), span, fg);
+                let line_start_byte = pane.buf.doc.rope().line_to_byte(line as usize);
+                let runs = line_runs(&content, span, marked.clone(), line_start_byte, &pane.spans, fg);
                 let shaped = window.text_system().shape_line(content.into(), font_size, &runs, None);
                 (line, shaped)
             })

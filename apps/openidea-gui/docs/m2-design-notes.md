@@ -53,24 +53,31 @@ pane mirrors it version-for-version.
   short count label); clicking it unfolds. Line numbers gutter shows the
   buffer row of each display row, so numbers skip during a fold.
 
-## 3. Incremental highlighting (Phase 3)
+## 3. Incremental highlighting (Phase 3, as built)
 
-- One `tree_sitter::Tree` per pane plus the parsed version. On every edit,
-  first `tree.edit(InputEdit::from(ByteEdit))` (cheap, keeps the tree usable),
-  then schedule an incremental re-parse on the background executor:
-  `tree.copy()` as the old tree, text read directly from a `ropey::Rope`
-  clone (chunks slide under the parser's read callback — no full-text copy),
-  new tree swapped in on the main thread when it lands, tagged with the
-  version it parsed.
-- Highlight spans come from a highlights query run over the tree. Strategy:
-  **viewport-first** — the query runs with a byte-range filter covering the
-  visible rows (with slack), producing `(byte range, kind)` spans the paint
-  code converts per line; a full-document span set is never materialized.
-  Scroll just recomputes for the new window (the query is cheap relative to
-  a 50 MB parse; measured in the perf HUD). Files flagged `large` (or
-  without a grammar) skip parsing/highlighting entirely.
-- Token kinds (`SyntaxHighlightKind`-style classes) map onto a hardcoded
-  palette in `theme.rs`; unknown kinds fall back to the default foreground.
+- One `tree_sitter::Tree` per pane. On every edit, `tree.edit(&InputEdit)`
+  from the `ByteEdit` vec `ide_text::apply_detailed` returned (cheap, keeps
+  the tree usable), then a re-parse is scheduled on the background executor.
+  The pane **hands the tree to the job** as the incremental base (0.25 has no
+  `Tree::copy`); edits landing mid-parse are journalled as `ByteEdit`s and
+  folded into the fresh tree when it lands, so the base is never lost.
+  A generation counter guards against results of a wholesale buffer replace
+  (out-of-sync resync) landing on the new text.
+- The job materializes the text from the rope off the main thread
+  (tree-sitter 0.25's query API wants contiguous bytes — a chunked
+  TextProvider no longer exists), parses incrementally, and runs the
+  highlights query **once over the whole document**, returning sorted
+  non-overlapping `(byte range, kind)` spans (innermost capture wins). The
+  main thread never queries: paint slices the span list per visible line with
+  a binary search, so scrolling costs nothing syntax-related. The full span
+  list for a big file is a few MB worst case; files flagged `large` (>5 MB,
+  the backend's threshold) or without a grammar skip parsing/highlighting
+  entirely, which is what keeps the 50 MB acceptance file cheap.
+- The query itself is written for the tree-sitter-rust node names and the
+  grammar comes from the repo's bundled set via `Syntax::ts_language` (its
+  public seam "for engines that parse on their own"). Token kinds map onto a
+  hardcoded palette in `theme.rs`; unknown kinds fall back to the default
+  foreground.
 - While a re-parse is in flight, the stale tree still colors correctly on
   average; spans carry the parsed version and are recomputed when the new
   tree lands or the viewport moves.
