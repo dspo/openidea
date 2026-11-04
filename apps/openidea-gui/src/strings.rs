@@ -13,3 +13,8 @@ pub const SAVE_STATE_STALE: &str = "stale — changed on disk";
 pub const SAVED_TOAST: &str = "Saved";
 pub const LOADING_FAILED: &str = "Cannot open";
 pub const SAVE_FAILED: &str = "Save failed";
+// Language-server rows in the status bar.
+pub const LS_READY: &str = "ready";
+pub const LS_STARTING: &str = "starting…";
+pub const LS_DOWN: &str = "down";
+pub const LS_STOPPED: &str = "stopped";
