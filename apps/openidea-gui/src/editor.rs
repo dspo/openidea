@@ -212,10 +212,15 @@ impl Buffer {
 }
 
 /// Element geometry the IME handler needs between frames, in window
-/// coordinates: where the text area starts, how tall a line is, which line is
-/// scrolled to the top and the viewport height.
+/// coordinates: where the gutter and the text area start, how tall a line is,
+/// which line is scrolled to the top and the viewport height.
 #[derive(Clone, Copy)]
 struct Geometry {
+    /// Left edge of the line-number gutter (the element's left inset).
+    gutter_x: Pixels,
+    /// Gutter width (numbers plus paddings); clicks inside it are not edits.
+    gutter_w: Pixels,
+    /// Left edge of the text area (gutter plus its own padding).
     origin: Point<Pixels>,
     line_height: Pixels,
     scroll: f32,
@@ -344,6 +349,10 @@ impl EditorPane {
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut gpui::Context<Self>) {
         window.focus(&self.focus, cx);
         let Some(geometry) = self.geometry.get() else { return };
+        // Gutter clicks are not text edits (fold chevrons arrive in phase 5).
+        if ev.position.x < geometry.gutter_x + geometry.gutter_w {
+            return;
+        }
         let count = self.buf.line_count();
         let visible = ((geometry.height - px(theme::TEXT_INSET) * 2.0) / geometry.line_height) as i64;
         let row = (((ev.position.y - geometry.origin.y) / geometry.line_height) as i64 + self.scroll.get() as i64)
@@ -416,9 +425,15 @@ struct EditorElement {
 }
 
 struct PrepaintState {
-    /// The visible lines in buffer order: (line index, shaped line).
-    lines: Vec<(usize, ShapedLine)>,
+    /// The laid-out rows in buffer order: (line index, shaped line). One row
+    /// of buffer above and below the viewport, so slow scrolls never show a
+    /// gap; everything outside is never shaped.
+    rows: Vec<(u32, ShapedLine)>,
+    /// Where the caret renders (its line and the gutter metrics for painting).
     caret: Bounds<Pixels>,
+    caret_line: u32,
+    gutter_w: Pixels,
+    numbers_w: Pixels,
 }
 
 /// The text runs for one visible line: committed text plain; the marked
@@ -464,19 +479,38 @@ fn shaped_width(window: &Window, text: &str, font_size: Pixels) -> Pixels {
     window.text_system().shape_line(text.into(), font_size, &[run], None).width()
 }
 
-/// Nearest caret (UTF-16 index inside `line`) for a window-space x.
+/// Window-space x of the caret at UTF-16 `index` inside `line`: one shape of
+/// the whole line, then one walk to the boundary (no per-prefix reshaping).
+fn x_at_utf16(window: &Window, line: &str, index: usize, font_size: Pixels) -> Pixels {
+    let run = plain_run(line.len(), gpui::black());
+    let shaped = window.text_system().shape_line(line.into(), font_size, &[run], None);
+    let mut cursor = shaped.cursor();
+    cursor.take_until(byte_at_utf16(line, index));
+    cursor.x_offset()
+}
+
+/// Nearest caret (UTF-16 index inside `line`) for a window-space x: one shape,
+/// then a linear walk snapping to the nearer boundary of each character.
 fn utf16_index_at_x(window: &Window, line: &str, x: Pixels, font_size: Pixels) -> usize {
+    if x <= px(0.0) {
+        return 0;
+    }
+    let run = plain_run(line.len(), gpui::black());
+    let shaped = window.text_system().shape_line(line.into(), font_size, &[run], None);
+    let mut cursor = shaped.cursor();
     let mut units = 0usize;
+    let mut prev_x = px(0.0);
     for (offset, ch) in line.char_indices() {
-        let width = shaped_width(window, &line[..offset], font_size);
-        if width >= x {
-            // Snap to the nearer boundary of the character under the mouse.
-            let char_width = shaped_width(window, &line[..offset + ch.len_utf8()], font_size) - width;
-            return if x - width > char_width / 2.0 { units + ch.len_utf16() } else { units };
+        cursor.take_until(offset + ch.len_utf8());
+        let end_x = cursor.x_offset();
+        if end_x >= x {
+            let char_width = end_x - prev_x;
+            return units + if x - prev_x > char_width / 2.0 { ch.len_utf16() } else { 0 };
         }
+        prev_x = end_x;
         units += ch.len_utf16();
     }
-    utf16_len(line)
+    units
 }
 
 impl IntoElement for EditorElement {
@@ -525,59 +559,101 @@ impl Element for EditorElement {
         let pane = self.view.read(cx);
         let font_size = theme::px_font_size();
         let line_height = theme::px_line_height();
-        let origin = point(bounds.origin.x + px(theme::TEXT_INSET), bounds.origin.y + px(theme::TEXT_INSET));
 
         let marked = pane.buf.marked.clone();
         let caret = pane.buf.caret;
         let line_count = pane.buf.line_count();
         let scroll = pane.scroll.get();
-        let first = (scroll.floor().max(0.0) as u32).min(line_count.saturating_sub(1));
+
+        // Gutter geometry: the widest line number sets the width (at least
+        // three digits, so small files do not look cramped).
+        let digits = line_count.to_string().len().max(3);
+        let numbers_w = shaped_width(window, &"8".repeat(digits), font_size);
+        let gutter_w = px(theme::GUTTER_PAD_L) + numbers_w + px(theme::GUTTER_PAD_R);
+        let gutter_x = bounds.origin.x;
+        let origin = point(gutter_x + gutter_w, bounds.origin.y + px(theme::TEXT_INSET));
+
+        // Only the visible rows are laid out, with one row of buffer above
+        // and below; a 50 MB file costs the same as a small one.
+        let first_visible = (scroll.floor().max(0.0) as u32).min(line_count.saturating_sub(1));
         let visible = ((bounds.size.height - px(theme::TEXT_INSET) * 2.0) / line_height).ceil() as u32;
-        let last = (first + visible).min(line_count);
+        let first = first_visible.saturating_sub(1);
+        let last = (first_visible + visible + 1).min(line_count);
 
         let fg = theme::fg();
-        let lines = (first..last)
+        let rows = (first..last)
             .map(|line| {
                 let span = pane.buf.line_span(line);
                 let content = pane.buf.slice_utf16(span.clone());
                 let runs = line_runs(&content, marked.clone(), span, fg);
                 let shaped = window.text_system().shape_line(content.into(), font_size, &runs, None);
-                (line as usize, shaped)
+                (line, shaped)
             })
             .collect();
 
         // Caret rect: the line it renders on plus its prefix width.
         let caret_line = pane.buf.line_of(caret);
         let caret_span = pane.buf.line_span(caret_line);
-        let prefix = pane.buf.slice_utf16(caret_span.start..caret);
-        let caret_x = shaped_width(window, &prefix, font_size);
+        let caret_line_text = pane.buf.slice_utf16(caret_span.clone());
+        let caret_x = x_at_utf16(window, &caret_line_text, caret - caret_span.start, font_size);
         let caret_y = origin.y + line_height * (caret_line as f32 - scroll);
         let caret = Bounds::new(point(origin.x + caret_x, caret_y), size(px(2.0), line_height));
 
-        pane.geometry.set(Some(Geometry { origin, line_height, scroll, height: bounds.size.height }));
+        pane.geometry.set(Some(Geometry {
+            gutter_x,
+            gutter_w,
+            origin,
+            line_height,
+            scroll,
+            height: bounds.size.height,
+        }));
 
-        PrepaintState { lines, caret }
+        PrepaintState { rows, caret, caret_line, gutter_w, numbers_w }
     }
 
     fn paint(
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _request_layout: &mut (),
         prepaint: &mut PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
         let Some(geometry) = self.view.read(cx).geometry.get() else { return };
+        let font_size = theme::px_font_size();
         let line_height = geometry.line_height;
         let origin = geometry.origin;
+        let gutter_x = geometry.gutter_x;
 
-        for (line, shaped) in prepaint.lines.drain(..) {
-            let y = origin.y + line_height * (line as f32 - geometry.scroll);
-            let _ = shaped.paint(point(origin.x, y), line_height, TextAlign::Left, None, window, cx);
-        }
-        window.paint_quad(fill(prepaint.caret, rgba_of(theme::ACCENT)));
+        // Clip to the element: long lines and mid-scroll rows must not paint
+        // over the workbench chrome around the editor.
+        window.paint_layer(bounds, |window| {
+            // Gutter: right-aligned line numbers, the caret's row brighter,
+            // separated from the text by the border color.
+            for (row, _) in prepaint.rows.iter() {
+                let number = (row + 1).to_string();
+                let width = shaped_width(window, &number, font_size);
+                let color = if *row == prepaint.caret_line { theme::fg() } else { theme::fg_muted() };
+                let x = gutter_x + px(theme::GUTTER_PAD_L) + prepaint.numbers_w - width;
+                let y = origin.y + line_height * (*row as f32 - geometry.scroll);
+                let run = plain_run(number.len(), color);
+                let shaped = window.text_system().shape_line(number.into(), font_size, &[run], None);
+                let _ = shaped.paint(point(x, y), line_height, TextAlign::Left, None, window, cx);
+            }
+            let separator = Bounds::new(
+                point(gutter_x + prepaint.gutter_w - px(1.0), bounds.origin.y),
+                size(px(1.0), bounds.size.height),
+            );
+            window.paint_quad(fill(separator, theme::border()));
+
+            for (row, shaped) in prepaint.rows.drain(..) {
+                let y = origin.y + line_height * (row as f32 - geometry.scroll);
+                let _ = shaped.paint(point(origin.x, y), line_height, TextAlign::Left, None, window, cx);
+            }
+            window.paint_quad(fill(prepaint.caret, rgba_of(theme::ACCENT)));
+        });
 
         // Publish the geometry for `bounds_for_range` between frames, then
         // register the IME handler for the upcoming frame.
