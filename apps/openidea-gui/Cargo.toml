@@ -1,4 +1,4 @@
-# openidea-gui — the future GPUI frontend host (M0 spike).
+# openidea-gui — the future GPUI frontend host (M1: workbench shell).
 #
 # Standalone package, deliberately OUTSIDE the root workspace: the gpui stack
 # must never enter the main build graph (CI runs `cargo nextest run
@@ -6,9 +6,11 @@
 # Cargo.toml lists this directory in `exclude`; the empty `[workspace]` table
 # below detaches this crate from any parent workspace.
 #
-# M0 scope: one window, one custom-drawn text element, the gpui input
-# protocol (NSTextInputClient semantics) driven by the macOS Pinyin IME.
-# No IDE features, no workbench chrome.
+# M1 scope: workbench shell (file tree / tab stack / status bar), real
+# backend wiring — `ide-workspace` documents + `ide-vfs` IO and watching via
+# path dependencies into `../../crates/*` — and the open/edit/save closed
+# loop. The backend crates are UI-agnostic and stay in the main workspace;
+# only this app crate leaves it.
 [package]
 name = "openidea-gui"
 version = "0.0.0"
@@ -28,9 +30,22 @@ gpui = { package = "gpui-pre", version = "=0.3.9" }
 # offline in the build script — the same feature set manox-app runs, and it
 # avoids requiring the separately-downloadable Xcode Metal Toolchain here.
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["font-kit", "runtime_shaders"] }
-# Pinned (default features only) so M0 proves this pair compiles together;
-# no component is used yet — M0 renders everything by hand.
+# Workbench chrome primitives (TabBar/Tab, StatusBar, Root, IconName).
 gpui-component = { version = "=0.8.0" }
+# The SVG icon set IconName resolves to, registered as the app AssetSource.
+gpui-kit-assets = { version = "=0.8.0" }
+# The openidea backend, in-process: the same crates the Tauri host drives.
+ide-core = { path = "../../crates/ide-core" }
+ide-vfs = { path = "../../crates/ide-vfs" }
+ide-workspace = { path = "../../crates/ide-workspace" }
+# Windows-friendly path canonicalization, the repo-wide convention.
+dunce = "1"
+# bus.rs: the backend → UI event channel (the task pins tokio channels).
+# `sync` only — no runtime, the watcher threads just try_send.
+tokio = { version = "1", default-features = false, features = ["sync"] }
+# ⌘O file dialog, invoked on a plain thread like Steer does (the sync rfd
+# API must not run on gpui's main thread).
+rfd = "0.15"
 
 [profile.dev.package]
 # gpui needs opt-level 3 even in debug, or rendering crawls. Keys use the

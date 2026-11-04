@@ -1,13 +1,15 @@
-//! The M0 spike's editor surface: a hand-drawn, single-line text element that
-//! implements gpui's `InputHandler` (1:1 NSTextInputClient semantics) so the
-//! macOS Pinyin IME can compose, anchor its candidate window, commit and
-//! cancel against a canvas-style element — no stock input component involved.
+//! The M1 editor surface: the M0 spike's hand-drawn text element, grown from
+//! one line to a viewport of lines, still on the same simple buffer — a
+//! `String` plus a UTF-16 caret and an optional UTF-16 marked range (no rope,
+//! no tree-sitter: that is M2). The `InputHandler` implementation is the same
+//! 1:1 NSTextInputClient exposure M0 verified end to end with the macOS
+//! Pinyin IME; only the geometry (caret/bounds → line-aware coordinates) is
+//! new.
 //!
-//! Buffer model: one `String` plus a UTF-16 caret and an optional UTF-16
-//! marked range. Marked text lives inline in the buffer (that is what
-//! NSTextInputClient means by "marked": it is in the document, just not
-//! committed), which is what makes candidate-window geometry and commit
-//! replacement fall out of ordinary range math.
+//! Marked text lives inline in the buffer (that is what NSTextInputClient
+//! means by "marked": it is in the document, just not committed), which is
+//! what makes candidate-window geometry and commit replacement fall out of
+//! ordinary range math.
 
 use std::cell::Cell;
 use std::ops::Range;
@@ -15,38 +17,18 @@ use std::ops::Range;
 use gpui::{
     App, Bounds, Element, ElementId, Entity, FocusHandle, Focusable, GlobalElementId, InputHandler, InspectorElementId,
     InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
-    Render, ShapedLine, Styled, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, fill, point, px, relative,
-    rgba, size,
+    Render, ScrollWheelEvent, ShapedLine, Styled, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, fill,
+    point, px, relative, rgba, size,
 };
 
-// Palette lifted from the main app's src/styles/tokens.css: dark, low
-// contrast greys, one cool accent. Hardcoded here on purpose — M0 deliberately
-// does not carry the token/theme layer.
-const BG_APP: u32 = 0x191a1c;
-const BG_SURFACE: u32 = 0x212326;
-const FG: u32 = 0xd1d3d9;
-const FG_MUTED: u32 = 0x8c8f95;
-const ACCENT: u32 = 0x3871e1;
-/// Marked-text background: the accent at ~18% alpha over the surface.
-const MARKED_BG: u32 = (ACCENT << 8) | 0x2e;
-
-const FONT_FAMILY: &str = "Menlo";
-const FONT_SIZE: f32 = 15.0;
-const LINE_HEIGHT: f32 = 1.5;
-const INFO_FONT_SIZE: f32 = 12.0;
-/// Inset between the element bounds and the text line.
-const TEXT_INSET: f32 = 24.0;
+use crate::theme;
 
 fn rgba_of(c: u32) -> gpui::Rgba {
     rgba((c << 8) | 0xff)
 }
 
-fn font() -> gpui::Font {
-    gpui::Font { family: FONT_FAMILY.into(), ..Default::default() }
-}
-
 fn plain_run(len: usize, color: gpui::Hsla) -> TextRun {
-    TextRun { len, font: font(), color, background_color: None, underline: None, strikethrough: None }
+    TextRun { len, font: theme::font(), color, background_color: None, underline: None, strikethrough: None }
 }
 
 /// UTF-16 length of a string.
@@ -66,17 +48,21 @@ fn utf16_to_byte(text: &str, target: usize) -> usize {
     text.len()
 }
 
-/// The single-line buffer with IME bookkeeping. All offsets are UTF-16.
+/// The buffer with IME bookkeeping. All offsets are UTF-16.
 struct Buffer {
     text: String,
     /// The in-flight composition, inline in `text`.
     marked: Option<Range<usize>>,
     caret: usize,
+    /// Bumped by every content mutation so the workbench can tell edits from
+    /// caret moves when it observes the pane.
+    edits: u32,
 }
 
 impl Buffer {
-    fn new(seed: &str) -> Self {
-        Self { text: seed.to_owned(), marked: None, caret: utf16_len(seed) }
+    fn new(text: String) -> Self {
+        let caret = utf16_len(&text);
+        Self { text, marked: None, caret, edits: 0 }
     }
 
     fn utf16_len(&self) -> usize {
@@ -100,6 +86,7 @@ impl Buffer {
         let (byte_start, byte_end) = (utf16_to_byte(&self.text, start), utf16_to_byte(&self.text, end));
         self.text.replace_range(byte_start..byte_end, new_text);
         let len = utf16_len(new_text);
+        self.edits += 1;
         start..start + len
     }
 
@@ -178,20 +165,77 @@ impl Buffer {
             self.caret = utf16_len(&self.text[..byte]);
         }
     }
+
+    fn caret_home(&mut self) {
+        let index = LineIndex::build(&self.text);
+        self.caret = index.starts[index.line_of(self.caret)];
+    }
+
+    fn caret_end(&mut self) {
+        let index = LineIndex::build(&self.text);
+        let line = index.line_of(self.caret);
+        self.caret = index.span_of(&self.text, line).end;
+    }
 }
 
-/// Element geometry the IME handler needs between frames: where the text line
-/// starts and how tall a line is, in window coordinates.
+/// UTF-16 offsets of every line's first character; the `\n` itself is the gap
+/// between a line and the next (so a caret sitting on it renders at the end
+/// of the line before it, like every native text view).
+struct LineIndex {
+    starts: Vec<usize>,
+}
+
+impl LineIndex {
+    fn build(text: &str) -> Self {
+        let mut starts = vec![0usize];
+        let mut units = 0usize;
+        for ch in text.chars() {
+            units += ch.len_utf16();
+            if ch == '\n' {
+                starts.push(units);
+            }
+        }
+        Self { starts }
+    }
+
+    fn count(&self) -> usize {
+        self.starts.len()
+    }
+
+    /// The line a caret at `utf16` renders on: the last line whose start is
+    /// at or before the offset.
+    fn line_of(&self, utf16: usize) -> usize {
+        match self.starts.binary_search(&utf16) {
+            Ok(line) => line,
+            Err(next) => next - 1,
+        }
+    }
+
+    /// UTF-16 content span of `line` (the `\n` excluded).
+    fn span_of(&self, text: &str, line: usize) -> Range<usize> {
+        let start = self.starts[line];
+        let end = if line + 1 < self.starts.len() { self.starts[line + 1] - 1 } else { utf16_len(text) };
+        start..end.max(start)
+    }
+}
+
+/// Element geometry the IME handler needs between frames, in window
+/// coordinates: where the text area starts, how tall a line is, which line is
+/// scrolled to the top and the viewport height.
 #[derive(Clone, Copy)]
 struct Geometry {
     origin: Point<Pixels>,
     line_height: Pixels,
+    scroll: f32,
+    height: Pixels,
 }
 
 pub struct EditorPane {
     buf: Buffer,
     focus: FocusHandle,
     geometry: Cell<Option<Geometry>>,
+    /// Top visible line, in lines (clamped on use).
+    scroll: Cell<f32>,
     focused_once: Cell<bool>,
 }
 
@@ -202,24 +246,38 @@ impl Focusable for EditorPane {
 }
 
 impl EditorPane {
-    pub fn new(seed: &str, cx: &mut gpui::Context<Self>) -> Self {
-        let mut buf = Buffer::new(seed);
-        // Deterministic marked-state rendering for evidence screenshots:
-        // injects through the same `set_marked` path the IME protocol drives
-        // (the in-flight composition is too short-lived to screenshot
-        // reliably). Clearly labeled synthetic — the real protocol trace is
-        // in M0-REPORT.md.
-        if std::env::var_os("OPENIDEA_M0_DEMO_MARKED").is_some() {
-            buf.set_marked(None, "nihao", Some(5..5));
-            eprintln!("[demo] synthetic marked text seeded via set_marked");
+    pub fn new(text: String, cx: &mut gpui::Context<Self>) -> Self {
+        Self {
+            buf: Buffer::new(text),
+            focus: cx.focus_handle(),
+            geometry: Cell::new(None),
+            scroll: Cell::new(0.0),
+            focused_once: Cell::new(false),
         }
-        Self { buf, focus: cx.focus_handle(), geometry: Cell::new(None), focused_once: Cell::new(false) }
+    }
+
+    /// Full buffer text, the save/push source of truth.
+    pub fn text(&self) -> String {
+        self.buf.text.clone()
+    }
+
+    /// Backend-driven replacement (external change reload): clamps the caret
+    /// into the new text and restarts the scroll at the top.
+    pub fn set_text(&mut self, text: String, cx: &mut gpui::Context<Self>) {
+        self.buf = Buffer::new(text);
+        self.scroll.set(0.0);
+        cx.notify();
+    }
+
+    /// How many content mutations happened, for edit-vs-move observation.
+    pub fn edit_count(&self) -> u32 {
+        self.buf.edits
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut gpui::Context<Self>) {
         let ks = &ev.keystroke;
         let mods = &ks.modifiers;
-        if mods.platform || mods.function {
+        if mods.platform || mods.function || mods.control || mods.alt {
             return;
         }
         if self.buf.marked.is_some() {
@@ -233,44 +291,69 @@ impl EditorPane {
             "delete" => self.buf.delete_forward(),
             "left" => self.buf.caret_left(),
             "right" => self.buf.caret_right(),
-            "home" => self.buf.caret = 0,
-            "end" => self.buf.caret = self.buf.utf16_len(),
+            "home" => self.buf.caret_home(),
+            "end" => self.buf.caret_end(),
+            "enter" => self.buf.insert_plain("\n"),
             "escape" => {}
-            // Diagnostic: render a synthetic composition through the same
-            // `set_marked` path the IME protocol uses (M0 can drive a real
-            // Pinyin IME only by hand — see M0-REPORT.md).
-            "m" if mods.control => {
-                self.buf.set_marked(None, "zhongwen", Some(4..8));
-                eprintln!("[key] synthetic marked text injected (ctrl+m)");
-            }
             _ => {
-                if let Some(text) = ks.key_char.as_ref()
-                    && !mods.control
-                    && !mods.alt
-                {
+                if let Some(text) = ks.key_char.as_ref() {
                     self.buf.insert_plain(text);
                 }
             }
         }
+        self.clamp_scroll_to_caret();
         cx.notify();
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut gpui::Context<Self>) {
         window.focus(&self.focus, cx);
-        if let Some(geometry) = self.geometry.get() {
-            let x = ev.position.x - geometry.origin.x;
-            self.buf.caret = utf16_index_at_x(window, &self.buf.text, x);
-            cx.notify();
-        }
+        let Some(geometry) = self.geometry.get() else { return };
+        let index = LineIndex::build(&self.buf.text);
+        let visible = ((geometry.height - px(theme::TEXT_INSET) * 2.0) / geometry.line_height) as i64;
+        let row = (((ev.position.y - geometry.origin.y) / geometry.line_height) as i64 + self.scroll.get() as i64)
+            .clamp(0, visible.max(1) - 1)
+            .clamp(0, index.count() as i64 - 1) as usize;
+        let span = index.span_of(&self.buf.text, row);
+        let line = self.buf.slice_utf16(span.clone());
+        let x = ev.position.x - geometry.origin.x;
+        let col = utf16_index_at_x(window, &line, x, theme::px_font_size());
+        self.buf.caret = span.start + col;
+        cx.notify();
     }
 
-    /// One-line status readout for the screenshots and manual verification.
-    fn status(&self) -> String {
-        let marked = match &self.buf.marked {
-            Some(range) => format!("{}..{}", range.start, range.end),
-            None => "none".to_owned(),
+    fn on_scroll(&mut self, ev: &ScrollWheelEvent, _window: &mut Window, cx: &mut gpui::Context<Self>) {
+        let delta = match ev.delta {
+            gpui::ScrollDelta::Pixels(point) => point.y / theme::px_line_height(),
+            gpui::ScrollDelta::Lines(point) => point.y,
         };
-        format!("utf16len={} caret={} marked=[{}]", self.buf.utf16_len(), self.buf.caret, marked)
+        self.scroll.set(self.scroll.get() - delta);
+        self.clamp_scroll();
+        cx.notify();
+    }
+
+    /// Keeps the viewport inside the grid of lines the buffer has.
+    fn clamp_scroll(&mut self) {
+        let max = self.line_count().saturating_sub(1) as f32;
+        self.scroll.set(self.scroll.get().clamp(0.0, max));
+    }
+
+    fn line_count(&self) -> usize {
+        LineIndex::build(&self.buf.text).count()
+    }
+
+    /// Scrolls the caret's line into view after caret-moving edits.
+    fn clamp_scroll_to_caret(&mut self) {
+        let index = LineIndex::build(&self.buf.text);
+        let caret_line = index.line_of(self.buf.caret) as f32;
+        let visible =
+            self.geometry.get().map_or(20.0, |g| (g.height - px(theme::TEXT_INSET) * 2.0) / g.line_height).max(1.0);
+        let scroll = self.scroll.get();
+        if caret_line < scroll {
+            self.scroll.set(caret_line);
+        } else if caret_line >= scroll + visible {
+            self.scroll.set(caret_line - visible + 1.0);
+        }
+        self.clamp_scroll();
     }
 }
 
@@ -284,8 +367,9 @@ impl Render for EditorPane {
             .size_full()
             .relative()
             .track_focus(&self.focus)
-            .bg(rgba_of(BG_APP))
+            .bg(theme::surface_bg())
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_scroll_wheel(cx.listener(Self::on_scroll))
             .on_key_down(cx.listener(Self::on_key))
             .child(EditorElement { view: cx.entity() })
     }
@@ -301,34 +385,40 @@ struct EditorElement {
 }
 
 struct PrepaintState {
-    line: ShapedLine,
+    /// The visible lines in buffer order: (line index, shaped line).
+    lines: Vec<(usize, ShapedLine)>,
     caret: Bounds<Pixels>,
-    status: ShapedLine,
-    hint: ShapedLine,
 }
 
-/// The text runs for one frame: committed text plain, the marked range with a
-/// distinct background and an accent underline.
-fn build_runs(text: &str, marked: Option<Range<usize>>, fg: gpui::Hsla) -> Vec<TextRun> {
-    let Some(range) = marked else {
-        return vec![plain_run(text.len(), fg)];
+/// The text runs for one visible line: committed text plain; the marked
+/// range's intersection with the line gets a distinct background and an
+/// accent underline. `marked` is a buffer-wide UTF-16 range, `span` the
+/// line's.
+fn line_runs(line: &str, marked: Option<Range<usize>>, span: Range<usize>, fg: gpui::Hsla) -> Vec<TextRun> {
+    let relative = marked.map(|marked| {
+        let start = marked.start.clamp(span.start, span.end) - span.start;
+        let end = marked.end.clamp(span.start, span.end) - span.start;
+        start..end
+    });
+    let Some(relative) = relative.filter(|r| r.start < r.end) else {
+        return vec![plain_run(line.len(), fg)];
     };
-    let start = utf16_to_byte(text, range.start);
-    let end = utf16_to_byte(text, range.end);
+    let start = utf16_to_byte(line, relative.start);
+    let end = utf16_to_byte(line, relative.end);
     let mut runs = Vec::with_capacity(3);
     if start > 0 {
         runs.push(plain_run(start, fg));
     }
     runs.push(TextRun {
         len: end - start,
-        font: font(),
+        font: theme::font(),
         color: fg,
-        background_color: Some(rgba_of(MARKED_BG).into()),
-        underline: Some(UnderlineStyle { thickness: px(1.0), color: Some(rgba_of(ACCENT).into()), wavy: false }),
+        background_color: Some(rgba_of(theme::MARKED_BG).into()),
+        underline: Some(UnderlineStyle { thickness: px(1.0), color: Some(rgba_of(theme::ACCENT).into()), wavy: false }),
         strikethrough: None,
     });
-    if end < text.len() {
-        runs.push(plain_run(text.len() - end, fg));
+    if end < line.len() {
+        runs.push(plain_run(line.len() - end, fg));
     }
     runs
 }
@@ -343,19 +433,19 @@ fn shaped_width(window: &Window, text: &str, font_size: Pixels) -> Pixels {
     window.text_system().shape_line(text.into(), font_size, &[run], None).width()
 }
 
-/// Nearest caret (UTF-16 index) for a window-space x inside the text line.
-fn utf16_index_at_x(window: &Window, text: &str, x: Pixels) -> usize {
+/// Nearest caret (UTF-16 index inside `line`) for a window-space x.
+fn utf16_index_at_x(window: &Window, line: &str, x: Pixels, font_size: Pixels) -> usize {
     let mut units = 0usize;
-    for (offset, ch) in text.char_indices() {
-        let width = shaped_width(window, &text[..offset], px(FONT_SIZE));
+    for (offset, ch) in line.char_indices() {
+        let width = shaped_width(window, &line[..offset], font_size);
         if width >= x {
             // Snap to the nearer boundary of the character under the mouse.
-            let char_width = shaped_width(window, &text[..offset + ch.len_utf8()], px(FONT_SIZE)) - width;
+            let char_width = shaped_width(window, &line[..offset + ch.len_utf8()], font_size) - width;
             return if x - width > char_width / 2.0 { units + ch.len_utf16() } else { units };
         }
         units += ch.len_utf16();
     }
-    utf16_len(text)
+    utf16_len(line)
 }
 
 impl IntoElement for EditorElement {
@@ -371,7 +461,7 @@ impl Element for EditorElement {
     type PrepaintState = PrepaintState;
 
     fn id(&self) -> Option<ElementId> {
-        Some("m0-editor".into())
+        Some("m1-editor".into())
     }
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
@@ -402,102 +492,86 @@ impl Element for EditorElement {
         cx: &mut App,
     ) -> PrepaintState {
         let pane = self.view.read(cx);
-        let font_size = px(FONT_SIZE);
-        let line_height = px(FONT_SIZE * LINE_HEIGHT);
-        let origin = point(bounds.origin.x + px(TEXT_INSET), bounds.origin.y + px(TEXT_INSET));
+        let font_size = theme::px_font_size();
+        let line_height = theme::px_line_height();
+        let origin = point(bounds.origin.x + px(theme::TEXT_INSET), bounds.origin.y + px(theme::TEXT_INSET));
 
         let text = pane.buf.text.clone();
         let marked = pane.buf.marked.clone();
         let caret = pane.buf.caret;
+        let index = LineIndex::build(&text);
+        let scroll = pane.scroll.get();
+        let first = (scroll.floor().max(0.0) as usize).min(index.count().saturating_sub(1));
+        let visible = ((bounds.size.height - px(theme::TEXT_INSET) * 2.0) / line_height).ceil() as usize;
+        let last = (first + visible).min(index.count());
 
-        let fg = rgba_of(FG).into();
-        let line = window.text_system().shape_line(
-            text.clone().into(),
-            font_size,
-            &build_runs(&text, marked.clone(), fg),
-            None,
-        );
+        let fg = theme::fg();
+        let lines = (first..last)
+            .map(|line| {
+                let span = index.span_of(&text, line);
+                let content = &text[utf16_to_byte(&text, span.start)..utf16_to_byte(&text, span.end)];
+                let shaped = window.text_system().shape_line(
+                    content.to_string().into(),
+                    font_size,
+                    &line_runs(content, marked.clone(), span, fg),
+                    None,
+                );
+                (line, shaped)
+            })
+            .collect();
 
-        let caret_x = shaped_width(window, &pane.buf.slice_utf16(0..caret), font_size);
-        let caret = Bounds::new(point(origin.x + caret_x, origin.y), size(px(2.0), line_height));
+        // Caret rect: the line it renders on plus its prefix width.
+        let caret_line = index.line_of(caret);
+        let caret_span = index.span_of(&text, caret_line);
+        let prefix = pane.buf.slice_utf16(caret_span.start..caret);
+        let caret_x = shaped_width(window, &prefix, font_size);
+        let caret_y = origin.y + line_height * (caret_line as f32 - scroll);
+        let caret = Bounds::new(point(origin.x + caret_x, caret_y), size(px(2.0), line_height));
 
-        let info_font =
-            gpui::Font { family: FONT_FAMILY.into(), weight: gpui::FontWeight::NORMAL, ..Default::default() };
-        let muted = rgba_of(FG_MUTED).into();
-        let status_run = TextRun {
-            len: pane.status().len(),
-            font: info_font.clone(),
-            color: muted,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let status = window.text_system().shape_line(pane.status().into(), px(INFO_FONT_SIZE), &[status_run], None);
-        let hint = "Pinyin: ni hao + Space commits | Esc cancels | ctrl+m injects a fake composition | Cmd+Q quits";
-        let hint_run = TextRun {
-            len: hint.len(),
-            font: info_font,
-            color: muted,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let hint = window.text_system().shape_line(hint.into(), px(INFO_FONT_SIZE), &[hint_run], None);
+        pane.geometry.set(Some(Geometry { origin, line_height, scroll, height: bounds.size.height }));
 
-        PrepaintState { line, caret, status, hint }
+        PrepaintState { lines, caret }
     }
 
     fn paint(
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
+        _bounds: Bounds<Pixels>,
         _request_layout: &mut (),
         prepaint: &mut PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
-        window.paint_quad(fill(bounds, rgba_of(BG_SURFACE)));
+        let Some(geometry) = self.view.read(cx).geometry.get() else { return };
+        let line_height = geometry.line_height;
+        let origin = geometry.origin;
 
-        let line_height = px(FONT_SIZE * LINE_HEIGHT);
-        let origin = point(bounds.origin.x + px(TEXT_INSET), bounds.origin.y + px(TEXT_INSET));
+        for (line, shaped) in prepaint.lines.drain(..) {
+            let y = origin.y + line_height * (line as f32 - geometry.scroll);
+            let _ = shaped.paint(point(origin.x, y), line_height, TextAlign::Left, None, window, cx);
+        }
+        window.paint_quad(fill(prepaint.caret, rgba_of(theme::ACCENT)));
 
-        let _ = prepaint.line.paint(origin, line_height, TextAlign::Left, None, window, cx);
-        window.paint_quad(fill(prepaint.caret, rgba_of(ACCENT)));
-
-        // Info lines hug the bottom edge of the element.
-        let info_line_height = px(INFO_FONT_SIZE * 1.4);
-        let status_y = bounds.origin.y + bounds.size.height - px(TEXT_INSET) - info_line_height * 2.0;
-        let _ = prepaint.status.paint(point(origin.x, status_y), info_line_height, TextAlign::Left, None, window, cx);
-        let _ = prepaint.hint.paint(
-            point(origin.x, status_y + info_line_height),
-            info_line_height,
-            TextAlign::Left,
-            None,
-            window,
-            cx,
-        );
-
-        // Publish the line geometry for `bounds_for_range` between frames,
-        // then register the IME handler for the upcoming frame.
-        let pane = self.view.read(cx);
-        pane.geometry.set(Some(Geometry { origin, line_height }));
-        let focus = pane.focus.clone();
-        window.handle_input(&focus, M0InputHandler { view: self.view.clone() }, cx);
+        // Publish the geometry for `bounds_for_range` between frames, then
+        // register the IME handler for the upcoming frame.
+        let focus = self.view.read(cx).focus.clone();
+        window.handle_input(&focus, EditorInputHandler { view: self.view.clone() }, cx);
     }
 }
 
 // ---------------------------------------------------------------------------
-// M0InputHandler — the NSTextInputClient face of the element
+// EditorInputHandler — the NSTextInputClient face of the element
 // ---------------------------------------------------------------------------
 
 /// gpui's input protocol for the editor element. Every mutation logs its
-/// payload to stderr: that trace is the M0 evidence of the protocol round-trip.
-struct M0InputHandler {
+/// payload to stderr — the M0 trace format, kept so IME behaviour in the
+/// tabbed workbench stays comparable against the M0 report.
+struct EditorInputHandler {
     view: Entity<EditorPane>,
 }
 
-impl InputHandler for M0InputHandler {
+impl InputHandler for EditorInputHandler {
     fn selected_text_range(
         &mut self,
         _ignore_disabled_input: bool,
@@ -538,6 +612,7 @@ impl InputHandler for M0InputHandler {
         eprintln!("[ime] insertText range={:?} text={:?}", replacement_range, text);
         self.view.update(cx, |pane, cx| {
             pane.buf.insert_commit(replacement_range, text);
+            pane.clamp_scroll_to_caret();
             cx.notify();
         });
     }
@@ -553,6 +628,7 @@ impl InputHandler for M0InputHandler {
         eprintln!("[ime] setMarkedText range={:?} text={:?} selected={:?}", range_utf16, new_text, new_selected_range);
         self.view.update(cx, |pane, cx| {
             pane.buf.set_marked(range_utf16, new_text, new_selected_range);
+            pane.clamp_scroll_to_caret();
             cx.notify();
         });
     }
@@ -565,8 +641,9 @@ impl InputHandler for M0InputHandler {
         });
     }
 
-    /// Candidate-window anchor: the window-space rect of a UTF-16 range. The
-    /// platform converts this to screen coordinates (`firstRectForCharacterRange`).
+    /// Candidate-window anchor: the window-space rect of a UTF-16 range,
+    /// mapped onto the range's start line. The platform converts this to
+    /// screen coordinates (`firstRectForCharacterRange`).
     fn bounds_for_range(
         &mut self,
         range_utf16: Range<usize>,
@@ -575,11 +652,18 @@ impl InputHandler for M0InputHandler {
     ) -> Option<Bounds<Pixels>> {
         let pane = self.view.read(cx);
         let geometry = pane.geometry.get()?;
-        let start = pane.buf.clamp(range_utf16.start);
-        let end = pane.buf.clamp(range_utf16.end).max(start);
-        let x0 = shaped_width(window, &pane.buf.slice_utf16(0..start), px(FONT_SIZE));
-        let x1 = shaped_width(window, &pane.buf.slice_utf16(0..end), px(FONT_SIZE));
-        let bounds = Bounds::new(point(geometry.origin.x + x0, geometry.origin.y), size(x1 - x0, geometry.line_height));
+        let text = pane.buf.text.clone();
+        let index = LineIndex::build(&text);
+        let line = index.line_of(pane.buf.clamp(range_utf16.start));
+        let span = index.span_of(&text, line);
+        let start = pane.buf.clamp(range_utf16.start).max(span.start);
+        let end = pane.buf.clamp(range_utf16.end).min(span.end).max(start);
+        let x0 = shaped_width(window, &pane.buf.slice_utf16(span.start..start), theme::px_font_size());
+        let x1 = shaped_width(window, &pane.buf.slice_utf16(span.start..end), theme::px_font_size());
+        let bounds = Bounds::new(
+            point(geometry.origin.x + x0, geometry.origin.y + geometry.line_height * (line as f32 - geometry.scroll)),
+            size(x1 - x0, geometry.line_height),
+        );
         eprintln!("[ime] firstRect {range_utf16:?} -> {bounds:?}");
         Some(bounds)
     }
@@ -588,7 +672,17 @@ impl InputHandler for M0InputHandler {
         let pane = self.view.read(cx);
         let geometry = pane.geometry.get()?;
         let text = pane.buf.text.clone();
-        Some(utf16_index_at_x(window, &text, point.x - geometry.origin.x))
+        let index = LineIndex::build(&text);
+        let visible = ((geometry.height - px(theme::TEXT_INSET) * 2.0) / geometry.line_height).max(1.0) as i64;
+        let row = (((point.y - geometry.origin.y) / geometry.line_height) as i64 + geometry.scroll as i64)
+            .clamp(0, visible - 1);
+        if row < 0 || row as usize >= index.count() {
+            return None;
+        }
+        let span = index.span_of(&text, row as usize);
+        let line_text = pane.buf.slice_utf16(span.clone());
+        let col = utf16_index_at_x(window, &line_text, point.x - geometry.origin.x, theme::px_font_size());
+        Some(span.start + col)
     }
 
     fn apple_press_and_hold_enabled(&mut self) -> bool {
