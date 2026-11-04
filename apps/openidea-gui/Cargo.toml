@@ -1,0 +1,42 @@
+# openidea-gui — the future GPUI frontend host (M0 spike).
+#
+# Standalone package, deliberately OUTSIDE the root workspace: the gpui stack
+# must never enter the main build graph (CI runs `cargo nextest run
+# --workspace` and `cargo clippy --workspace` against it). The root
+# Cargo.toml lists this directory in `exclude`; the empty `[workspace]` table
+# below detaches this crate from any parent workspace.
+#
+# M0 scope: one window, one custom-drawn text element, the gpui input
+# protocol (NSTextInputClient semantics) driven by the macOS Pinyin IME.
+# No IDE features, no workbench chrome.
+[package]
+name = "openidea-gui"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[workspace]
+
+[dependencies]
+# GPUI stack: the longbridge gpui-kit line, exact-pinned to the versions
+# manox-app (Steer) locks, so the two repos share one tested snapshot.
+# gpui-pre is Longbridge's weekly repackaged snapshot of zed's gpui; this
+# repo never depends on zed-industries/zed directly.
+gpui = { package = "gpui-pre", version = "=0.3.9" }
+# runtime_shaders compiles the Metal shaders at first launch instead of
+# offline in the build script — the same feature set manox-app runs, and it
+# avoids requiring the separately-downloadable Xcode Metal Toolchain here.
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["font-kit", "runtime_shaders"] }
+# Pinned (default features only) so M0 proves this pair compiles together;
+# no component is used yet — M0 renders everything by hand.
+gpui-component = { version = "=0.8.0" }
+
+[profile.dev.package]
+# gpui needs opt-level 3 even in debug, or rendering crawls. Keys use the
+# real package names (gpui-pre*), not the dependency alias.
+gpui-pre = { opt-level = 3 }
+gpui-pre-platform = { opt-level = 3 }
+
+[lints.clippy]
+dbg_macro = "deny"

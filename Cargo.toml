@@ -2,7 +2,9 @@
 resolver = "3"
 members = ["crates/*", "src-tauri"]
 # Plugins and the guest SDK build for wasm32-wasip2 in their own workspaces.
-exclude = ["sdk", "plugins"]
+# apps/openidea-gui is the GPUI frontend spike; its gpui stack must never
+# enter this workspace's build graph (it carries its own Cargo.lock).
+exclude = ["sdk", "plugins", "apps/openidea-gui"]
 
 [workspace.package]
 version = "0.1.39"
