@@ -6,6 +6,7 @@
 //! `Notify` feed the status line.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -20,7 +21,7 @@ use gpui_component::tab::{Tab as ComponentTab, TabBar};
 use gpui_component::{Icon, IconName, Selectable as _, Sizable as _};
 use ide_core::event::NotifyLevel;
 use ide_core::event::ServerStatus;
-use ide_core::{DocId, IdeEvent, ServerId};
+use ide_core::{Diagnostic, DocId, IdeEvent, ServerId};
 use ide_vfs::EntryKind;
 
 use crate::actions::{CloseTab, OpenFile, Redo, Save, Undo};
@@ -65,6 +66,10 @@ pub struct Workbench {
     tree_focused_once: Cell<bool>,
     message: Option<Message>,
     servers: Vec<ServerRow>,
+    /// Diagnostics per file, per producer (`Diagnostics` events replace one
+    /// producer's list; the merged view reaches the pane). Sorted by position
+    /// for the pane's line lookups.
+    diagnostics: HashMap<PathBuf, HashMap<String, Vec<Diagnostic>>>,
     bus: Bus,
 }
 
@@ -85,6 +90,7 @@ impl Workbench {
             tree_focused_once: Cell::new(false),
             message: None,
             servers: Vec::new(),
+            diagnostics: HashMap::new(),
             bus,
         }
     }
@@ -213,6 +219,12 @@ impl Workbench {
         };
         let doc_id = info.id;
         let pane = cx.new(|cx| EditorPane::new(host, info, cx));
+        // Diagnostics may have landed before the tab existed (the servers
+        // publish for every open file in the project).
+        let existing = self.diagnostics.get(&path.to_path_buf());
+        if let Some(merged) = existing.map(Self::merge_diagnostics) {
+            pane.update(cx, |pane, cx| pane.set_diagnostics(merged, cx));
+        }
         let path = path.to_path_buf();
         self.tabs.push(Tab { path: path.clone(), doc: doc_id, pane: pane.clone(), dirty: false, stale: false });
         self.active = Some(self.tabs.len() - 1);
@@ -220,13 +232,17 @@ impl Workbench {
         cx.notify();
     }
 
+    /// All producers' diagnostics for one file, sorted by position.
+    fn merge_diagnostics(by_source: &HashMap<String, Vec<Diagnostic>>) -> Vec<Diagnostic> {
+        let mut merged: Vec<Diagnostic> = by_source.values().flatten().cloned().collect();
+        merged.sort_by_key(|d| (d.range.start.line, d.range.start.col, d.range.end.line, d.range.end.col));
+        merged
+    }
+
     // -- bus --------------------------------------------------------------
 
     /// The bus pump's landing zone: backend events and the file-dialog result.
     pub fn handle_bus(&mut self, message: BusMessage, cx: &mut Context<Self>) {
-        if let BusMessage::Ide(IdeEvent::Diagnostics { path, items, .. }) = &message {
-            eprintln!("[bus] diagnostics {} x{}", path.0.display(), items.len());
-        }
         match message {
             BusMessage::Picked(path) => {
                 if let Some(path) = path {
@@ -267,6 +283,25 @@ impl Workbench {
             }
             BusMessage::Ide(IdeEvent::Notify { level, title, .. }) => {
                 self.message = Some((level, title));
+                cx.notify();
+            }
+            BusMessage::Ide(IdeEvent::Diagnostics { path, source, items }) => {
+                // One producer's full replacement for one file; the pane
+                // squiggles what it shows, so hand it the merged list.
+                let mut by_source = self.diagnostics.remove(&path.0).unwrap_or_default();
+                if items.is_empty() {
+                    by_source.remove(&source);
+                } else {
+                    by_source.insert(source, items);
+                }
+                let merged = (!by_source.is_empty()).then(|| Self::merge_diagnostics(&by_source));
+                if merged.is_some() {
+                    self.diagnostics.insert(path.0.clone(), by_source);
+                }
+                if let Some(tab) = self.tabs.iter().find(|tab| tab.path == path.0) {
+                    let merged = merged.clone().unwrap_or_default();
+                    tab.pane.update(cx, |pane, cx| pane.set_diagnostics(merged, cx));
+                }
                 cx.notify();
             }
             BusMessage::Ide(IdeEvent::LanguageServer { server, name, status, message }) => {
