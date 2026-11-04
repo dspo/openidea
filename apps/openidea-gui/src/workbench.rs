@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable as _, InteractiveElement, IntoElement,
-    KeyDownEvent, Modifiers, MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled,
-    Window, div, px,
+    KeyDownEvent, ModifiersChangedEvent, MouseButton, ParentElement, Render, SharedString,
+    StatefulInteractiveElement as _, Styled, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -115,6 +115,8 @@ pub struct Workbench {
     picker_sub: Option<gpui::Subscription>,
     /// The last bare ⇧ press, for the double-⇧ Search Everywhere gesture.
     last_shift: Cell<Option<Instant>>,
+    /// Whether ⇧ was held at the last modifiers event (rising-edge detection).
+    shift_held: Cell<bool>,
 }
 
 impl Workbench {
@@ -139,6 +141,7 @@ impl Workbench {
             picker: None,
             picker_sub: None,
             last_shift: Cell::new(None),
+            shift_held: Cell::new(false),
         }
     }
 
@@ -225,24 +228,25 @@ impl Workbench {
         self.open_picker(true, window, cx);
     }
 
-    /// Bare-⇧ taps, two within a short window, open Search Everywhere. The
-    /// action binding in `main.rs` (`"shift shift"`) may or may not fire
-    /// first depending on how the platform routes modifier-only keystrokes;
-    /// whichever path fires, `open_picker` is idempotent.
-    fn on_raw_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let ks = &ev.keystroke;
-        let bare_shift = ks.key == "shift"
-            && ks.modifiers == Modifiers { control: false, alt: false, shift: true, platform: false, function: false };
-        if !bare_shift {
-            self.last_shift.set(None);
-            return;
-        }
-        let now = Instant::now();
-        let again =
-            self.last_shift.replace(Some(now)).is_some_and(|at| now.duration_since(at) < Duration::from_millis(600));
-        if again {
-            self.last_shift.set(None);
-            self.open_picker(true, window, cx);
+    /// Bare-⇧ taps, two within a short window, open Search Everywhere.
+    /// Modifier-only presses never become key events (macOS turns them into
+    /// `ModifiersChanged`), so the gesture lives here on the rising edge of a
+    /// bare shift instead of in the keymap.
+    fn on_modifiers(&mut self, ev: &ModifiersChangedEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let mods = ev.modifiers;
+        let shift = mods.shift;
+        let was_held = self.shift_held.replace(shift);
+        let bare = shift && !mods.control && !mods.alt && !mods.platform && !mods.function;
+        if bare && !was_held {
+            let now = Instant::now();
+            let again = self
+                .last_shift
+                .replace(Some(now))
+                .is_some_and(|at| now.duration_since(at) < Duration::from_millis(600));
+            if again {
+                self.last_shift.set(None);
+                self.open_picker(true, window, cx);
+            }
         }
     }
 
@@ -269,6 +273,12 @@ impl Workbench {
                 InputEvent::PressEnter { .. } => this.picker_accept(window, cx),
                 _ => {}
             }));
+        eprintln!(
+            "[picker] refreshed: {} files, {} symbols, {} actions",
+            self.picker.as_ref().map_or(0, |p| p.files.len()),
+            self.picker.as_ref().map_or(0, |p| p.symbols.len()),
+            self.picker.as_ref().map_or(0, |p| p.actions.len())
+        );
         self.refresh_picker(cx);
     }
 
@@ -287,10 +297,11 @@ impl Workbench {
     }
 
     fn picker_query_changed(&mut self, input: &Entity<InputState>, _window: &mut Window, cx: &mut Context<Self>) {
+        let query = input.read(cx).value().to_string();
         if let Some(picker) = &mut self.picker {
-            picker.query = input.read(cx).value().to_string();
-            self.refresh_picker(cx);
+            picker.query = query;
         }
+        self.refresh_picker(cx);
     }
 
     /// Re-runs the palette's queries against the index and the action
@@ -717,8 +728,8 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::on_go_to_file))
             .on_action(cx.listener(Self::on_search_everywhere))
-            // Double ⇧ (the raw fallback for the gesture; see on_raw_key).
-            .on_key_down(cx.listener(Self::on_raw_key))
+            // Double ⇧ gesture (modifier presses arrive as modifiers events).
+            .on_modifiers_changed(cx.listener(Self::on_modifiers))
             .child(
                 div()
                     .flex_1()

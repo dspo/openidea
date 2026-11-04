@@ -336,25 +336,15 @@ struct HoverDiag {
 }
 
 /// The rename flow: an input overlay prefilled with the current name, then
-/// the server's workspace edit shown for confirmation before it applies. The
-/// input entity rides along to the preview stage (unused there) so the
-/// window's first responder never dangles mid-flow: once a focused view
-/// drops, gpui dispatches actions from the window root and the pane's
-/// handlers are out of the chain. Cancelling or applying hands focus back to
-/// the pane.
+/// the server's workspace edit shown for confirmation before it applies.
+/// `confirmed` guards the Enter that is already in flight. The input view
+/// unmounts once the request goes out, so [`EditorPane::command`] hands
+/// focus back to the pane right away — a focus left on the unmounted input
+/// would take the pane's handlers out of the dispatch chain (found the hard
+/// way during the live pass).
 enum RenameFlow {
-    Input {
-        input: gpui::Entity<InputState>,
-        confirmed: bool,
-    },
-    Preview {
-        edit: WorkspaceEdit,
-        name: String,
-        /// Only kept alive: it holds the window's first responder through the
-        /// preview stage (see the type's doc).
-        #[expect(dead_code)]
-        input: gpui::Entity<InputState>,
-    },
+    Input { input: gpui::Entity<InputState>, confirmed: bool },
+    Preview { edit: WorkspaceEdit, name: String },
 }
 
 /// The open completion popup: the server's items for the request, the
@@ -1160,30 +1150,23 @@ impl EditorPane {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let lsp = self.host.lsp.clone();
         let doc = self.doc_id;
-        let input = input.clone();
         self.host.runtime.spawn(async move {
             let result = lsp.rename(doc, pos, new_name.clone(), cancel).await;
-            let _ = tx.send((result, new_name, input));
+            let _ = tx.send((result, new_name));
         });
         cx.spawn(async move |this, cx| {
-            if let Ok((result, name, input)) = rx.await {
-                this.update(cx, |pane, cx| pane.rename_preview(result, name, input, cx)).ok();
+            if let Ok((result, name)) = rx.await {
+                this.update(cx, |pane, cx| pane.rename_preview(result, name, cx)).ok();
             }
         })
         .detach();
     }
 
     /// Lands the rename answer and switches to the preview stage.
-    fn rename_preview(
-        &mut self,
-        result: IdeResult<Renamed>,
-        name: String,
-        input: gpui::Entity<InputState>,
-        cx: &mut gpui::Context<Self>,
-    ) {
+    fn rename_preview(&mut self, result: IdeResult<Renamed>, name: String, cx: &mut gpui::Context<Self>) {
         match result {
             Ok(renamed) if !renamed.edit.files.is_empty() => {
-                self.rename = Some(RenameFlow::Preview { edit: renamed.edit, name, input });
+                self.rename = Some(RenameFlow::Preview { edit: renamed.edit, name });
             }
             Ok(_) => {
                 self.rename = None;
@@ -1557,6 +1540,9 @@ impl EditorPane {
                     if !*confirmed {
                         self.rename_confirm(cx);
                     }
+                    // The input view unmounts as the request goes out; the
+                    // pane takes over so the preview's Enter still lands here.
+                    window.focus(&self.focus, cx);
                     return;
                 }
                 Command::Cancel => {
@@ -1656,6 +1642,9 @@ impl EditorPane {
         if self.buf.marked.is_some() {
             eprintln!("[key] passthrough while composing: {}", ks.key);
             return;
+        }
+        if self.rename.is_some() {
+            return; // the rename flow is modal; typing belongs to its input
         }
         if ks.modifiers.platform || ks.modifiers.alt || ks.modifiers.control {
             return;
@@ -2194,7 +2183,7 @@ impl EditorPane {
                         .into_any_element(),
                 )
             }
-            Some(RenameFlow::Preview { edit, name, .. }) => {
+            Some(RenameFlow::Preview { edit, name }) => {
                 let mut rows = gpui::div().flex().flex_col().gap_1();
                 let apply = cx.listener(|this, _, window, cx| this.rename_apply(window, cx));
                 let cancel = cx.listener(|this, _, window, cx| this.rename_cancel_flow(window, cx));
