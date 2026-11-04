@@ -70,9 +70,52 @@ fn kind_for(name: &str) -> Option<Kind> {
     }
 }
 
-/// A finished parse hands the pane its tree, its span list and the parsed
-/// version.
-pub type ParseResult = (Tree, Vec<(Range<usize>, Kind)>, u32);
+/// A finished parse hands the pane its tree, its span list, the foldable
+/// line ranges and the parsed version.
+pub type ParseResult = (Tree, Vec<(Range<usize>, Kind)>, Vec<(u32, u32)>, u32);
+
+/// At most this many fold ranges are collected (huge generated files).
+const MAX_FOLDS: usize = 4096;
+
+/// `(start line, end line)` pairs of foldable syntax nodes: named nodes that
+/// span several lines, outermost first (nested candidates are dropped when
+/// their containing range is kept). The root node itself is not a candidate —
+/// folding the whole document from it would swallow every other range.
+pub fn fold_candidates(tree: &Tree) -> Vec<(u32, u32)> {
+    let root = tree.root_node();
+    let mut all: Vec<(u32, u32)> = Vec::new();
+    let mut stack: Vec<tree_sitter::Node> = Vec::new();
+    for i in 0..root.child_count() {
+        if let Some(child) = root.child(i) {
+            stack.push(child);
+        }
+    }
+    while let Some(node) = stack.pop() {
+        let (start, end) = (node.start_position().row as u32, node.end_position().row as u32);
+        if node.is_named() && end > start {
+            all.push((start, end));
+        }
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                stack.push(child);
+            }
+        }
+    }
+    // Outermost wins: longest ranges first, then keep what does not overlap
+    // an already-kept range (the kept list stays ascending by construction).
+    all.sort_by_key(|(start, end)| (*start, std::cmp::Reverse(*end)));
+    let mut kept: Vec<(u32, u32)> = Vec::new();
+    for (start, end) in all {
+        if kept.len() >= MAX_FOLDS {
+            break;
+        }
+        match kept.last() {
+            Some(&(_, last_end)) if start <= last_end => {}
+            _ => kept.push((start, end)),
+        }
+    }
+    kept
+}
 
 /// Highlights for one language: the query plus each capture's kind.
 pub struct Highlighter {
@@ -102,7 +145,8 @@ impl Highlighter {
         parser.set_language(&self.language).ok()?;
         let tree = parser.parse(text, old_tree)?;
         let spans = self.spans(&tree, text);
-        Some((tree, spans, version))
+        let folds = fold_candidates(&tree);
+        Some((tree, spans, folds, version))
     }
 
     /// Sorted, non-overlapping `(byte range, kind)` spans of the whole text:
