@@ -29,6 +29,7 @@ use ide_core::{ChangeSet, DocId, TextChange};
 use ide_workspace::DocumentInfo;
 use tree_sitter::Tree;
 
+use crate::actions as acts;
 use crate::highlight::{Highlighter, Kind, ParseResult, input_edit};
 use crate::host::Host;
 use crate::theme;
@@ -135,6 +136,16 @@ enum Motion {
     LineEnd,
     DocStart,
     DocEnd,
+}
+
+/// The editor commands the action handlers ask for.
+#[derive(Clone, Copy)]
+enum Command {
+    Move(Motion, bool),
+    Delete { forward: bool, word: bool },
+    Newline,
+    Cancel,
+    ToggleHud,
 }
 
 /// Why an edit batch happened; decides undo grouping and caret mapping.
@@ -899,12 +910,20 @@ impl EditorPane {
         self.apply_edits(vec![change], Cause::ImeCommit, cx);
     }
 
-    // -- keys --------------------------------------------------------------
+    // -- commands -----------------------------------------------------------
+    //
+    // Every editor behaviour is a gpui action (see `actions.rs`); the render
+    // registers the handlers, they funnel through [`EditorPane::command`]
+    // which guards composition and notes the perf HUD's input timestamp.
+    // Printable input is not an action: it keeps its raw `on_key_down`
+    // fallback below.
 
-    fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut gpui::Context<Self>) {
-        let ks = &ev.keystroke;
-        let mods = &ks.modifiers;
-        if ks.key == "f12" && !mods.platform {
+    fn command(&mut self, cmd: Command, cx: &mut gpui::Context<Self>) {
+        self.hud.note_input();
+        // The HUD toggle stays live while composing (M2 behaviour); every
+        // other command yields to the IME: while composing, macOS routes keys
+        // through the IME first, and reaching here means it passed one through.
+        if let Command::ToggleHud = cmd {
             let on = !self.hud.visible.get();
             self.hud.visible.set(on);
             eprintln!(
@@ -921,54 +940,37 @@ impl EditorPane {
             cx.notify();
             return;
         }
+        if self.buf.marked.is_some() {
+            return;
+        }
+        match cmd {
+            Command::Move(motion, extend) => self.move_cursors(motion, extend, cx),
+            Command::Delete { forward, word } => self.delete(forward, word, cx),
+            Command::Newline => self.insert_text("\n", cx),
+            Command::Cancel => self.collapse_cursors(cx),
+            Command::ToggleHud => unreachable!("handled above"),
+        }
+    }
+
+    // -- keys ---------------------------------------------------------------
+
+    /// The raw-input path: printable characters the IME did not consume (and
+    /// unbound keys) land here. Commands travel as actions instead.
+    fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut gpui::Context<Self>) {
+        let ks = &ev.keystroke;
         self.hud.note_input();
-        if mods.function {
+        if ks.modifiers.function {
             return;
         }
         if self.buf.marked.is_some() {
-            // While composing, macOS routes every key through the IME first;
-            // reaching here means the IME passed it through. Leave it alone.
             eprintln!("[key] passthrough while composing: {}", ks.key);
             return;
         }
-        // ⌘-arrows jump (line ends / document ends), ⌥-arrows step by word;
-        // Shift extends instead of moving.
-        let motion = match ks.key.as_str() {
-            "left" | "right" | "up" | "down" | "home" | "end" => match ks.key.as_str() {
-                "left" if mods.platform => Some(Motion::LineHome),
-                "right" if mods.platform => Some(Motion::LineEnd),
-                "up" if mods.platform => Some(Motion::DocStart),
-                "down" if mods.platform => Some(Motion::DocEnd),
-                "left" if mods.alt => Some(Motion::WordLeft),
-                "right" if mods.alt => Some(Motion::WordRight),
-                "left" => Some(Motion::Left),
-                "right" => Some(Motion::Right),
-                "up" => Some(Motion::Up),
-                "down" => Some(Motion::Down),
-                "home" => Some(Motion::LineHome),
-                "end" => Some(Motion::LineEnd),
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(motion) = motion {
-            self.move_cursors(motion, mods.shift, cx);
+        if ks.modifiers.platform || ks.modifiers.alt || ks.modifiers.control {
             return;
         }
-        if mods.platform || mods.alt || mods.control {
-            return;
-        }
-        match ks.key.as_str() {
-            "backspace" => self.delete(false, false, cx),
-            "delete" => self.delete(true, false, cx),
-            "enter" => self.insert_text("\n", cx),
-            "escape" => self.collapse_cursors(cx),
-            "tab" => {}
-            _ => {
-                if let Some(text) = ks.key_char.as_ref() {
-                    self.insert_text(text, cx);
-                }
-            }
+        if let Some(text) = ks.key_char.as_ref() {
+            self.insert_text(text, cx);
         }
     }
 
@@ -1289,16 +1291,98 @@ impl Render for EditorPane {
             self.focused_once.set(true);
             window.focus(&self.focus, cx);
         }
+        // Every editor behaviour is an action (bindings in `main.rs`); the
+        // handlers funnel through `command`. Verbose on purpose: gpui's
+        // `on_action` is typed per action, and macros cannot sit mid-chain.
         gpui::div()
             .size_full()
             .relative()
             .track_focus(&self.focus)
+            .key_context("Editor")
             .bg(theme::surface_bg())
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .on_key_down(cx.listener(Self::on_key))
+            .on_action(cx.listener(|this, _: &acts::TogglePerfHud, _, cx| this.command(Command::ToggleHud, cx)))
+            .on_action(cx.listener(|this, _: &acts::Cancel, _, cx| this.command(Command::Cancel, cx)))
+            .on_action(cx.listener(|this, _: &acts::Newline, _, cx| this.command(Command::Newline, cx)))
+            .on_action(cx.listener(|this, _: &acts::DeleteBackward, _, cx| {
+                this.command(Command::Delete { forward: false, word: false }, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::DeleteForward, _, cx| {
+                this.command(Command::Delete { forward: true, word: false }, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::DeleteWordBackward, _, cx| {
+                this.command(Command::Delete { forward: false, word: true }, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::DeleteWordForward, _, cx| {
+                this.command(Command::Delete { forward: true, word: true }, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &acts::CursorLeft, _, cx| this.command(Command::Move(Motion::Left, false), cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &acts::CursorRight, _, cx| this.command(Command::Move(Motion::Right, false), cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &acts::CursorUp, _, cx| this.command(Command::Move(Motion::Up, false), cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &acts::CursorDown, _, cx| this.command(Command::Move(Motion::Down, false), cx)),
+            )
+            .on_action(cx.listener(|this, _: &acts::CursorWordLeft, _, cx| {
+                this.command(Command::Move(Motion::WordLeft, false), cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::CursorWordRight, _, cx| {
+                this.command(Command::Move(Motion::WordRight, false), cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::CursorLineHome, _, cx| {
+                this.command(Command::Move(Motion::LineHome, false), cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::CursorLineEnd, _, cx| {
+                this.command(Command::Move(Motion::LineEnd, false), cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::CursorDocStart, _, cx| {
+                this.command(Command::Move(Motion::DocStart, false), cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &acts::CursorDocEnd, _, cx| {
+                    this.command(Command::Move(Motion::DocEnd, false), cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &acts::SelectLeft, _, cx| this.command(Command::Move(Motion::Left, true), cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &acts::SelectRight, _, cx| this.command(Command::Move(Motion::Right, true), cx)),
+            )
+            .on_action(cx.listener(|this, _: &acts::SelectUp, _, cx| this.command(Command::Move(Motion::Up, true), cx)))
+            .on_action(
+                cx.listener(|this, _: &acts::SelectDown, _, cx| this.command(Command::Move(Motion::Down, true), cx)),
+            )
+            .on_action(cx.listener(|this, _: &acts::SelectWordLeft, _, cx| {
+                this.command(Command::Move(Motion::WordLeft, true), cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::SelectWordRight, _, cx| {
+                this.command(Command::Move(Motion::WordRight, true), cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::SelectLineHome, _, cx| {
+                this.command(Command::Move(Motion::LineHome, true), cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::SelectLineEnd, _, cx| {
+                this.command(Command::Move(Motion::LineEnd, true), cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::SelectDocStart, _, cx| {
+                this.command(Command::Move(Motion::DocStart, true), cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &acts::SelectDocEnd, _, cx| {
+                    this.command(Command::Move(Motion::DocEnd, true), cx)
+                }),
+            )
+            // Navigation/refactoring handlers arrive in later M3 phases.
             .child(EditorElement { view: cx.entity() })
     }
 }

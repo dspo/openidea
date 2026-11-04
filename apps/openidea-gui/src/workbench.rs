@@ -12,8 +12,7 @@ use std::sync::Arc;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable as _, InteractiveElement, IntoElement,
-    KeyDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled, Window, actions, div,
-    px,
+    KeyDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::status_bar::StatusBar;
@@ -23,13 +22,12 @@ use ide_core::event::NotifyLevel;
 use ide_core::{DocId, IdeEvent};
 use ide_vfs::EntryKind;
 
+use crate::actions::{CloseTab, OpenFile, Redo, Save, Undo};
 use crate::bus::{Bus, BusMessage};
 use crate::editor::EditorPane;
 use crate::file_tree::{FileTree, Row};
 use crate::host::Host;
 use crate::{strings, theme};
-
-actions!(workbench, [OpenFile, Save, CloseTab, Undo, Redo, Quit]);
 
 /// One open file: the editor pane, its document in the backend, and the two
 /// flags the chrome shows. The pane pushes its edits to the backend live, so

@@ -6,6 +6,7 @@
 //! main workspace (root `Cargo.toml` `exclude`); the backend crates are path
 //! dependencies into `../../crates/*`.
 
+mod actions;
 mod bus;
 mod editor;
 mod file_tree;
@@ -22,9 +23,16 @@ use gpui::{App, AppContext as _, KeyBinding, WindowBounds, WindowOptions, px, si
 use gpui_component::{Root, Theme, ThemeMode};
 use gpui_kit_assets::AllAssets;
 
+use crate::actions::{
+    Cancel, CloseTab, CursorDocEnd, CursorDocStart, CursorDown, CursorLeft, CursorLineEnd, CursorLineHome, CursorRight,
+    CursorUp, CursorWordLeft, CursorWordRight, DeleteBackward, DeleteForward, DeleteWordBackward, DeleteWordForward,
+    FindUsages, GoToFile, GotoDefinition, Newline, OpenFile, Quit, Redo, Rename, Save, SearchEverywhere, SelectDocEnd,
+    SelectDocStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineHome, SelectRight, SelectUp, SelectWordLeft,
+    SelectWordRight, TogglePerfHud, Undo,
+};
 use crate::bus::Bus;
 use crate::host::Host;
-use crate::workbench::{CloseTab, OpenFile, Quit, Redo, Save, Undo, Workbench};
+use crate::workbench::Workbench;
 
 const WINDOW_WIDTH: f32 = 1200.0;
 const WINDOW_HEIGHT: f32 = 800.0;
@@ -62,6 +70,45 @@ fn main() {
                 KeyBinding::new("cmd-w", CloseTab, None),
                 KeyBinding::new("cmd-z", Undo, None),
                 KeyBinding::new("shift-cmd-z", Redo, None),
+                // M3: navigation and the command surfaces (the handlers land
+                // with their features; an unhandled action is a no-op).
+                KeyBinding::new("shift-cmd-o", GoToFile, None),
+                KeyBinding::new("shift shift", SearchEverywhere, None),
+                KeyBinding::new("cmd-b", GotoDefinition, None),
+                KeyBinding::new("shift-f6", Rename, None),
+                KeyBinding::new("alt-f7", FindUsages, None),
+                // Escape cancels panels/popups first (whatever has focus),
+                // then collapses the editor's own state.
+                KeyBinding::new("escape", Cancel, None),
+                KeyBinding::new("f12", TogglePerfHud, None),
+                // Editor commands live in the "Editor" key context so they
+                // only fire while the editor pane holds focus (the file tree
+                // keeps its own enter / arrow handling).
+                KeyBinding::new("enter", Newline, Some("Editor")),
+                KeyBinding::new("backspace", DeleteBackward, Some("Editor")),
+                KeyBinding::new("delete", DeleteForward, Some("Editor")),
+                KeyBinding::new("alt-backspace", DeleteWordBackward, Some("Editor")),
+                KeyBinding::new("alt-delete", DeleteWordForward, Some("Editor")),
+                KeyBinding::new("left", CursorLeft, Some("Editor")),
+                KeyBinding::new("right", CursorRight, Some("Editor")),
+                KeyBinding::new("up", CursorUp, Some("Editor")),
+                KeyBinding::new("down", CursorDown, Some("Editor")),
+                KeyBinding::new("alt-left", CursorWordLeft, Some("Editor")),
+                KeyBinding::new("alt-right", CursorWordRight, Some("Editor")),
+                KeyBinding::new("cmd-left", CursorLineHome, Some("Editor")),
+                KeyBinding::new("cmd-right", CursorLineEnd, Some("Editor")),
+                KeyBinding::new("cmd-up", CursorDocStart, Some("Editor")),
+                KeyBinding::new("cmd-down", CursorDocEnd, Some("Editor")),
+                KeyBinding::new("shift-left", SelectLeft, Some("Editor")),
+                KeyBinding::new("shift-right", SelectRight, Some("Editor")),
+                KeyBinding::new("shift-up", SelectUp, Some("Editor")),
+                KeyBinding::new("shift-down", SelectDown, Some("Editor")),
+                KeyBinding::new("shift-alt-left", SelectWordLeft, Some("Editor")),
+                KeyBinding::new("shift-alt-right", SelectWordRight, Some("Editor")),
+                KeyBinding::new("shift-cmd-left", SelectLineHome, Some("Editor")),
+                KeyBinding::new("shift-cmd-right", SelectLineEnd, Some("Editor")),
+                KeyBinding::new("shift-cmd-up", SelectDocStart, Some("Editor")),
+                KeyBinding::new("shift-cmd-down", SelectDocEnd, Some("Editor")),
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
             let (bus, rx) = Bus::channel();
