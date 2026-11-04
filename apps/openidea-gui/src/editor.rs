@@ -336,10 +336,25 @@ struct HoverDiag {
 }
 
 /// The rename flow: an input overlay prefilled with the current name, then
-/// the server's workspace edit shown for confirmation before it applies.
+/// the server's workspace edit shown for confirmation before it applies. The
+/// input entity rides along to the preview stage (unused there) so the
+/// window's first responder never dangles mid-flow: once a focused view
+/// drops, gpui dispatches actions from the window root and the pane's
+/// handlers are out of the chain. Cancelling or applying hands focus back to
+/// the pane.
 enum RenameFlow {
-    Input { input: gpui::Entity<InputState> },
-    Preview { edit: WorkspaceEdit, name: String },
+    Input {
+        input: gpui::Entity<InputState>,
+        confirmed: bool,
+    },
+    Preview {
+        edit: WorkspaceEdit,
+        name: String,
+        /// Only kept alive: it holds the window's first responder through the
+        /// preview stage (see the type's doc).
+        #[expect(dead_code)]
+        input: gpui::Entity<InputState>,
+    },
 }
 
 /// The open completion popup: the server's items for the request, the
@@ -1119,14 +1134,19 @@ impl EditorPane {
         let current = self.buf.slice_utf16(start..end);
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("new name"));
         input.update(cx, |state, cx| state.set_value(current.clone(), window, cx));
-        self.rename = Some(RenameFlow::Input { input });
+        self.rename = Some(RenameFlow::Input { input, confirmed: false });
         cx.notify();
     }
 
     /// Enter on the input: asks the server for the workspace edit and shows
-    /// the preview (Apply / Cancel).
+    /// the preview (Apply / Cancel). Guarded against double-Enter while the
+    /// request is in flight.
     fn rename_confirm(&mut self, cx: &mut gpui::Context<Self>) {
-        let Some(RenameFlow::Input { input, .. }) = &self.rename else { return };
+        let Some(RenameFlow::Input { input, confirmed }) = &mut self.rename else { return };
+        if *confirmed {
+            return;
+        }
+        *confirmed = true;
         let new_name = input.read(cx).value().to_string();
         if new_name.is_empty() {
             return;
@@ -1140,23 +1160,30 @@ impl EditorPane {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let lsp = self.host.lsp.clone();
         let doc = self.doc_id;
+        let input = input.clone();
         self.host.runtime.spawn(async move {
             let result = lsp.rename(doc, pos, new_name.clone(), cancel).await;
-            let _ = tx.send((result, new_name));
+            let _ = tx.send((result, new_name, input));
         });
         cx.spawn(async move |this, cx| {
-            if let Ok((result, name)) = rx.await {
-                this.update(cx, |pane, cx| pane.rename_preview(result, name, cx)).ok();
+            if let Ok((result, name, input)) = rx.await {
+                this.update(cx, |pane, cx| pane.rename_preview(result, name, input, cx)).ok();
             }
         })
         .detach();
     }
 
     /// Lands the rename answer and switches to the preview stage.
-    fn rename_preview(&mut self, result: IdeResult<Renamed>, name: String, cx: &mut gpui::Context<Self>) {
+    fn rename_preview(
+        &mut self,
+        result: IdeResult<Renamed>,
+        name: String,
+        input: gpui::Entity<InputState>,
+        cx: &mut gpui::Context<Self>,
+    ) {
         match result {
             Ok(renamed) if !renamed.edit.files.is_empty() => {
-                self.rename = Some(RenameFlow::Preview { edit: renamed.edit, name });
+                self.rename = Some(RenameFlow::Preview { edit: renamed.edit, name, input });
             }
             Ok(_) => {
                 self.rename = None;
@@ -1178,11 +1205,13 @@ impl EditorPane {
         cx.notify();
     }
 
-    /// Apply on the preview: Documents lands the edit atomically.
-    fn rename_apply(&mut self, cx: &mut gpui::Context<Self>) {
+    /// Apply on the preview: Documents lands the edit atomically, and the
+    /// pane takes focus back from the (now dropped) input.
+    fn rename_apply(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
         if let Some(RenameFlow::Preview { edit, .. }) = &self.rename {
             let result = self.host.apply_workspace_edit(edit);
             self.rename = None;
+            window.focus(&self.focus, cx);
             if let Err(e) = result {
                 self.host.sink.emit(ide_core::IdeEvent::Notify {
                     level: ide_core::event::NotifyLevel::Error,
@@ -1194,8 +1223,9 @@ impl EditorPane {
         cx.notify();
     }
 
-    fn rename_cancel_flow(&mut self, cx: &mut gpui::Context<Self>) {
+    fn rename_cancel_flow(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
         self.rename = None;
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
@@ -1494,7 +1524,7 @@ impl EditorPane {
     // Printable input is not an action: it keeps its raw `on_key_down`
     // fallback below.
 
-    fn command(&mut self, cmd: Command, cx: &mut gpui::Context<Self>) {
+    fn command(&mut self, cmd: Command, window: &mut Window, cx: &mut gpui::Context<Self>) {
         self.hud.note_input();
         // The HUD toggle stays live while composing (M2 behaviour); every
         // other command yields to the IME: while composing, macOS routes keys
@@ -1521,14 +1551,16 @@ impl EditorPane {
         }
         // The rename input is modal: Enter confirms, Esc cancels; typing goes
         // through the input's own handler (it holds focus via render).
-        if matches!(self.rename, Some(RenameFlow::Input { .. })) {
+        if let Some(RenameFlow::Input { confirmed, .. }) = &self.rename {
             match cmd {
                 Command::Newline => {
-                    self.rename_confirm(cx);
+                    if !*confirmed {
+                        self.rename_confirm(cx);
+                    }
                     return;
                 }
                 Command::Cancel => {
-                    self.rename_cancel_flow(cx);
+                    self.rename_cancel_flow(window, cx);
                     return;
                 }
                 Command::Move(..) | Command::Delete { .. } | Command::ToggleHud => return,
@@ -1537,11 +1569,11 @@ impl EditorPane {
         if matches!(self.rename, Some(RenameFlow::Preview { .. })) {
             match cmd {
                 Command::Cancel => {
-                    self.rename_cancel_flow(cx);
+                    self.rename_cancel_flow(window, cx);
                     return;
                 }
                 Command::Newline => {
-                    self.rename_apply(cx);
+                    self.rename_apply(window, cx);
                     return;
                 }
                 _ => return,
@@ -1996,83 +2028,83 @@ impl Render for EditorPane {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .on_key_down(cx.listener(Self::on_key))
-            .on_action(cx.listener(|this, _: &acts::TogglePerfHud, _, cx| this.command(Command::ToggleHud, cx)))
-            .on_action(cx.listener(|this, _: &acts::Cancel, _, cx| this.command(Command::Cancel, cx)))
-            .on_action(cx.listener(|this, _: &acts::Newline, _, cx| this.command(Command::Newline, cx)))
-            .on_action(cx.listener(|this, _: &acts::DeleteBackward, _, cx| {
-                this.command(Command::Delete { forward: false, word: false }, cx)
-            }))
-            .on_action(cx.listener(|this, _: &acts::DeleteForward, _, cx| {
-                this.command(Command::Delete { forward: true, word: false }, cx)
-            }))
-            .on_action(cx.listener(|this, _: &acts::DeleteWordBackward, _, cx| {
-                this.command(Command::Delete { forward: false, word: true }, cx)
-            }))
-            .on_action(cx.listener(|this, _: &acts::DeleteWordForward, _, cx| {
-                this.command(Command::Delete { forward: true, word: true }, cx)
-            }))
             .on_action(
-                cx.listener(|this, _: &acts::CursorLeft, _, cx| this.command(Command::Move(Motion::Left, false), cx)),
+                cx.listener(|this, _: &acts::TogglePerfHud, window, cx| this.command(Command::ToggleHud, window, cx)),
             )
-            .on_action(
-                cx.listener(|this, _: &acts::CursorRight, _, cx| this.command(Command::Move(Motion::Right, false), cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &acts::CursorUp, _, cx| this.command(Command::Move(Motion::Up, false), cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &acts::CursorDown, _, cx| this.command(Command::Move(Motion::Down, false), cx)),
-            )
-            .on_action(cx.listener(|this, _: &acts::CursorWordLeft, _, cx| {
-                this.command(Command::Move(Motion::WordLeft, false), cx)
+            .on_action(cx.listener(|this, _: &acts::Cancel, window, cx| this.command(Command::Cancel, window, cx)))
+            .on_action(cx.listener(|this, _: &acts::Newline, window, cx| this.command(Command::Newline, window, cx)))
+            .on_action(cx.listener(|this, _: &acts::DeleteBackward, window, cx| {
+                this.command(Command::Delete { forward: false, word: false }, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &acts::CursorWordRight, _, cx| {
-                this.command(Command::Move(Motion::WordRight, false), cx)
+            .on_action(cx.listener(|this, _: &acts::DeleteForward, window, cx| {
+                this.command(Command::Delete { forward: true, word: false }, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &acts::CursorLineHome, _, cx| {
-                this.command(Command::Move(Motion::LineHome, false), cx)
+            .on_action(cx.listener(|this, _: &acts::DeleteWordBackward, window, cx| {
+                this.command(Command::Delete { forward: false, word: true }, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &acts::CursorLineEnd, _, cx| {
-                this.command(Command::Move(Motion::LineEnd, false), cx)
+            .on_action(cx.listener(|this, _: &acts::DeleteWordForward, window, cx| {
+                this.command(Command::Delete { forward: true, word: true }, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &acts::CursorDocStart, _, cx| {
-                this.command(Command::Move(Motion::DocStart, false), cx)
+            .on_action(cx.listener(|this, _: &acts::CursorLeft, window, cx| {
+                this.command(Command::Move(Motion::Left, false), window, cx)
             }))
-            .on_action(
-                cx.listener(|this, _: &acts::CursorDocEnd, _, cx| {
-                    this.command(Command::Move(Motion::DocEnd, false), cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &acts::SelectLeft, _, cx| this.command(Command::Move(Motion::Left, true), cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &acts::SelectRight, _, cx| this.command(Command::Move(Motion::Right, true), cx)),
-            )
-            .on_action(cx.listener(|this, _: &acts::SelectUp, _, cx| this.command(Command::Move(Motion::Up, true), cx)))
-            .on_action(
-                cx.listener(|this, _: &acts::SelectDown, _, cx| this.command(Command::Move(Motion::Down, true), cx)),
-            )
-            .on_action(cx.listener(|this, _: &acts::SelectWordLeft, _, cx| {
-                this.command(Command::Move(Motion::WordLeft, true), cx)
+            .on_action(cx.listener(|this, _: &acts::CursorRight, window, cx| {
+                this.command(Command::Move(Motion::Right, false), window, cx)
             }))
-            .on_action(cx.listener(|this, _: &acts::SelectWordRight, _, cx| {
-                this.command(Command::Move(Motion::WordRight, true), cx)
+            .on_action(cx.listener(|this, _: &acts::CursorUp, window, cx| {
+                this.command(Command::Move(Motion::Up, false), window, cx)
             }))
-            .on_action(cx.listener(|this, _: &acts::SelectLineHome, _, cx| {
-                this.command(Command::Move(Motion::LineHome, true), cx)
+            .on_action(cx.listener(|this, _: &acts::CursorDown, window, cx| {
+                this.command(Command::Move(Motion::Down, false), window, cx)
             }))
-            .on_action(cx.listener(|this, _: &acts::SelectLineEnd, _, cx| {
-                this.command(Command::Move(Motion::LineEnd, true), cx)
+            .on_action(cx.listener(|this, _: &acts::CursorWordLeft, window, cx| {
+                this.command(Command::Move(Motion::WordLeft, false), window, cx)
             }))
-            .on_action(cx.listener(|this, _: &acts::SelectDocStart, _, cx| {
-                this.command(Command::Move(Motion::DocStart, true), cx)
+            .on_action(cx.listener(|this, _: &acts::CursorWordRight, window, cx| {
+                this.command(Command::Move(Motion::WordRight, false), window, cx)
             }))
-            .on_action(
-                cx.listener(|this, _: &acts::SelectDocEnd, _, cx| {
-                    this.command(Command::Move(Motion::DocEnd, true), cx)
-                }),
-            )
+            .on_action(cx.listener(|this, _: &acts::CursorLineHome, window, cx| {
+                this.command(Command::Move(Motion::LineHome, false), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::CursorLineEnd, window, cx| {
+                this.command(Command::Move(Motion::LineEnd, false), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::CursorDocStart, window, cx| {
+                this.command(Command::Move(Motion::DocStart, false), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::CursorDocEnd, window, cx| {
+                this.command(Command::Move(Motion::DocEnd, false), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::SelectLeft, window, cx| {
+                this.command(Command::Move(Motion::Left, true), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::SelectRight, window, cx| {
+                this.command(Command::Move(Motion::Right, true), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::SelectUp, window, cx| {
+                this.command(Command::Move(Motion::Up, true), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::SelectDown, window, cx| {
+                this.command(Command::Move(Motion::Down, true), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::SelectWordLeft, window, cx| {
+                this.command(Command::Move(Motion::WordLeft, true), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::SelectWordRight, window, cx| {
+                this.command(Command::Move(Motion::WordRight, true), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::SelectLineHome, window, cx| {
+                this.command(Command::Move(Motion::LineHome, true), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::SelectLineEnd, window, cx| {
+                this.command(Command::Move(Motion::LineEnd, true), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::SelectDocStart, window, cx| {
+                this.command(Command::Move(Motion::DocStart, true), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::SelectDocEnd, window, cx| {
+                this.command(Command::Move(Motion::DocEnd, true), window, cx)
+            }))
             // Hover tooltip: a plain-text bubble under the hovered diagnostic.
             .children(self.render_hover_tooltip(cx))
             // Completion popup: the filtered item list at the caret.
@@ -2162,15 +2194,10 @@ impl EditorPane {
                         .into_any_element(),
                 )
             }
-            Some(RenameFlow::Preview { edit, name }) => {
+            Some(RenameFlow::Preview { edit, name, .. }) => {
                 let mut rows = gpui::div().flex().flex_col().gap_1();
-                let apply_edit = edit.clone();
-                let apply_name = name.clone();
-                let apply = cx.listener(move |this, _, _, cx| {
-                    this.rename = Some(RenameFlow::Preview { edit: apply_edit.clone(), name: apply_name.clone() });
-                    this.rename_apply(cx);
-                });
-                let cancel = cx.listener(|this, _, _, cx| this.rename_cancel_flow(cx));
+                let apply = cx.listener(|this, _, window, cx| this.rename_apply(window, cx));
+                let cancel = cx.listener(|this, _, window, cx| this.rename_cancel_flow(window, cx));
                 let mut total = 0usize;
                 for file in &edit.files {
                     if let ide_core::FileEdit::Edit { path, edits, .. } = file {
