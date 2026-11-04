@@ -248,6 +248,13 @@ impl Host {
         let branch = repo.head()?.0;
         Ok((statuses, branch))
     }
+
+    /// Line hunks of `current_text` against HEAD (UTF-8 like every M0–M3
+    /// document; call on a background thread).
+    pub fn git_line_hunks(&self, path: &Path, current_text: &str) -> IdeResult<Vec<ide_vcs::LineHunk>> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        repo.line_hunks(path, current_text, false, encoding_rs::UTF_8)
+    }
 }
 
 /// Stable per-project cache-directory name (FNV-1a of the root), the same

@@ -35,3 +35,9 @@ pub const RUN_ALREADY_RUNNING: &str = "A run is already active — stop it first
 pub const RUN_LAUNCH_FAILED: &str = "Run failed";
 // The Run picker's synthetic row for a one-off shell command line.
 pub const RUN_SHELL_PREFIX: &str = "Run command: ";
+// Git (M4).
+pub const GIT_NOT_A_REPO: &str = "The project is not a git repository";
+pub const DIFF_TITLE: &str = "Diff";
+pub const DIFF_NO_CHANGES: &str = "No changes against HEAD";
+pub const DIFF_FAILED: &str = "Diff failed";
+pub const DIFF_TARGET_HINT: &str = "Select a changed file in the tree (or open one) to diff";

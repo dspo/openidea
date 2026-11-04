@@ -54,6 +54,8 @@ ide-run = { path = "../../crates/ide-run" }
 # M4: the minimal git surface — status / diff / stage / commit through the
 # same Repo the Tauri host's VCS feature drives.
 ide-vcs = { path = "../../crates/ide-vcs" }
+# The charset constant for ide-vcs's TextEncoding (UTF-8 documents only here).
+encoding_rs = "0.8"
 # The grammar Language values come from ide-language; this must resolve to the
 # same tree-sitter the main workspace pins (0.25.10) so the types unify.
 tree-sitter = "=0.25.10"

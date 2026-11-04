@@ -8,6 +8,7 @@
 
 mod actions;
 mod bus;
+mod diff_view;
 mod editor;
 mod file_tree;
 mod fuzzy;

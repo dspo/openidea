@@ -5622,6 +5622,7 @@ version = "0.0.0"
 dependencies = [
  "dirs 6.0.0",
  "dunce",
+ "encoding_rs",
  "gpui-component",
  "gpui-kit-assets",
  "gpui-pre",
