@@ -15,7 +15,7 @@
 //! what makes candidate-window geometry and commit replacement fall out of
 //! ordinary range math.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -321,6 +321,49 @@ struct Geometry {
     height: Pixels,
 }
 
+/// The F12 perf HUD's counters. Cells, so the element's prepaint/paint phases
+/// (which hold only a shared view borrow) can publish what the HUD paints.
+#[derive(Default)]
+struct Hud {
+    visible: Cell<bool>,
+    /// Rolling frame starts, newest last (bounded).
+    frames: RefCell<Vec<std::time::Instant>>,
+    last_frame_ms: Cell<f32>,
+    /// Instant of the last user input; diffed at the next prepaint.
+    last_input: Cell<Option<std::time::Instant>>,
+    input_latency_ms: Cell<Option<f32>>,
+    rows_laid_out: Cell<u32>,
+    spans_painted: Cell<u32>,
+    spans_total: Cell<u32>,
+    parse_started: Cell<Option<std::time::Instant>>,
+    parse_ms: Cell<Option<f32>>,
+    parse_version: Cell<u32>,
+}
+
+impl Hud {
+    fn note_input(&self) {
+        self.last_input.set(Some(std::time::Instant::now()));
+    }
+
+    /// FPS over the trailing ~half second, and the newest frame interval.
+    fn frame(&self) -> (f32, f32) {
+        let mut frames = self.frames.borrow_mut();
+        let now = std::time::Instant::now();
+        if let Some(last) = frames.last() {
+            self.last_frame_ms.set((now - *last).as_secs_f32() * 1000.0);
+        }
+        frames.push(now);
+        while frames.len() > 240 {
+            frames.remove(0);
+        }
+        let fps = match (frames.first(), frames.last()) {
+            (Some(first), Some(last)) if *last > *first => (frames.len() as f32 - 1.0) / (*last - *first).as_secs_f32(),
+            _ => 0.0,
+        };
+        (fps, self.last_frame_ms.get())
+    }
+}
+
 pub struct EditorPane {
     host: Arc<Host>,
     doc_id: DocId,
@@ -335,6 +378,9 @@ pub struct EditorPane {
     highlighter: Option<Arc<Highlighter>>,
     language: ide_core::LanguageId,
     large: bool,
+    /// The backend refuses edits on read-only documents (large files are
+    /// flagged read-only); the pane short-circuits instead of resync-storming.
+    read_only: bool,
     tree: Option<Tree>,
     spans: Vec<(Range<usize>, Kind)>,
     parse_in_flight: bool,
@@ -355,6 +401,11 @@ pub struct EditorPane {
     // Folding (phase 5): the syntax candidates plus the user's folded subset.
     fold_candidates: Vec<(u32, u32)>,
     folds: Vec<Fold>,
+    /// F12 perf overlay counters (phase 7).
+    hud: Hud,
+    /// When the pane was created; the first paint logs the open latency.
+    created_at: std::time::Instant,
+    first_paint_done: Cell<bool>,
 }
 
 impl Focusable for EditorPane {
@@ -377,6 +428,7 @@ impl EditorPane {
             highlighter: None,
             language,
             large: info.large,
+            read_only: info.read_only,
             tree: None,
             spans: Vec::new(),
             parse_in_flight: false,
@@ -390,6 +442,9 @@ impl EditorPane {
             last_edit: None,
             fold_candidates: Vec::new(),
             folds: Vec::new(),
+            hud: Hud::default(),
+            created_at: std::time::Instant::now(),
+            first_paint_done: Cell::new(false),
         };
         pane.start_syntax(cx);
         pane
@@ -416,6 +471,7 @@ impl EditorPane {
             return;
         }
         self.parse_in_flight = true;
+        self.hud.parse_started.set(Some(std::time::Instant::now()));
         let rope = self.buf.doc.rope().clone();
         let old_tree = self.tree.take();
         let version = self.buf.doc.version();
@@ -442,6 +498,10 @@ impl EditorPane {
         cx: &mut gpui::Context<Self>,
     ) {
         self.parse_in_flight = false;
+        if let (Some(started), Some((_, _, _, version))) = (self.hud.parse_started.get(), parsed.as_ref()) {
+            self.hud.parse_ms.set(Some(started.elapsed().as_secs_f32() * 1000.0));
+            self.hud.parse_version.set(*version);
+        }
         if generation == self.parse_generation
             && let Some((tree, spans, fold_candidates, _)) = parsed
             && self.tree.is_none()
@@ -508,6 +568,9 @@ impl EditorPane {
     /// and to the backend, feed the syntax tree, record the undo entry (per
     /// `Cause`), and map the cursors through the batch.
     fn apply_edits(&mut self, changes: Vec<TextChange>, cause: Cause, cx: &mut gpui::Context<Self>) {
+        if self.read_only {
+            return;
+        }
         let mut changes = changes;
         changes.sort_by_key(|c| (c.from, c.to));
         changes.retain(|c| c.from < c.to || !c.insert.is_empty());
@@ -796,6 +859,7 @@ impl EditorPane {
         new_selected: Option<Range<usize>>,
         cx: &mut gpui::Context<Self>,
     ) {
+        self.hud.note_input();
         let caret = self.selections.first().map_or(0, |s| s.head);
         let base = range_utf16.clone().or_else(|| self.buf.marked.clone()).unwrap_or(caret..caret);
         let (marked, change) = self.buf.replace(base, new_text);
@@ -822,6 +886,7 @@ impl EditorPane {
     /// `insertText:replacementRange:` — commits the composition (replacing
     /// the marked range) or inserts at the primary cursor.
     fn ime_commit(&mut self, range_utf16: Option<Range<usize>>, text: &str, cx: &mut gpui::Context<Self>) {
+        self.hud.note_input();
         let caret = self.selections.first().map_or(0, |s| s.head);
         let base = range_utf16.clone().or_else(|| self.buf.marked.clone()).unwrap_or(caret..caret);
         let (inserted, change) = self.buf.replace(base, text);
@@ -839,6 +904,24 @@ impl EditorPane {
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut gpui::Context<Self>) {
         let ks = &ev.keystroke;
         let mods = &ks.modifiers;
+        if ks.key == "f12" && !mods.platform {
+            let on = !self.hud.visible.get();
+            self.hud.visible.set(on);
+            eprintln!(
+                "[perf] hud {} — rows {} spans {}/{} parse {:?} ms@v{} input {:?} ms frame {:.1} ms",
+                if on { "on" } else { "off" },
+                self.hud.rows_laid_out.get(),
+                self.hud.spans_painted.get(),
+                self.hud.spans_total.get(),
+                self.hud.parse_ms.get(),
+                self.hud.parse_version.get(),
+                self.hud.input_latency_ms.get(),
+                self.hud.last_frame_ms.get()
+            );
+            cx.notify();
+            return;
+        }
+        self.hud.note_input();
         if mods.function {
             return;
         }
@@ -1523,6 +1606,26 @@ impl Element for EditorElement {
             }
         }
 
+        if !pane.first_paint_done.replace(true) {
+            eprintln!("[perf] first paint {:.0} ms after open", pane.created_at.elapsed().as_secs_f32() * 1000.0);
+        }
+
+        // HUD counters: input→pixel latency lands at the first prepaint after
+        // an input; row/span counts describe this frame.
+        if let Some(input) = pane.hud.last_input.get() {
+            pane.hud.input_latency_ms.set(Some(input.elapsed().as_secs_f32() * 1000.0));
+            pane.hud.last_input.set(None);
+        }
+        pane.hud.rows_laid_out.set(rows.len() as u32);
+        pane.hud.spans_total.set(pane.spans.len() as u32);
+        let visible_lo =
+            rows.iter().filter_map(|row| row.line.map(|line| pane.buf.line_start(line))).min().unwrap_or(usize::MAX);
+        let visible_hi =
+            rows.iter().filter_map(|row| row.line.map(|line| pane.buf.line_span(line).end)).max().unwrap_or(0);
+        let lo_idx = pane.spans.partition_point(|(range, _)| range.end <= visible_lo);
+        let hi_idx = pane.spans.partition_point(|(range, _)| range.start < visible_hi);
+        pane.hud.spans_painted.set(hi_idx.saturating_sub(lo_idx) as u32);
+
         pane.geometry.set(Some(Geometry {
             gutter_x,
             gutter_w,
@@ -1592,6 +1695,40 @@ impl Element for EditorElement {
             }
             for caret in &prepaint.carets {
                 window.paint_quad(fill(*caret, rgba_of(theme::ACCENT)));
+            }
+
+            // F12 perf HUD, top right, above everything.
+            let hud = &self.view.read(cx).hud;
+            if hud.visible.get() {
+                let (fps, frame_ms) = hud.frame();
+                let latency = hud.input_latency_ms.get().map_or("-".to_owned(), |ms| format!("{ms:.1}"));
+                let parse = hud.parse_ms.get().map_or("-".to_owned(), |ms| format!("{ms:.1}"));
+                let lines = [
+                    format!("{fps:.0} fps · frame {frame_ms:.1} ms"),
+                    format!(
+                        "rows {} · spans {}/{}",
+                        hud.rows_laid_out.get(),
+                        hud.spans_painted.get(),
+                        hud.spans_total.get()
+                    ),
+                    format!("key→px {latency} ms · parse {parse} ms @v{}", hud.parse_version.get()),
+                    format!(
+                        "cursors {} · folds {}",
+                        self.view.read(cx).selections.len(),
+                        self.view.read(cx).folds.len()
+                    ),
+                ];
+                let font_size = theme::px_font_size();
+                for (index, line) in lines.iter().enumerate() {
+                    let width = shaped_width(window, line, font_size);
+                    let x = bounds.origin.x + bounds.size.width - width - px(10.0);
+                    let y = bounds.origin.y + px(6.0) + line_height * index as f32;
+                    let background = Bounds::new(point(x - px(6.0), y), size(width + px(12.0), line_height));
+                    window.paint_quad(fill(background, rgba_of(theme::BG_APP << 8 | 0xe0)));
+                    let run = plain_run(line.len(), theme::fg());
+                    let shaped = window.text_system().shape_line(line.as_str().into(), font_size, &[run], None);
+                    let _ = shaped.paint(point(x, y), line_height, TextAlign::Left, None, window, cx);
+                }
             }
         });
 
