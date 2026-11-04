@@ -618,7 +618,20 @@ pub struct EditorPane {
     /// flagged read-only); the pane short-circuits instead of resync-storming.
     read_only: bool,
     tree: Option<Tree>,
+    /// The tree-sitter spans (one source); the paint list `spans` is the
+    /// semantic overlay merged over these (M5 phase 2).
+    syntax_spans: Vec<(Range<usize>, Kind)>,
+    /// The merged paint list (semantic over tree-sitter, sorted
+    /// non-overlapping byte ranges).
     spans: Vec<(Range<usize>, Kind)>,
+    /// The last semantic-token answer as byte ranges (empty without a
+    /// capable server or before the first answer).
+    semantic_spans: Vec<(Range<usize>, Kind)>,
+    /// Semantic request generation (stale answers drop).
+    semantic_gen: u32,
+    /// Retry budget while the server starts; an explicit "no support"
+    /// answer (Ok None) stops retrying.
+    semantic_retries: u32,
     parse_in_flight: bool,
     /// An edit landed while a parse ran; reschedule when it lands.
     parse_dirty: bool,
@@ -687,7 +700,11 @@ impl EditorPane {
             large: info.large,
             read_only: info.read_only,
             tree: None,
+            syntax_spans: Vec::new(),
             spans: Vec::new(),
+            semantic_spans: Vec::new(),
+            semantic_gen: 0,
+            semantic_retries: 0,
             parse_in_flight: false,
             parse_dirty: false,
             pending_edits: Vec::new(),
@@ -724,6 +741,96 @@ impl EditorPane {
         let Some(highlighter) = Highlighter::for_language(&self.language) else { return };
         self.highlighter = Some(highlighter.clone());
         self.schedule_parse(highlighter, cx);
+    }
+
+    // -- semantic tokens (M5 phase 2) ----------------------------------------
+    //
+    // One debounced request per settled parse; the answer overlays the
+    // grammar spans. Edits bump the generation, so a stale answer drops, and
+    // the in-flight byte ranges ride the edit deltas until it lands.
+
+    /// Schedules the debounced semantic-token request (a settled parse or a
+    /// landing overlay implies the text changed).
+    fn schedule_semantic(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.large || self.semantic_retries > 5 {
+            return;
+        }
+        self.semantic_gen += 1;
+        let req = self.semantic_gen;
+        let version = self.buf.doc.version();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let lsp = self.host.lsp.clone();
+        let doc = self.doc_id;
+        self.host.runtime.spawn(async move {
+            // The debounce lives on the tokio side: a burst of keystrokes
+            // collapses into the last generation.
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let result = lsp.semantic_tokens(doc).await;
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.await {
+                this.update(cx, |pane, cx| {
+                    if pane.semantic_gen == req {
+                        pane.semantic_ready(req, version, result, cx);
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Lands a semantic answer: only the current generation at the same
+    /// buffer version is accepted; a missing capability stops retrying, a
+    /// failed (starting/missing) server burns one retry round.
+    fn semantic_ready(
+        &mut self,
+        req: u32,
+        version: u32,
+        result: IdeResult<Option<ide_lsp::types::SemanticTokens>>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if req != self.semantic_gen {
+            return;
+        }
+        match result {
+            Ok(Some(tokens)) if version == self.buf.doc.version() => {
+                self.semantic_retries = 0;
+                self.semantic_spans = crate::semantic::token_spans(&tokens, self.buf.doc.rope());
+                self.merge_spans();
+                eprintln!("[lsp] semantic tokens {} spans", self.semantic_spans.len());
+                cx.notify();
+            }
+            // Server ready without semantic support: stop asking. A stale
+            // version re-requests through the next parse instead.
+            Ok(_) => self.semantic_retries = 5,
+            Err(_) => {
+                self.semantic_retries += 1;
+                if self.semantic_retries <= 5 {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let lsp = self.host.lsp.clone();
+                    let doc = self.doc_id;
+                    self.host.runtime.spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        let result = lsp.semantic_tokens(doc).await;
+                        let _ = tx.send(result);
+                    });
+                    let req = self.semantic_gen;
+                    cx.spawn(async move |this, cx| {
+                        if let Ok(result) = rx.await {
+                            this.update(cx, |pane, cx| {
+                                if pane.semantic_gen == req {
+                                    pane.semantic_ready(req, version, result, cx);
+                                }
+                            })
+                            .ok();
+                        }
+                    })
+                    .detach();
+                }
+            }
+        }
     }
 
     /// Schedules an incremental re-parse on the background executor. The tree
@@ -776,7 +883,11 @@ impl EditorPane {
                 tree.edit(&input_edit(&edit));
             }
             self.tree = Some(tree);
-            self.spans = spans;
+            self.syntax_spans = spans;
+            self.merge_spans();
+            // The paint list changed: refresh the semantic overlay for the
+            // new text (debounced, generation-guarded).
+            self.schedule_semantic(cx);
             // Keep the user's folds that still exist as candidates; their
             // ends follow the (possibly edited) syntax.
             self.fold_candidates = fold_candidates;
@@ -799,8 +910,17 @@ impl EditorPane {
         cx.notify();
     }
 
+    /// The merged paint list: semantic tokens over the grammar capture, so
+    /// the server's precise kinds win where they exist.
+    fn merge_spans(&mut self) {
+        let len = self.buf.doc.rope().len_bytes();
+        self.spans = crate::highlight::overlay(&self.syntax_spans, &self.semantic_spans, len);
+    }
+
     /// Applies byte-coordinate edits to the syntax tree, shifts the folded
     /// ranges with the line deltas, and schedules an incremental re-parse.
+    /// The semantic overlay rides the byte deltas too; spans the edit ran
+    /// through drop until the next answer lands.
     fn after_edits(&mut self, byte_edits: &[ide_text::ByteEdit], cx: &mut gpui::Context<Self>) {
         for edit in byte_edits {
             let (start, old_end, new_end) = (edit.start.row as u32, edit.old_end.row as u32, edit.new_end.row as u32);
@@ -816,6 +936,22 @@ impl EditorPane {
                     false // the edit ran through the folded range: unfold it
                 }
             });
+            let (edit_start, edit_old_end, edit_shift) = (edit.start_byte as i64, edit.old_end_byte as i64, shift);
+            self.semantic_spans.retain_mut(|(range, _)| {
+                let (range_start, range_end) = (range.start as i64, range.end as i64);
+                if range_end <= edit_start {
+                    true
+                } else if range_start >= edit_old_end {
+                    range.start = (range_start + edit_shift).max(0) as usize;
+                    range.end = (range_end + edit_shift).max(0) as usize;
+                    range.start < range.end
+                } else {
+                    false // the edit ran through the token: overlay refreshes
+                }
+            });
+        }
+        if !self.semantic_spans.is_empty() {
+            self.merge_spans();
         }
         if let Some(tree) = &mut self.tree {
             for edit in byte_edits {
@@ -1202,7 +1338,10 @@ impl EditorPane {
             // exists anywhere; the in-flight parse (if any) is invalidated.
             self.parse_generation += 1;
             self.tree = None;
+            self.syntax_spans.clear();
             self.spans.clear();
+            self.semantic_spans.clear();
+            self.semantic_gen += 1;
             self.pending_edits.clear();
             self.fold_candidates.clear();
             self.folds.clear();

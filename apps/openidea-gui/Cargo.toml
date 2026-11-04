@@ -59,6 +59,9 @@ encoding_rs = "0.8"
 # The grammar Language values come from ide-language; this must resolve to the
 # same tree-sitter the main workspace pins (0.25.10) so the types unify.
 tree-sitter = "=0.25.10"
+# The rope type ide-text exposes (`Document::rope`); semantic tokens map their
+# UTF-16 positions onto byte ranges through it. Same version as ide-text pins.
+ropey = { version = "1.6", default-features = false, features = ["simd"] }
 # Query match iteration (`matches()` returns a streaming iterator).
 streaming-iterator = "0.1"
 # Windows-friendly path canonicalization, the repo-wide convention.

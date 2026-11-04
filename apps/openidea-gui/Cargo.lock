@@ -5637,6 +5637,7 @@ dependencies = [
  "ide-vfs",
  "ide-workspace",
  "rfd",
+ "ropey 1.6.1",
  "streaming-iterator",
  "tokio",
  "tracing-subscriber",
