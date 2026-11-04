@@ -21,4 +21,17 @@ pub const LS_STOPPED: &str = "stopped";
 // Go to File / Search Everywhere palette.
 pub const PICKER_FILE_PLACEHOLDER: &str = "Go to file (empty lists recent files)";
 pub const PICKER_EVERYWHERE_PLACEHOLDER: &str = "Search files, symbols and actions";
+pub const PICKER_RUN_PLACEHOLDER: &str = "Run configuration, or a shell command line";
 pub const PICKER_NO_MATCHES: &str = "No matches";
+// The Run dock.
+pub const RUN_TITLE: &str = "Run";
+pub const RUN_STARTING: &str = "starting…";
+pub const RUN_RUNNING: &str = "running · ";
+pub const RUN_EXIT_CODE: &str = "exit code";
+pub const RUN_EXITED: &str = "exited";
+pub const RUN_STOP: &str = "Stop";
+pub const RUN_CLEAR: &str = "Clear";
+pub const RUN_ALREADY_RUNNING: &str = "A run is already active — stop it first";
+pub const RUN_LAUNCH_FAILED: &str = "Run failed";
+// The Run picker's synthetic row for a one-off shell command line.
+pub const RUN_SHELL_PREFIX: &str = "Run command: ";

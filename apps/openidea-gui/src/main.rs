@@ -13,6 +13,7 @@ mod file_tree;
 mod fuzzy;
 mod highlight;
 mod host;
+mod run_panel;
 mod strings;
 mod theme;
 mod workbench;
@@ -25,11 +26,11 @@ use gpui_component::{Root, Theme, ThemeMode};
 use gpui_kit_assets::AllAssets;
 
 use crate::actions::{
-    Cancel, CloseTab, CursorDocEnd, CursorDocStart, CursorDown, CursorLeft, CursorLineEnd, CursorLineHome, CursorRight,
-    CursorUp, CursorWordLeft, CursorWordRight, DeleteBackward, DeleteForward, DeleteWordBackward, DeleteWordForward,
-    FindUsages, GoToFile, GotoDefinition, Newline, OpenFile, Paste, Quit, Redo, Rename, Save, SelectDocEnd,
-    SelectDocStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineHome, SelectRight, SelectUp, SelectWordLeft,
-    SelectWordRight, TogglePerfHud, Undo,
+    Cancel, CloseTab, Commit, CursorDocEnd, CursorDocStart, CursorDown, CursorLeft, CursorLineEnd, CursorLineHome,
+    CursorRight, CursorUp, CursorWordLeft, CursorWordRight, DeleteBackward, DeleteForward, DeleteWordBackward,
+    DeleteWordForward, FindUsages, GoToFile, GotoDefinition, Newline, OpenFile, Paste, Quit, Redo, Rename, Run, Save,
+    SelectDocEnd, SelectDocStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineHome, SelectRight, SelectUp,
+    SelectWordLeft, SelectWordRight, ShowDiff, TogglePerfHud, Undo,
 };
 use crate::actions::{SelectNext, SelectPrev};
 use crate::bus::Bus;
@@ -39,9 +40,10 @@ use crate::workbench::Workbench;
 const WINDOW_WIDTH: f32 = 1200.0;
 const WINDOW_HEIGHT: f32 = 800.0;
 
-/// The open project's host as a global, so window-level actions (Quit) reach
-/// the backend without threading it through every entity.
-struct ProjectHost(Arc<Host>);
+/// The open project's host as a global, so window-level actions (Quit) and
+/// feature panels (the run dock's Stop) reach the backend without threading
+/// it through every entity.
+pub(crate) struct ProjectHost(pub(crate) Arc<Host>);
 
 impl gpui::Global for ProjectHost {}
 
@@ -105,6 +107,10 @@ fn main() {
                     KeyBinding::new("cmd-b", GotoDefinition, None),
                     KeyBinding::new("shift-f6", Rename, None),
                     KeyBinding::new("alt-f7", FindUsages, None),
+                    // M4: run and git surfaces (handlers on the workbench).
+                    KeyBinding::new("ctrl-r", Run, None),
+                    KeyBinding::new("ctrl-d", ShowDiff, None),
+                    KeyBinding::new("cmd-k", Commit, None),
                     // Escape cancels panels/popups first (whatever has focus),
                     // then collapses the editor's own state.
                     KeyBinding::new("escape", Cancel, None),
