@@ -21,9 +21,9 @@ use std::sync::Arc;
 
 use gpui::{
     App, Bounds, Element, ElementId, Entity, FocusHandle, Focusable, GlobalElementId, InputHandler, InspectorElementId,
-    InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
-    Render, ScrollWheelEvent, ShapedLine, Styled, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, fill,
-    point, px, relative, rgba, size,
+    InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Point, Render, ScrollWheelEvent, ShapedLine, Styled, TextAlign, TextRun, UTF16Selection,
+    UnderlineStyle, Window, fill, point, px, relative, rgba, size,
 };
 use ide_core::{ChangeSet, DocId, TextChange};
 use ide_workspace::DocumentInfo;
@@ -60,19 +60,116 @@ fn byte_at_utf16(text: &str, target: usize) -> usize {
 
 /// The rope-backed buffer with IME bookkeeping. All offsets are UTF-16 of the
 /// `\n`-normalized text (`ide_text` normalizes on construction, exactly like
-/// the backend document this mirrors).
+/// the backend document this mirrors). Carets live in the pane's selections.
 struct Buffer {
     doc: ide_text::Document,
     /// The in-flight composition, inline in `doc`.
     marked: Option<Range<usize>>,
-    caret: usize,
+}
+
+/// One cursor with optional selection. Offsets are UTF-16; `head` is the
+/// caret (where editing happens) and may sit before `anchor` (`reversed`),
+/// `goal_col` preserves the wanted column across vertical moves (None =
+/// derive from the head).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Selection {
+    anchor: usize,
+    head: usize,
+    reversed: bool,
+    goal_col: Option<usize>,
+}
+
+impl Selection {
+    /// A bare caret.
+    fn caret(offset: usize) -> Self {
+        Self { anchor: offset, head: offset, reversed: false, goal_col: None }
+    }
+
+    fn with_head(mut self, head: usize) -> Self {
+        self.reversed = head < self.anchor;
+        self.head = head;
+        self
+    }
+
+    /// Sorted `(start, end)` of the selected range.
+    fn normalized(&self) -> (usize, usize) {
+        if self.reversed { (self.head, self.anchor) } else { (self.anchor, self.head) }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+
+    /// Cursors after a batch that replaced each range with its insert: one
+    /// caret at the end of each inserted text, in post-batch coordinates.
+    fn after_inserts(changes: &[TextChange]) -> Vec<Selection> {
+        let mut out = Vec::with_capacity(changes.len());
+        let mut delta: i64 = 0;
+        for change in changes {
+            let inserted = change.insert.chars().map(char::len_utf16).sum::<usize>();
+            let head = (change.from as i64 + delta).max(0) as usize + inserted;
+            out.push(Selection::caret(head));
+            delta += inserted as i64 - (change.to - change.from) as i64;
+        }
+        out
+    }
+}
+
+/// What a press started: a normal anchor drag, or a ⌥ column selection.
+#[derive(Clone, Copy)]
+enum Drag {
+    Normal { anchor: usize },
+    Columnar { from: Point<Pixels> },
+}
+
+/// Motions the keymap maps onto. Word/line variants are chosen by modifier.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Motion {
+    Left,
+    Right,
+    Up,
+    Down,
+    WordLeft,
+    WordRight,
+    LineHome,
+    LineEnd,
+    DocStart,
+    DocEnd,
+}
+
+/// Why an edit batch happened; decides undo grouping and caret mapping.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cause {
+    /// Printable input across cursors (groups in the undo timeline).
+    Typing,
+    /// Backspace/Delete across cursors (groups like typing).
+    Delete,
+    /// An IME commit: undo removes the whole composition, not just the final
+    /// text (the marked keystrokes were never undo entries).
+    ImeCommit,
+    /// Undo/redo/IME marked-text application: no undo entry, selections are
+    /// managed by the caller.
+    Mechanical,
+}
+
+/// One applied edit batch with its inverse and the cursor states around it.
+struct UndoEntry {
+    /// Forward changes (ascending, non-overlapping, against `base_version`).
+    changes: Vec<TextChange>,
+    /// The same batch undone, in the coordinates *after* the batch.
+    inverse: Vec<TextChange>,
+    selections_before: Vec<Selection>,
+    selections_after: Vec<Selection>,
+}
+
+/// Consecutive typing/deleting batches merge into one undo step.
+struct UndoGroup {
+    entries: Vec<UndoEntry>,
 }
 
 impl Buffer {
     fn new(text: &str) -> Self {
-        let doc = ide_text::Document::new(text);
-        let caret = doc.len_utf16() as usize;
-        Self { doc, marked: None, caret }
+        Self { doc: ide_text::Document::new(text), marked: None }
     }
 
     fn utf16_len(&self) -> usize {
@@ -111,6 +208,71 @@ impl Buffer {
         start..end.max(start)
     }
 
+    /// Char index of a UTF-16 offset (clamped, mid-surrogate rounds down).
+    fn char_at(&self, utf16: usize) -> usize {
+        self.doc.rope().utf16_cu_to_char(self.clamp(utf16) as usize)
+    }
+
+    fn utf16_of(&self, ch: usize) -> usize {
+        self.doc.rope().char_to_utf16_cu(ch)
+    }
+
+    /// The UTF-16 offset of the previous char boundary (0 at the top).
+    fn prev_boundary(&self, utf16: usize) -> usize {
+        let ch = self.char_at(utf16);
+        if ch > 0 { self.utf16_of(ch - 1) } else { 0 }
+    }
+
+    fn next_boundary(&self, utf16: usize) -> usize {
+        let ch = self.char_at(utf16);
+        let count = self.doc.rope().len_chars();
+        if ch < count { self.utf16_of(ch + 1) } else { self.utf16_len() }
+    }
+
+    /// The char sitting at (i.e. starting at) a boundary.
+    fn char_of(&self, utf16: usize) -> char {
+        self.doc.rope().char(self.char_at(utf16))
+    }
+
+    /// Same as [`Buffer::char_of`], the class at a boundary.
+    fn class_at(&self, utf16: usize) -> u8 {
+        char_class(self.char_of(utf16))
+    }
+
+    /// The word-class run boundary left of `offset` (a whitespace run is
+    /// crossed first, then one same-class run is consumed).
+    fn word_start(&self, offset: usize) -> usize {
+        let mut i = offset.min(self.utf16_len());
+        while i > 0 && char_class(self.char_of(self.prev_boundary(i))) == 0 {
+            i = self.prev_boundary(i);
+        }
+        if i == 0 {
+            return 0;
+        }
+        let class = char_class(self.char_of(self.prev_boundary(i)));
+        while i > 0 && char_class(self.char_of(self.prev_boundary(i))) == class {
+            i = self.prev_boundary(i);
+        }
+        i
+    }
+
+    /// The word-class run boundary right of `offset`.
+    fn word_end(&self, offset: usize) -> usize {
+        let len = self.utf16_len();
+        let mut i = offset.min(len);
+        while i < len && self.class_at(i) == 0 {
+            i = self.next_boundary(i);
+        }
+        if i >= len {
+            return len;
+        }
+        let class = self.class_at(i);
+        while i < len && self.class_at(i) == class {
+            i = self.next_boundary(i);
+        }
+        i
+    }
+
     /// Replace a UTF-16 range with `new_text`, as a change for [`Buffer`]'s
     /// document; returns the inserted range and the change. Applying it is
     /// the pane's job (it also pushes the change to the backend).
@@ -121,95 +283,16 @@ impl Buffer {
         let len = utf16_len(new_text);
         (start..start + len, change)
     }
+}
 
-    /// `setMarkedText:selectedRange:replacementRange:`. `range_utf16` (when
-    /// given) replaces that range; otherwise the previous marked range, or an
-    /// insertion at the caret. An empty `new_text` cancels the composition
-    /// (the macOS Esc path). Returns the change for the pane to apply.
-    fn set_marked(
-        &mut self,
-        range_utf16: Option<Range<usize>>,
-        new_text: &str,
-        new_selected: Option<Range<usize>>,
-    ) -> TextChange {
-        let base = range_utf16.or_else(|| self.marked.clone()).unwrap_or(self.caret..self.caret);
-        let (marked, change) = self.replace(base, new_text);
-        self.marked = if new_text.is_empty() || marked.is_empty() { None } else { Some(marked.clone()) };
-        // The platform's selected range is relative to the marked text start.
-        self.caret = match new_selected {
-            Some(selected) => {
-                let start = selected.start.clamp(0, marked.len());
-                let end = selected.end.clamp(start, marked.len());
-                marked.start + end
-            }
-            None => marked.end,
-        };
-        change
-    }
-
-    /// `insertText:replacementRange:`. Committing replaces the marked range
-    /// when there is one; otherwise inserts at the caret.
-    fn insert_commit(&mut self, range_utf16: Option<Range<usize>>, text: &str) -> TextChange {
-        let base = range_utf16.or_else(|| self.marked.clone()).unwrap_or(self.caret..self.caret);
-        let (inserted, change) = self.replace(base, text);
-        self.marked = None;
-        self.caret = inserted.end;
-        change
-    }
-
-    fn unmark(&mut self) {
-        self.marked = None;
-    }
-
-    fn insert_plain(&mut self, text: &str) -> TextChange {
-        self.insert_commit(None, text)
-    }
-
-    fn backspace(&mut self) -> Option<TextChange> {
-        if self.caret == 0 {
-            return None;
-        }
-        let end = self.caret;
-        let start = self.clamp(self.caret - 1) as usize;
-        let (_, change) = self.replace(start..end, "");
-        self.caret = change.from as usize;
-        // Deleting into a marked region would desync the IME; drop it.
-        self.marked = None;
-        Some(change)
-    }
-
-    fn delete_forward(&mut self) -> Option<TextChange> {
-        let len = self.utf16_len();
-        if self.caret >= len {
-            return None;
-        }
-        let start = self.caret;
-        let end = (self.caret + 1).min(len);
-        let (_, change) = self.replace(start..end, "");
-        self.marked = None;
-        Some(change)
-    }
-
-    fn caret_left(&mut self) {
-        if self.caret > 0 {
-            self.caret = self.clamp(self.caret - 1) as usize;
-        }
-    }
-
-    fn caret_right(&mut self) {
-        let len = self.utf16_len();
-        if self.caret < len {
-            self.caret = (self.caret + 1).min(len);
-        }
-    }
-
-    fn caret_home(&mut self) {
-        self.caret = self.line_start(self.line_of(self.caret));
-    }
-
-    fn caret_end(&mut self) {
-        let line = self.line_of(self.caret);
-        self.caret = self.line_span(line).end;
+/// Whitespace / word / other, the three classes word motions jump between.
+fn char_class(ch: char) -> u8 {
+    if ch.is_whitespace() {
+        0
+    } else if ch.is_alphanumeric() || ch == '_' {
+        1
+    } else {
+        2
     }
 }
 
@@ -253,6 +336,13 @@ pub struct EditorPane {
     /// Bumped when the buffer is replaced wholesale; landed parses from an
     /// older generation are dropped.
     parse_generation: u32,
+    // Multi-cursor state (phase 4).
+    selections: Vec<Selection>,
+    drag: Cell<Option<Drag>>,
+    undo: Vec<UndoGroup>,
+    redo: Vec<UndoGroup>,
+    /// When the last grouped edit happened and whether it was one.
+    last_edit: Option<(std::time::Instant, bool)>,
 }
 
 impl Focusable for EditorPane {
@@ -281,6 +371,11 @@ impl EditorPane {
             parse_dirty: false,
             pending_edits: Vec::new(),
             parse_generation: 0,
+            selections: vec![Selection::caret(utf16_len(&info.text))],
+            drag: Cell::new(None),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            last_edit: None,
         };
         pane.start_syntax(cx);
         pane
@@ -367,12 +462,21 @@ impl EditorPane {
         }
     }
 
-    /// Applies one user edit locally and pushes it to the backend document
-    /// (which owns the dirty flag). A backend rejection resyncs from the
-    /// snapshot so the two never diverge silently.
-    fn edit(&mut self, change: TextChange, cx: &mut gpui::Context<Self>) {
+    /// The one edit pipeline: apply ascending non-overlapping changes locally
+    /// and to the backend, feed the syntax tree, record the undo entry (per
+    /// `Cause`), and map the cursors through the batch.
+    fn apply_edits(&mut self, changes: Vec<TextChange>, cause: Cause, cx: &mut gpui::Context<Self>) {
+        let mut changes = changes;
+        changes.sort_by_key(|c| (c.from, c.to));
+        changes.retain(|c| c.from < c.to || !c.insert.is_empty());
+        if changes.is_empty() {
+            return;
+        }
         let version = self.buf.doc.version();
-        let set = ChangeSet { changes: vec![change] };
+        // The inverse needs the text the batch replaces, captured pre-apply.
+        let originals: Vec<String> =
+            changes.iter().map(|c| self.buf.slice_utf16(c.from as usize..c.to as usize)).collect();
+        let set = ChangeSet { changes: changes.clone() };
         let byte_edits = match self.buf.doc.apply_detailed(version, &set) {
             Ok((_, byte_edits)) => byte_edits,
             Err(e) => {
@@ -383,23 +487,230 @@ impl EditorPane {
         if let Err(e) = self.host.edit(self.doc_id, version, set) {
             eprintln!("[editor] backend rejected the edit ({}); resyncing", e.message);
             self.resync(cx);
-        } else {
-            self.after_edits(&byte_edits, cx);
+            return;
         }
-        self.clamp_scroll_to_caret();
+
+        // Inverse in post-batch coordinates. An IME commit's undo removes the
+        // committed text entirely (marked keystrokes were never entries), so
+        // its inverse is a plain deletion.
+        let inverse = inverse_changes(&changes, &originals, cause == Cause::ImeCommit);
+
+        let selections_before = std::mem::take(&mut self.selections);
+        let selections_after = match cause {
+            Cause::Typing => Selection::after_inserts(&changes),
+            Cause::Delete => Selection::after_inserts(&changes),
+            // Mechanical batches keep the caller's cursors; they are restored
+            // (undo/redo) or clamped (IME, patches) afterwards.
+            Cause::ImeCommit | Cause::Mechanical => selections_before.clone(),
+        };
+        self.selections = normalize_selections(
+            selections_after.into_iter().map(|s| clamp_selection(s, self.buf.utf16_len())).collect(),
+        );
+        if !matches!(cause, Cause::Mechanical) {
+            self.push_undo(UndoEntry { changes, inverse, selections_before, selections_after: Vec::new() }, cause);
+        }
+        self.last_edit =
+            Some((std::time::Instant::now(), matches!(cause, Cause::Typing | Cause::Delete | Cause::ImeCommit)));
+        self.after_edits(&byte_edits, cx);
+        self.clamp_scroll_to_primary();
         cx.notify();
+    }
+
+    /// Records an entry, grouping consecutive typing/deleting batches. The
+    /// `selections_after` are filled in once the batch's cursors are known.
+    fn push_undo(&mut self, mut entry: UndoEntry, cause: Cause) {
+        entry.selections_after = self.selections.clone();
+        self.redo.clear();
+        let grouped = matches!(cause, Cause::Typing | Cause::Delete)
+            && self.last_edit.is_some_and(|(at, batch)| batch && at.elapsed() < std::time::Duration::from_millis(800));
+        if grouped && let Some(group) = self.undo.last_mut() {
+            group.entries.push(entry);
+        } else {
+            self.undo.push(UndoGroup { entries: vec![entry] });
+        }
+    }
+
+    /// ⌘Z: inverts the newest undo group (newest entry first) and parks the
+    /// inversions on the redo stack.
+    pub fn undo(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(group) = self.undo.pop() else { return };
+        for entry in group.entries.iter().rev() {
+            self.apply_edits(entry.inverse.clone(), Cause::Mechanical, cx);
+        }
+        if let Some(first) = group.entries.first() {
+            let len = self.buf.utf16_len();
+            self.selections =
+                normalize_selections(first.selections_before.iter().map(|s| clamp_selection(s.clone(), len)).collect());
+        }
+        self.redo.push(group);
+        self.last_edit = None;
+        self.clamp_scroll_to_primary();
+        cx.notify();
+    }
+
+    /// ⌘⇧Z: replays the newest redo group (oldest entry first).
+    pub fn redo(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(group) = self.redo.pop() else { return };
+        for entry in group.entries.iter() {
+            self.apply_edits(entry.changes.clone(), Cause::Mechanical, cx);
+        }
+        if let Some(last) = group.entries.last() {
+            let len = self.buf.utf16_len();
+            self.selections =
+                normalize_selections(last.selections_after.iter().map(|s| clamp_selection(s.clone(), len)).collect());
+        }
+        self.undo.push(group);
+        self.last_edit = None;
+        self.clamp_scroll_to_primary();
+        cx.notify();
+    }
+
+    /// Inserts `text` at every cursor (replacing each selection), bottom-up
+    /// in one `ChangeSet` so the backend sees a single version bump.
+    fn insert_text(&mut self, text: &str, cx: &mut gpui::Context<Self>) {
+        let mut ranges: Vec<(usize, usize)> = self.selections.iter().map(|s| s.normalized()).collect();
+        ranges.sort_unstable();
+        ranges.dedup();
+        let changes: Vec<TextChange> = ranges
+            .into_iter()
+            .map(|(start, end)| TextChange { from: start as u32, to: end as u32, insert: text.to_owned() })
+            .collect();
+        self.apply_edits(changes, Cause::Typing, cx);
+    }
+
+    /// Backspace / delete across cursors: a non-empty selection loses its
+    /// range, an empty caret loses one char boundary (⌥: one word).
+    fn delete(&mut self, forward: bool, word: bool, cx: &mut gpui::Context<Self>) {
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for selection in &self.selections {
+            let (start, end) = selection.normalized();
+            if start < end {
+                ranges.push((start, end));
+                continue;
+            }
+            if word {
+                let target = if forward { self.buf.word_end(start) } else { self.buf.word_start(start) };
+                ranges.push((start.min(target), start.max(target)));
+            } else if forward {
+                let next = self.buf.next_boundary(start);
+                if next > start {
+                    ranges.push((start, next));
+                }
+            } else {
+                let prev = self.buf.prev_boundary(start);
+                if prev < start {
+                    ranges.push((prev, start));
+                }
+            }
+        }
+        ranges.sort_unstable();
+        ranges.dedup();
+        let changes: Vec<TextChange> = ranges
+            .into_iter()
+            .map(|(s, e)| TextChange { from: s as u32, to: e as u32, insert: String::new() })
+            .collect();
+        self.apply_edits(changes, Cause::Delete, cx);
+    }
+
+    /// Moves every cursor (`extend` keeps the anchors). Vertical moves keep
+    /// each cursor's goal column; other motions drop it.
+    fn move_cursors(&mut self, motion: Motion, extend: bool, cx: &mut gpui::Context<Self>) {
+        let vertical = matches!(motion, Motion::Up | Motion::Down);
+        let targets: Vec<usize> = self.selections.iter().map(|s| self.motion_target(motion, s)).collect();
+        for (index, selection) in self.selections.iter_mut().enumerate() {
+            let head = selection.head;
+            let target = targets[index];
+            if vertical {
+                if selection.goal_col.is_none() {
+                    selection.goal_col = Some(head - self.buf.line_start(self.buf.line_of(head)));
+                }
+            } else {
+                selection.goal_col = None;
+            }
+            // Collapsing motions on a non-empty selection move to its edge
+            // before stepping (Left → start, Right → end), like native views.
+            if !extend && selection.is_empty() {
+                selection.anchor = target;
+                selection.head = target;
+                selection.reversed = false;
+            } else if !extend {
+                *selection = Selection::caret(target);
+            } else {
+                *selection = selection.clone().with_head(target);
+            }
+        }
+        let len = self.buf.utf16_len();
+        self.selections =
+            normalize_selections(self.selections.iter().map(|s| clamp_selection(s.clone(), len)).collect());
+        self.clamp_scroll_to_primary();
+        cx.notify();
+    }
+
+    /// The new head for `motion` from a selection's current state.
+    fn motion_target(&self, motion: Motion, selection: &Selection) -> usize {
+        let head = selection.head;
+        match motion {
+            Motion::Left => {
+                if selection.is_empty() {
+                    self.buf.prev_boundary(head)
+                } else {
+                    selection.normalized().0
+                }
+            }
+            Motion::Right => {
+                if selection.is_empty() {
+                    self.buf.next_boundary(head)
+                } else {
+                    selection.normalized().1
+                }
+            }
+            Motion::Up | Motion::Down => {
+                let line = self.buf.line_of(head) as i64;
+                let target = if motion == Motion::Up { line - 1 } else { line + 1 };
+                if target < 0 || target >= self.buf.line_count() as i64 {
+                    return head;
+                }
+                let target = target as u32;
+                let span = self.buf.line_span(target);
+                let col = selection.goal_col.unwrap_or(head - self.buf.line_start(self.buf.line_of(head)));
+                span.start + col.min(span.len())
+            }
+            Motion::WordLeft => self.buf.word_start(head),
+            Motion::WordRight => self.buf.word_end(head),
+            Motion::LineHome => {
+                let span = self.buf.line_span(self.buf.line_of(head));
+                let text = self.buf.slice_utf16(span.clone());
+                let indent = text.len() - text.trim_start_matches([' ', '\t']).len();
+                let first = span.start + utf16_len(&text[..indent]);
+                if head == first { span.start } else { first }
+            }
+            Motion::LineEnd => self.buf.line_span(self.buf.line_of(head)).end,
+            Motion::DocStart => 0,
+            Motion::DocEnd => self.buf.utf16_len(),
+        }
+    }
+
+    /// Escape: collapse everything to the primary caret.
+    fn collapse_cursors(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.selections.len() > 1 {
+            let primary = self.selections[0].clone();
+            self.selections = vec![Selection::caret(primary.head)];
+            cx.notify();
+        }
     }
 
     /// A backend-originated patch (`DocPatched`: external reload, tooling
     /// edits). Reconciled **by version**: an exact base-version match applies
-    /// incrementally with the caret clamped, anything else falls back to a
+    /// incrementally with the cursors clamped, anything else falls back to a
     /// full snapshot (M1 compared whole texts instead).
     pub fn backend_patched(&mut self, base_version: u32, changes: Vec<TextChange>, cx: &mut gpui::Context<Self>) {
         if self.buf.doc.version() == base_version {
             match self.buf.doc.apply_detailed(base_version, &ChangeSet { changes }) {
                 Ok((_, byte_edits)) => {
                     self.buf.marked = None;
-                    self.buf.caret = self.buf.caret.min(self.buf.utf16_len());
+                    let len = self.buf.utf16_len();
+                    self.selections =
+                        normalize_selections(self.selections.iter().map(|s| clamp_selection(s.clone(), len)).collect());
                     self.clamp_scroll();
                     self.after_edits(&byte_edits, cx);
                 }
@@ -415,6 +726,9 @@ impl EditorPane {
     fn resync(&mut self, cx: &mut gpui::Context<Self>) {
         if let Ok(info) = self.host.snapshot(self.doc_id) {
             self.buf = Buffer::new(&info.text);
+            self.selections = vec![Selection::caret(self.buf.utf16_len())];
+            self.undo.clear();
+            self.redo.clear();
             self.scroll.set(0.0);
             // The old tree and its queued edits describe text that no longer
             // exists anywhere; the in-flight parse (if any) is invalidated.
@@ -428,10 +742,60 @@ impl EditorPane {
         }
     }
 
+    // -- IME (composition happens at the primary cursor; others freeze) ----
+
+    /// `setMarkedText:selectedRange:replacementRange:` at the primary cursor.
+    fn ime_set_marked(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected: Option<Range<usize>>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let caret = self.selections.first().map_or(0, |s| s.head);
+        let base = range_utf16.clone().or_else(|| self.buf.marked.clone()).unwrap_or(caret..caret);
+        let (marked, change) = self.buf.replace(base, new_text);
+        self.buf.marked = if new_text.is_empty() || marked.is_empty() { None } else { Some(marked.clone()) };
+        // The platform's selected range is relative to the marked text start.
+        let caret = match new_selected {
+            Some(selected) => {
+                let start = selected.start.clamp(0, marked.len());
+                let end = selected.end.clamp(start, marked.len());
+                marked.start + end
+            }
+            None => marked.end,
+        };
+        if self.selections.is_empty() {
+            self.selections.push(Selection::caret(caret));
+        } else {
+            self.selections[0] = Selection::caret(caret);
+        }
+        // Marked keystrokes are not undo entries; committing (below) removes
+        // the whole composition in one step.
+        self.apply_edits(vec![change], Cause::Mechanical, cx);
+    }
+
+    /// `insertText:replacementRange:` — commits the composition (replacing
+    /// the marked range) or inserts at the primary cursor.
+    fn ime_commit(&mut self, range_utf16: Option<Range<usize>>, text: &str, cx: &mut gpui::Context<Self>) {
+        let caret = self.selections.first().map_or(0, |s| s.head);
+        let base = range_utf16.clone().or_else(|| self.buf.marked.clone()).unwrap_or(caret..caret);
+        let (inserted, change) = self.buf.replace(base, text);
+        self.buf.marked = None;
+        if self.selections.is_empty() {
+            self.selections.push(Selection::caret(inserted.end));
+        } else {
+            self.selections[0] = Selection::caret(inserted.end);
+        }
+        self.apply_edits(vec![change], Cause::ImeCommit, cx);
+    }
+
+    // -- keys --------------------------------------------------------------
+
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut gpui::Context<Self>) {
         let ks = &ev.keystroke;
         let mods = &ks.modifiers;
-        if mods.platform || mods.function || mods.control || mods.alt {
+        if mods.function {
             return;
         }
         if self.buf.marked.is_some() {
@@ -440,35 +804,65 @@ impl EditorPane {
             eprintln!("[key] passthrough while composing: {}", ks.key);
             return;
         }
+        // ⌘-arrows jump (line ends / document ends), ⌥-arrows step by word;
+        // Shift extends instead of moving.
+        let motion = match ks.key.as_str() {
+            "left" | "right" | "up" | "down" | "home" | "end" => match ks.key.as_str() {
+                "left" if mods.platform => Some(Motion::LineHome),
+                "right" if mods.platform => Some(Motion::LineEnd),
+                "up" if mods.platform => Some(Motion::DocStart),
+                "down" if mods.platform => Some(Motion::DocEnd),
+                "left" if mods.alt => Some(Motion::WordLeft),
+                "right" if mods.alt => Some(Motion::WordRight),
+                "left" => Some(Motion::Left),
+                "right" => Some(Motion::Right),
+                "up" => Some(Motion::Up),
+                "down" => Some(Motion::Down),
+                "home" => Some(Motion::LineHome),
+                "end" => Some(Motion::LineEnd),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(motion) = motion {
+            self.move_cursors(motion, mods.shift, cx);
+            return;
+        }
+        if mods.platform || mods.alt || mods.control {
+            return;
+        }
         match ks.key.as_str() {
-            "backspace" => {
-                if let Some(change) = self.buf.backspace() {
-                    self.edit(change, cx);
-                }
-            }
-            "delete" => {
-                if let Some(change) = self.buf.delete_forward() {
-                    self.edit(change, cx);
-                }
-            }
-            "left" => self.buf.caret_left(),
-            "right" => self.buf.caret_right(),
-            "home" => self.buf.caret_home(),
-            "end" => self.buf.caret_end(),
-            "enter" => {
-                let change = self.buf.insert_plain("\n");
-                self.edit(change, cx);
-            }
-            "escape" => {}
+            "backspace" => self.delete(false, false, cx),
+            "delete" => self.delete(true, false, cx),
+            "enter" => self.insert_text("\n", cx),
+            "escape" => self.collapse_cursors(cx),
+            "tab" => {}
             _ => {
                 if let Some(text) = ks.key_char.as_ref() {
-                    let change = self.buf.insert_plain(text);
-                    self.edit(change, cx);
+                    self.insert_text(text, cx);
                 }
             }
         }
-        self.clamp_scroll_to_caret();
-        cx.notify();
+    }
+
+    // -- mouse -------------------------------------------------------------
+
+    /// Buffer offset for a window point (its row's line, clamped into it).
+    fn offset_at(&self, window: &Window, geometry: &Geometry, position: Point<Pixels>) -> usize {
+        let row = self.row_at(geometry, position.y);
+        let span = self.buf.line_span(row);
+        let line = self.buf.slice_utf16(span.clone());
+        let col = utf16_index_at_x(window, &line, position.x - geometry.origin.x, theme::px_font_size());
+        span.start + col
+    }
+
+    fn row_at(&self, geometry: &Geometry, y: Pixels) -> u32 {
+        let count = self.buf.line_count();
+        let visible = ((geometry.height - px(theme::TEXT_INSET) * 2.0) / geometry.line_height) as i64;
+        let row = (((y - geometry.origin.y) / geometry.line_height) as i64 + self.scroll.get() as i64)
+            .clamp(0, visible.max(1) - 1)
+            .clamp(0, count as i64 - 1);
+        row.max(0) as u32
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut gpui::Context<Self>) {
@@ -478,17 +872,90 @@ impl EditorPane {
         if ev.position.x < geometry.gutter_x + geometry.gutter_w {
             return;
         }
-        let count = self.buf.line_count();
-        let visible = ((geometry.height - px(theme::TEXT_INSET) * 2.0) / geometry.line_height) as i64;
-        let row = (((ev.position.y - geometry.origin.y) / geometry.line_height) as i64 + self.scroll.get() as i64)
-            .clamp(0, visible.max(1) - 1)
-            .clamp(0, count as i64 - 1) as u32;
-        let span = self.buf.line_span(row);
-        let line = self.buf.slice_utf16(span.clone());
-        let x = ev.position.x - geometry.origin.x;
-        let col = utf16_index_at_x(window, &line, x, theme::px_font_size());
-        self.buf.caret = span.start + col;
+        if ev.modifiers.alt {
+            // ⌥-drag: column selection.
+            self.drag.set(Some(Drag::Columnar { from: ev.position }));
+            self.selections = self.columnar_selections(window, &geometry, ev.position, ev.position);
+            cx.notify();
+            return;
+        }
+        let offset = self.offset_at(window, &geometry, ev.position);
+        if ev.modifiers.platform && !ev.modifiers.shift {
+            // ⌘-click toggles a cursor at the point.
+            let mut selections = self.selections.clone();
+            if let Some(at) = selections.iter().position(|s| s.is_empty() && s.head == offset) {
+                if selections.len() > 1 {
+                    selections.remove(at);
+                }
+            } else {
+                selections.push(Selection::caret(offset));
+                selections = normalize_selections(selections);
+            }
+            self.selections = selections;
+            cx.notify();
+            return;
+        }
+        if ev.modifiers.shift {
+            let primary = self.selections.first().cloned().unwrap_or_else(|| Selection::caret(offset));
+            self.selections = vec![primary.with_head(offset)];
+        } else {
+            self.selections = vec![Selection::caret(offset)];
+            self.drag.set(Some(Drag::Normal { anchor: offset }));
+        }
         cx.notify();
+    }
+
+    fn on_mouse_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        let Some(geometry) = self.geometry.get() else { return };
+        match self.drag.get() {
+            Some(Drag::Normal { anchor }) => {
+                let head = self.offset_at(window, &geometry, ev.position);
+                if head != anchor || !self.selections.first().is_some_and(|s| s.is_empty() && s.anchor == anchor) {
+                    self.selections = vec![Selection::caret(anchor).with_head(head)];
+                    cx.notify();
+                }
+            }
+            Some(Drag::Columnar { from }) if ev.position != from => {
+                self.selections = self.columnar_selections(window, &geometry, from, ev.position);
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    fn on_mouse_up(&mut self, _ev: &MouseUpEvent, _window: &mut Window, _cx: &mut gpui::Context<Self>) {
+        self.drag.set(None);
+    }
+
+    /// One cursor per visual row between two window points, spanning the
+    /// points' x range (zero-width where both ends map to the same offset).
+    fn columnar_selections(
+        &self,
+        window: &Window,
+        geometry: &Geometry,
+        from: Point<Pixels>,
+        to: Point<Pixels>,
+    ) -> Vec<Selection> {
+        let (top, bottom) = if from.y <= to.y { (from, to) } else { (to, from) };
+        let down = from.y <= to.y;
+        let row0 = self.row_at(geometry, top.y);
+        let row1 = self.row_at(geometry, bottom.y);
+        let (x_left, x_right) = if from.x <= to.x { (from.x, to.x) } else { (to.x, from.x) };
+        let mut selections = Vec::new();
+        for row in row0..=row1 {
+            let span = self.buf.line_span(row);
+            let line = self.buf.slice_utf16(span.clone());
+            let c0 = utf16_index_at_x(window, &line, x_left - geometry.origin.x, theme::px_font_size());
+            let c1 = utf16_index_at_x(window, &line, x_right - geometry.origin.x, theme::px_font_size());
+            let start = span.start + c0;
+            let end = span.start + c1;
+            selections.push(if down {
+                Selection { anchor: start, head: end, reversed: false, goal_col: None }
+            } else {
+                Selection { anchor: end, head: start, reversed: true, goal_col: None }
+            });
+        }
+        selections
     }
 
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, _window: &mut Window, cx: &mut gpui::Context<Self>) {
@@ -507,9 +974,10 @@ impl EditorPane {
         self.scroll.set(self.scroll.get().clamp(0.0, max));
     }
 
-    /// Scrolls the caret's line into view after caret-moving edits.
-    fn clamp_scroll_to_caret(&self) {
-        let caret_line = self.buf.line_of(self.buf.caret) as f32;
+    /// Scrolls the primary cursor's line into view.
+    fn clamp_scroll_to_primary(&self) {
+        let caret = self.selections.first().map_or(0, |s| s.head);
+        let caret_line = self.buf.line_of(caret) as f32;
         let visible =
             self.geometry.get().map_or(20.0, |g| (g.height - px(theme::TEXT_INSET) * 2.0) / g.line_height).max(1.0);
         let scroll = self.scroll.get();
@@ -520,6 +988,68 @@ impl EditorPane {
         }
         self.clamp_scroll();
     }
+}
+
+/// The post-batch inverse of an ascending change batch: each change becomes a
+/// replacement of its inserted text with the original. `strip_inserts` (an
+/// IME commit) deletes instead of restoring, so undo removes the whole
+/// composition.
+fn inverse_changes(changes: &[TextChange], originals: &[String], strip_inserts: bool) -> Vec<TextChange> {
+    let mut inverse = Vec::with_capacity(changes.len());
+    let mut delta: i64 = 0;
+    for (change, original) in changes.iter().zip(originals) {
+        let inserted = change.insert.chars().map(char::len_utf16).sum::<usize>();
+        let from = (change.from as i64 + delta).max(0) as u32;
+        let insert = if strip_inserts { String::new() } else { original.clone() };
+        inverse.push(TextChange { from, to: from + inserted as u32, insert });
+        delta += inserted as i64 - (change.to - change.from) as i64;
+    }
+    inverse
+}
+
+/// Clamp one selection into the document length.
+fn clamp_selection(mut selection: Selection, len: usize) -> Selection {
+    selection.anchor = selection.anchor.min(len);
+    selection.head = selection.head.min(len);
+    if selection.head < selection.anchor && !selection.reversed {
+        selection.reversed = true;
+    } else if selection.head > selection.anchor && selection.reversed {
+        selection.reversed = false;
+    }
+    selection
+}
+
+/// Sorts cursors, deduplicates identical ones, and merges selections that
+/// overlap (an edit that fuses two cursors leaves one).
+fn normalize_selections(mut selections: Vec<Selection>) -> Vec<Selection> {
+    if selections.is_empty() {
+        return vec![Selection::caret(0)];
+    }
+    selections.sort_by_key(|s| {
+        let (start, end) = s.normalized();
+        (start, end)
+    });
+    let mut out: Vec<Selection> = Vec::with_capacity(selections.len());
+    for selection in selections {
+        let overlapping = match out.last() {
+            Some(last) => {
+                let (_, last_end) = last.normalized();
+                let (start, _) = selection.normalized();
+                start < last_end
+            }
+            None => false,
+        };
+        if overlapping {
+            // Overlapping: keep the union as a plain selection.
+            let last = out.last_mut().expect("checked above");
+            let (last_start, _) = last.normalized();
+            let (_, end) = selection.normalized();
+            *last = Selection { anchor: last_start, head: end, reversed: false, goal_col: None };
+        } else if out.last() != Some(&selection) {
+            out.push(selection);
+        }
+    }
+    out
 }
 
 impl Render for EditorPane {
@@ -534,6 +1064,8 @@ impl Render for EditorPane {
             .track_focus(&self.focus)
             .bg(theme::surface_bg())
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .on_key_down(cx.listener(Self::on_key))
             .child(EditorElement { view: cx.entity() })
@@ -554,8 +1086,11 @@ struct PrepaintState {
     /// of buffer above and below the viewport, so slow scrolls never show a
     /// gap; everything outside is never shaped.
     rows: Vec<(u32, ShapedLine)>,
-    /// Where the caret renders (its line and the gutter metrics for painting).
-    caret: Bounds<Pixels>,
+    /// One caret per selection head.
+    carets: Vec<Bounds<Pixels>>,
+    /// Selection rectangles for the visible rows (painted under the text).
+    selection_rects: Vec<Bounds<Pixels>>,
+    /// The primary's line, for the brighter gutter number.
     caret_line: u32,
     gutter_w: Pixels,
     numbers_w: Pixels,
@@ -741,7 +1276,7 @@ impl Element for EditorElement {
         let line_height = theme::px_line_height();
 
         let marked = pane.buf.marked.clone();
-        let caret = pane.buf.caret;
+        let caret_line = pane.selections.first().map_or(0, |s| pane.buf.line_of(s.head));
         let line_count = pane.buf.line_count();
         let scroll = pane.scroll.get();
 
@@ -772,13 +1307,45 @@ impl Element for EditorElement {
             })
             .collect();
 
-        // Caret rect: the line it renders on plus its prefix width.
-        let caret_line = pane.buf.line_of(caret);
-        let caret_span = pane.buf.line_span(caret_line);
-        let caret_line_text = pane.buf.slice_utf16(caret_span.clone());
-        let caret_x = x_at_utf16(window, &caret_line_text, caret - caret_span.start, font_size);
-        let caret_y = origin.y + line_height * (caret_line as f32 - scroll);
-        let caret = Bounds::new(point(origin.x + caret_x, caret_y), size(px(2.0), line_height));
+        // Carets (one per selection head) and selection rectangles for the
+        // visible rows.
+        let mut carets = Vec::with_capacity(pane.selections.len());
+        let mut selection_rects = Vec::new();
+        for selection in &pane.selections {
+            let head_line = pane.buf.line_of(selection.head);
+            if (first..last).contains(&head_line) {
+                let span = pane.buf.line_span(head_line);
+                let line_text = pane.buf.slice_utf16(span.clone());
+                let head_x = x_at_utf16(window, &line_text, selection.head - span.start, font_size);
+                let head_y = origin.y + line_height * (head_line as f32 - scroll);
+                carets.push(Bounds::new(point(origin.x + head_x, head_y), size(px(2.0), line_height)));
+            }
+            let (start, end) = selection.normalized();
+            if start == end {
+                continue;
+            }
+            let start_line = pane.buf.line_of(start);
+            let end_line = pane.buf.line_of(end).max(start_line);
+            for row in first..last {
+                if row < start_line || row > end_line {
+                    continue;
+                }
+                let span = pane.buf.line_span(row);
+                let line_text = pane.buf.slice_utf16(span.clone());
+                let x0 = if row > start_line {
+                    px(0.0)
+                } else {
+                    x_at_utf16(window, &line_text, start - span.start, font_size)
+                };
+                let x1 = if row < end_line {
+                    shaped_width(window, &line_text, font_size)
+                } else {
+                    x_at_utf16(window, &line_text, end - span.start, font_size)
+                };
+                let y = origin.y + line_height * (row as f32 - scroll);
+                selection_rects.push(Bounds::new(point(origin.x + x0, y), size((x1 - x0).max(px(0.0)), line_height)));
+            }
+        }
 
         pane.geometry.set(Some(Geometry {
             gutter_x,
@@ -789,7 +1356,7 @@ impl Element for EditorElement {
             height: bounds.size.height,
         }));
 
-        PrepaintState { rows, caret, caret_line, gutter_w, numbers_w }
+        PrepaintState { rows, carets, selection_rects, caret_line, gutter_w, numbers_w }
     }
 
     fn paint(
@@ -829,11 +1396,17 @@ impl Element for EditorElement {
             );
             window.paint_quad(fill(separator, theme::border()));
 
+            // Selections under the text, then the rows, then the carets.
+            for rect in &prepaint.selection_rects {
+                window.paint_quad(fill(*rect, rgba_of(theme::SELECTION_BG)));
+            }
             for (row, shaped) in prepaint.rows.drain(..) {
                 let y = origin.y + line_height * (row as f32 - geometry.scroll);
                 let _ = shaped.paint(point(origin.x, y), line_height, TextAlign::Left, None, window, cx);
             }
-            window.paint_quad(fill(prepaint.caret, rgba_of(theme::ACCENT)));
+            for caret in &prepaint.carets {
+                window.paint_quad(fill(*caret, rgba_of(theme::ACCENT)));
+            }
         });
 
         // Publish the geometry for `bounds_for_range` between frames, then
@@ -861,8 +1434,13 @@ impl InputHandler for EditorInputHandler {
         _window: &mut Window,
         cx: &mut App,
     ) -> Option<UTF16Selection> {
-        let range = self.view.read(cx).buf.caret;
-        Some(UTF16Selection { range: range..range, reversed: false })
+        // The primary selection is the IME's; the others freeze during
+        // composition.
+        let (range, reversed) = self.view.read(cx).selections.first().map_or((0..0, false), |s| {
+            let (start, end) = s.normalized();
+            (start..end, s.reversed)
+        });
+        Some(UTF16Selection { range, reversed })
     }
 
     fn marked_text_range(&mut self, _window: &mut Window, cx: &mut App) -> Option<Range<usize>> {
@@ -893,10 +1471,7 @@ impl InputHandler for EditorInputHandler {
         cx: &mut App,
     ) {
         eprintln!("[ime] insertText range={:?} text={:?}", replacement_range, text);
-        self.view.update(cx, |pane, cx| {
-            let change = pane.buf.insert_commit(replacement_range, text);
-            pane.edit(change, cx);
-        });
+        self.view.update(cx, |pane, cx| pane.ime_commit(replacement_range, text, cx));
     }
 
     fn replace_and_mark_text_in_range(
@@ -908,16 +1483,13 @@ impl InputHandler for EditorInputHandler {
         cx: &mut App,
     ) {
         eprintln!("[ime] setMarkedText range={:?} text={:?} selected={:?}", range_utf16, new_text, new_selected_range);
-        self.view.update(cx, |pane, cx| {
-            let change = pane.buf.set_marked(range_utf16, new_text, new_selected_range);
-            pane.edit(change, cx);
-        });
+        self.view.update(cx, |pane, cx| pane.ime_set_marked(range_utf16, new_text, new_selected_range, cx));
     }
 
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut App) {
         eprintln!("[ime] unmarkText");
         self.view.update(cx, |pane, cx| {
-            pane.buf.unmark();
+            pane.buf.marked = None;
             cx.notify();
         });
     }
@@ -973,5 +1545,96 @@ impl InputHandler for EditorInputHandler {
     /// routing in gpui-pre-macos/src/window.rs).
     fn prefers_ime_for_printable_keys(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tc(from: u32, to: u32, insert: &str) -> TextChange {
+        TextChange { from, to, insert: insert.into() }
+    }
+
+    #[test]
+    fn selections_normalize_sort_dedup_and_merge() {
+        let mut selections = vec![
+            Selection::caret(30),
+            Selection::caret(5),
+            Selection::caret(5),
+            Selection { anchor: 12, head: 20, reversed: false, goal_col: None },
+            Selection { anchor: 22, head: 17, reversed: true, goal_col: None },
+        ];
+        // Overlapping pair (12..20 and 17..22) merges into one plain range.
+        selections = normalize_selections(selections);
+        let spans: Vec<(usize, usize)> = selections.iter().map(|s| s.normalized()).collect();
+        assert_eq!(spans, vec![(5, 5), (12, 22), (30, 30)]);
+    }
+
+    #[test]
+    fn after_inserts_maps_to_post_batch_positions() {
+        // Two cursors typing "hi" over empty ranges at 2 and 10.
+        let after = Selection::after_inserts(&[tc(2, 2, "hi"), tc(10, 10, "hi")]);
+        let heads: Vec<usize> = after.iter().map(|s| s.head).collect();
+        assert_eq!(heads, vec![4, 14], "the first insert shifts the second cursor");
+        // Deletions collapse to the start of the deleted range.
+        let after = Selection::after_inserts(&[tc(4, 8, "")]);
+        assert_eq!(after[0].head, 4);
+    }
+
+    #[test]
+    fn inverse_of_typing_and_of_ime_commit() {
+        // Typing "x" over a selection restores the original text on undo.
+        let inv = inverse_changes(&[tc(0, 3, "x")], &["abc".into()], false);
+        assert_eq!(inv, vec![tc(0, 1, "abc")]);
+        // A pure insertion restores emptiness.
+        let inv = inverse_changes(&[tc(2, 2, "hi")], &["".into()], false);
+        assert_eq!(inv, vec![tc(2, 4, "")]);
+        // An IME commit over marked text deletes it all on undo.
+        let inv = inverse_changes(&[tc(2, 5, "你好")], &["nih".into()], true);
+        assert_eq!(inv, vec![tc(2, 4, "")]);
+        // Multi-change batches shift later positions by earlier deltas.
+        let inv = inverse_changes(&[tc(0, 0, "ab"), tc(5, 7, "")], &["".into(), "cd".into()], false);
+        // Inverses live in post-batch coordinates: the deletion moved to 7.
+        assert_eq!(inv, vec![tc(0, 2, ""), tc(7, 7, "cd")]);
+    }
+
+    #[test]
+    fn clamp_selection_respects_length_and_direction() {
+        let s = clamp_selection(Selection { anchor: 3, head: 9, reversed: false, goal_col: None }, 5);
+        assert_eq!(s.normalized(), (3, 5));
+        assert!(!s.reversed);
+        let s = clamp_selection(Selection { anchor: 4, head: 1, reversed: true, goal_col: None }, 2);
+        assert_eq!(s.normalized(), (1, 2));
+        assert!(s.reversed);
+    }
+
+    #[test]
+    fn word_boundaries_jump_class_runs() {
+        let buf = Buffer::new("let alpha_x = 42;\n");
+        assert_eq!(buf.utf16_len(), 18);
+        // From the end of "alpha_x" back lands on its start (word run).
+        assert_eq!(buf_slice(&buf, buf.word_start(10), buf.word_end(10)), "alpha_x");
+        // From after `42;` back over `;` (other class), then `42` (word).
+        assert_eq!(buf_slice(&buf, buf.word_start(17), 17), ";");
+        assert_eq!(buf_slice(&buf, buf.word_start(17), 15), "");
+        // Whitespace runs are crossed: from before `4` back lands before `=`,
+        // and from after `=` forward lands after `42`.
+        assert_eq!(buf.word_start(14), 12);
+        assert_eq!(buf.word_end(13), 16);
+    }
+
+    fn buf_slice(buf: &Buffer, start: usize, end: usize) -> String {
+        buf.slice_utf16(start..end)
+    }
+
+    #[test]
+    fn buffer_line_helpers_round_trip() {
+        let buf = Buffer::new("abc\r\ndef");
+        // ide_text normalizes CRLF, so two lines.
+        assert_eq!(buf.line_count(), 2);
+        assert_eq!(buf.line_span(0), 0..3);
+        assert_eq!(buf.line_span(1), 4..7);
+        assert_eq!(buf.slice_utf16(0..buf.utf16_len()), "abc\ndef");
     }
 }

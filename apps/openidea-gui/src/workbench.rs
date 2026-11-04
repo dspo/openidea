@@ -29,7 +29,7 @@ use crate::file_tree::{FileTree, Row};
 use crate::host::Host;
 use crate::{strings, theme};
 
-actions!(workbench, [OpenFile, Save, CloseTab, Quit]);
+actions!(workbench, [OpenFile, Save, CloseTab, Undo, Redo, Quit]);
 
 /// One open file: the editor pane, its document in the backend, and the two
 /// flags the chrome shows. The pane pushes its edits to the backend live, so
@@ -131,6 +131,19 @@ impl Workbench {
         let Some(index) = self.active else { return };
         self.close_tab(index, cx);
         self.focus_active(window, cx);
+    }
+
+    /// ⌘Z / ⌘⇧Z on the active editor pane (one undo timeline per pane).
+    fn on_undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.active {
+            self.tabs[index].pane.update(cx, |pane, cx| pane.undo(cx));
+        }
+    }
+
+    fn on_redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.active {
+            self.tabs[index].pane.update(cx, |pane, cx| pane.redo(cx));
+        }
     }
 
     // -- tab plumbing -----------------------------------------------------
@@ -330,6 +343,8 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_open_file))
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_close_tab))
+            .on_action(cx.listener(Self::on_undo))
+            .on_action(cx.listener(Self::on_redo))
             .child(
                 div()
                     .flex_1()

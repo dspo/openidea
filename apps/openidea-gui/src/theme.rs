@@ -15,6 +15,8 @@ pub const WARNING: u32 = 0xc9a23a;
 pub const ERROR: u32 = 0xd16b55;
 /// Marked-text background: the accent at ~18% alpha over the surface.
 pub const MARKED_BG: u32 = (ACCENT << 8) | 0x2e;
+/// Editor selection background: the accent at ~24% alpha.
+pub const SELECTION_BG: u32 = (ACCENT << 8) | 0x3c;
 /// Selected-row background in the file tree: the accent at ~22% alpha.
 pub const SELECTED_BG: u32 = (ACCENT << 8) | 0x38;
 
