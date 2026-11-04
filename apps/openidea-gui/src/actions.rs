@@ -10,21 +10,7 @@ use gpui::actions;
 
 actions!(
     workbench,
-    [
-        OpenFile,
-        Save,
-        CloseTab,
-        Undo,
-        Redo,
-        Quit,
-        Cancel,
-        GoToFile,
-        SearchEverywhere,
-        Run,
-        ShowDiff,
-        Commit,
-        CommitConfirm,
-    ]
+    [OpenFile, Save, CloseTab, Undo, Redo, Quit, Cancel, GoToFile, SearchEverywhere, Run, StopRun, ShowDiff, Commit,]
 );
 
 // Palette plumbing (⇧⌘O / double-⇧ popup): deliberately not in REGISTRY —
@@ -96,6 +82,7 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("workbench::GoToFile", "Go to File", "Navigate", "⇧⌘O"),
     action_info!("workbench::SearchEverywhere", "Search Everywhere", "Navigate", "Double ⇧"),
     action_info!("workbench::Run", "Run…", "Run", "⌃R"),
+    action_info!("workbench::StopRun", "Stop Run", "Run", "⌃⌘R"),
     action_info!("workbench::ShowDiff", "Show Diff", "Git", "⌃D"),
     action_info!("workbench::Commit", "Commit…", "Git", "⌘K"),
     action_info!("workbench::Undo", "Undo", "Edit", "⌘Z"),

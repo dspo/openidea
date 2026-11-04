@@ -32,7 +32,9 @@ use ide_vcs::ChangeKind;
 use ide_vfs::EntryKind;
 
 use crate::actions as acts;
-use crate::actions::{Cancel, CloseTab, GoToFile, OpenFile, Redo, Run, Save, SearchEverywhere, ShowDiff, Undo};
+use crate::actions::{
+    Cancel, CloseTab, GoToFile, OpenFile, Redo, Run, Save, SearchEverywhere, ShowDiff, StopRun, Undo,
+};
 use crate::bus::{Bus, BusMessage};
 use crate::diff_view::{self, DiffLine};
 use crate::editor::EditorPane;
@@ -176,6 +178,8 @@ pub struct Workbench {
     diff_focus_pending: Cell<bool>,
     /// The open commit overlay (⌘K).
     commit: Option<CommitFlow>,
+    /// The message input's PressEnter subscription, alive while the overlay is.
+    commit_sub: Option<gpui::Subscription>,
     /// Set when a bus message closed an overlay: the next render hands the
     /// focus back to the editor (or the tree).
     restore_focus_pending: Cell<bool>,
@@ -216,6 +220,7 @@ impl Workbench {
             diff_focus: cx.focus_handle(),
             diff_focus_pending: Cell::new(false),
             commit: None,
+            commit_sub: None,
             restore_focus_pending: Cell::new(false),
             last_shift: Cell::new(None),
             shift_held: Cell::new(false),
@@ -234,7 +239,14 @@ impl Workbench {
         let host = host.clone();
         cx.background_executor()
             .spawn(async move {
-                let (statuses, branch) = host.git_status().unwrap_or((Vec::new(), None));
+                let result = host.git_status();
+                eprintln!(
+                    "[vcs] status refresh: {} files, branch {:?} ({})",
+                    result.as_ref().map_or(0, |(s, _)| s.len()),
+                    result.as_ref().map(|(_, b)| b.as_deref()),
+                    result.as_ref().err().map_or("ok", |e| e.message.as_str())
+                );
+                let (statuses, branch) = result.unwrap_or((Vec::new(), None));
                 bus.send(BusMessage::GitStatus { statuses, branch });
             })
             .detach();
@@ -329,6 +341,20 @@ impl Workbench {
         self.open_picker(PickerMode::Run, window, cx);
     }
 
+    /// ⌃⌘R: stops the live run (the dock's Stop button in keymap form).
+    fn on_stop_run(&mut self, _: &StopRun, _window: &mut Window, cx: &mut Context<Self>) {
+        let run_id = self.run_panel.as_ref().and_then(|panel| panel.read(cx).run_id);
+        let live = self.run_panel.as_ref().is_some_and(|panel| panel.read(cx).running());
+        if let (Some(run_id), true) = (run_id, live)
+            && let Some(host) = &self.host
+        {
+            if let Err(e) = host.stop_run(run_id) {
+                eprintln!("[run] stop: {}", e.message);
+            }
+            cx.notify();
+        }
+    }
+
     /// ⌃D: the diff overlay for the changed file at hand — the tree's
     /// selected row when it carries a git change, else the active tab's file.
     fn on_show_diff(&mut self, _: &ShowDiff, _window: &mut Window, cx: &mut Context<Self>) {
@@ -404,6 +430,7 @@ impl Workbench {
         }
         let input = cx.new(|cx| TextareaState::new(window, cx).placeholder(strings::COMMIT_MESSAGE_PLACEHOLDER));
         window.focus(&input.read(cx).focus_handle(cx), cx);
+        eprintln!("[commit] dialog open, focused={:?}", input.read(cx).focus_handle(cx).is_focused(window));
         // Sorted by name, checked by default (the IDEA commit dialog's shape).
         let mut files: Vec<CommitFile> = self
             .git_status
@@ -411,7 +438,15 @@ impl Workbench {
             .map(|(path, kind)| CommitFile { path: path.clone(), name: file_name(path), kind: *kind, selected: true })
             .collect();
         files.sort_by(|a, b| a.name.cmp(&b.name));
-        self.commit = Some(CommitFlow { input, files });
+        self.commit = Some(CommitFlow { input: input.clone(), files });
+        // ⌘Enter (the input's secondary-Enter) commits; plain Enter inserts
+        // the newline (the input's own keymap is nearer the focus than any
+        // "Commit" context of ours, so a binding would lose there).
+        self.commit_sub = Some(cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
+            if let InputEvent::PressEnter { secondary: true, .. } = event {
+                this.commit_confirm(cx);
+            }
+        }));
         cx.notify();
     }
 
@@ -419,8 +454,17 @@ impl Workbench {
     /// leave the index, so the commit is exactly the dialog's checkmarks),
     /// then commit the index.
     fn commit_confirm(&mut self, cx: &mut Context<Self>) {
-        let Some(flow) = &self.commit else { return };
+        let Some(flow) = &self.commit else {
+            eprintln!("[commit] confirm without an open dialog");
+            return;
+        };
         let message = flow.input.read(cx).value().to_string();
+        eprintln!(
+            "[commit] confirm: message {:?} ({} chars), {} files",
+            message.trim(),
+            message.len(),
+            flow.files.len()
+        );
         if message.trim().is_empty() {
             self.message = Some((NotifyLevel::Warning, strings::COMMIT_EMPTY_MESSAGE.to_owned()));
             cx.notify();
@@ -454,6 +498,7 @@ impl Workbench {
         if self.commit.take().is_none() {
             return;
         }
+        self.commit_sub.take();
         if self.active.is_some() {
             self.focus_active(window, cx);
         } else {
@@ -984,6 +1029,7 @@ impl Workbench {
                     Ok(id) => {
                         let short: String = id.chars().take(7).collect();
                         self.commit = None;
+                        self.commit_sub.take();
                         self.restore_focus_pending.set(true);
                         self.message = Some((NotifyLevel::Info, format!("{} {short}", strings::COMMIT_TOAST)));
                         eprintln!("[vcs] committed {id}");
@@ -1202,6 +1248,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_go_to_file))
             .on_action(cx.listener(Self::on_search_everywhere))
             .on_action(cx.listener(Self::on_run))
+            .on_action(cx.listener(Self::on_stop_run))
             .on_action(cx.listener(Self::on_show_diff))
             .on_action(cx.listener(Self::on_commit))
             // Double ⇧ gesture (modifier presses arrive as modifiers events).
@@ -1753,7 +1800,6 @@ impl Workbench {
                             |_: &gpui::MouseDownEvent, _: &mut Window, cx: &mut gpui::App| cx.stop_propagation(),
                         )
                         .on_action(cx.listener(|this, _: &Cancel, window, cx| this.close_commit(window, cx)))
-                        .on_action(cx.listener(|this, _: &acts::CommitConfirm, _, cx| this.commit_confirm(cx)))
                         .child(
                             div()
                                 .flex()
