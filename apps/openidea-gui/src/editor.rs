@@ -152,6 +152,15 @@ enum Cause {
     Mechanical,
 }
 
+/// A folded buffer line range (`start_line` and `end_line` inclusive). The
+/// start line keeps rendering; `start_line + 1..=end_line` collapse into one
+/// placeholder row. Sorted, non-overlapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Fold {
+    start_line: u32,
+    end_line: u32,
+}
+
 /// One applied edit batch with its inverse and the cursor states around it.
 struct UndoEntry {
     /// Forward changes (ascending, non-overlapping, against `base_version`).
@@ -343,6 +352,9 @@ pub struct EditorPane {
     redo: Vec<UndoGroup>,
     /// When the last grouped edit happened and whether it was one.
     last_edit: Option<(std::time::Instant, bool)>,
+    // Folding (phase 5): the syntax candidates plus the user's folded subset.
+    fold_candidates: Vec<(u32, u32)>,
+    folds: Vec<Fold>,
 }
 
 impl Focusable for EditorPane {
@@ -376,6 +388,8 @@ impl EditorPane {
             undo: Vec::new(),
             redo: Vec::new(),
             last_edit: None,
+            fold_candidates: Vec::new(),
+            folds: Vec::new(),
         };
         pane.start_syntax(cx);
         pane
@@ -429,7 +443,8 @@ impl EditorPane {
     ) {
         self.parse_in_flight = false;
         if generation == self.parse_generation
-            && let (Some((tree, spans, _)), None) = (parsed, self.tree.as_ref())
+            && let Some((tree, spans, fold_candidates, _)) = parsed
+            && self.tree.is_none()
         {
             let mut tree = tree;
             for edit in self.pending_edits.drain(..) {
@@ -437,6 +452,18 @@ impl EditorPane {
             }
             self.tree = Some(tree);
             self.spans = spans;
+            // Keep the user's folds that still exist as candidates; their
+            // ends follow the (possibly edited) syntax.
+            self.fold_candidates = fold_candidates;
+            self.folds.retain_mut(|fold| {
+                match self.fold_candidates.iter().find(|(start, _)| *start == fold.start_line) {
+                    Some((_, end)) => {
+                        fold.end_line = *end;
+                        fold.end_line > fold.start_line
+                    }
+                    None => false,
+                }
+            });
         }
         if self.parse_dirty {
             self.parse_dirty = false;
@@ -447,9 +474,24 @@ impl EditorPane {
         cx.notify();
     }
 
-    /// Applies byte-coordinate edits to the syntax tree and schedules an
-    /// incremental re-parse.
+    /// Applies byte-coordinate edits to the syntax tree, shifts the folded
+    /// ranges with the line deltas, and schedules an incremental re-parse.
     fn after_edits(&mut self, byte_edits: &[ide_text::ByteEdit], cx: &mut gpui::Context<Self>) {
+        for edit in byte_edits {
+            let (start, old_end, new_end) = (edit.start.row as u32, edit.old_end.row as u32, edit.new_end.row as u32);
+            let shift = new_end as i64 - old_end as i64;
+            self.folds.retain_mut(|fold| {
+                if fold.end_line < start {
+                    true
+                } else if fold.start_line > old_end {
+                    fold.start_line = (fold.start_line as i64 + shift).max(0) as u32;
+                    fold.end_line = (fold.end_line as i64 + shift).max(0) as u32;
+                    fold.end_line > fold.start_line
+                } else {
+                    false // the edit ran through the folded range: unfold it
+                }
+            });
+        }
         if let Some(tree) = &mut self.tree {
             for edit in byte_edits {
                 tree.edit(&input_edit(edit));
@@ -736,6 +778,8 @@ impl EditorPane {
             self.tree = None;
             self.spans.clear();
             self.pending_edits.clear();
+            self.fold_candidates.clear();
+            self.folds.clear();
             if let Some(highlighter) = self.highlighter.clone() {
                 self.schedule_parse(highlighter, cx);
             }
@@ -849,15 +893,16 @@ impl EditorPane {
 
     /// Buffer offset for a window point (its row's line, clamped into it).
     fn offset_at(&self, window: &Window, geometry: &Geometry, position: Point<Pixels>) -> usize {
-        let row = self.row_at(geometry, position.y);
-        let span = self.buf.line_span(row);
+        let (line, _) = self.resolve_display(self.row_at(geometry, position.y));
+        let span = self.buf.line_span(line);
         let line = self.buf.slice_utf16(span.clone());
         let col = utf16_index_at_x(window, &line, position.x - geometry.origin.x, theme::px_font_size());
         span.start + col
     }
 
+    /// The display row a window y falls on.
     fn row_at(&self, geometry: &Geometry, y: Pixels) -> u32 {
-        let count = self.buf.line_count();
+        let count = self.display_count();
         let visible = ((geometry.height - px(theme::TEXT_INSET) * 2.0) / geometry.line_height) as i64;
         let row = (((y - geometry.origin.y) / geometry.line_height) as i64 + self.scroll.get() as i64)
             .clamp(0, visible.max(1) - 1)
@@ -868,8 +913,20 @@ impl EditorPane {
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut gpui::Context<Self>) {
         window.focus(&self.focus, cx);
         let Some(geometry) = self.geometry.get() else { return };
-        // Gutter clicks are not text edits (fold chevrons arrive in phase 5).
+        let display_row = self.row_at(&geometry, ev.position.y);
+        // The gutter folds: a chevron row toggles its fold.
         if ev.position.x < geometry.gutter_x + geometry.gutter_w {
+            let (line, placeholder) = self.resolve_display(display_row);
+            if let Some(fold) = placeholder {
+                self.unfold_placeholder(fold.start_line, cx);
+            } else if self.fold_candidates.iter().any(|(start, _)| *start == line) {
+                self.toggle_fold(line, cx);
+            }
+            return;
+        }
+        // Clicking a placeholder row unfolds it.
+        if let (_, Some(fold)) = self.resolve_display(display_row) {
+            self.unfold_placeholder(fold.start_line, cx);
             return;
         }
         if ev.modifiers.alt {
@@ -942,11 +999,15 @@ impl EditorPane {
         let row1 = self.row_at(geometry, bottom.y);
         let (x_left, x_right) = if from.x <= to.x { (from.x, to.x) } else { (to.x, from.x) };
         let mut selections = Vec::new();
-        for row in row0..=row1 {
-            let span = self.buf.line_span(row);
-            let line = self.buf.slice_utf16(span.clone());
-            let c0 = utf16_index_at_x(window, &line, x_left - geometry.origin.x, theme::px_font_size());
-            let c1 = utf16_index_at_x(window, &line, x_right - geometry.origin.x, theme::px_font_size());
+        for display in row0..=row1 {
+            let (line, placeholder) = self.resolve_display(display);
+            if placeholder.is_some() {
+                continue;
+            }
+            let span = self.buf.line_span(line);
+            let text = self.buf.slice_utf16(span.clone());
+            let c0 = utf16_index_at_x(window, &text, x_left - geometry.origin.x, theme::px_font_size());
+            let c1 = utf16_index_at_x(window, &text, x_right - geometry.origin.x, theme::px_font_size());
             let start = span.start + c0;
             let end = span.start + c1;
             selections.push(if down {
@@ -970,14 +1031,14 @@ impl EditorPane {
 
     /// Keeps the viewport inside the grid of lines the buffer has.
     fn clamp_scroll(&self) {
-        let max = self.buf.line_count().saturating_sub(1) as f32;
+        let max = self.display_count().saturating_sub(1) as f32;
         self.scroll.set(self.scroll.get().clamp(0.0, max));
     }
 
     /// Scrolls the primary cursor's line into view.
     fn clamp_scroll_to_primary(&self) {
         let caret = self.selections.first().map_or(0, |s| s.head);
-        let caret_line = self.buf.line_of(caret) as f32;
+        let caret_line = self.display_of_line(self.buf.line_of(caret)) as f32;
         let visible =
             self.geometry.get().map_or(20.0, |g| (g.height - px(theme::TEXT_INSET) * 2.0) / g.line_height).max(1.0);
         let scroll = self.scroll.get();
@@ -987,6 +1048,45 @@ impl EditorPane {
             self.scroll.set(caret_line - visible + 1.0);
         }
         self.clamp_scroll();
+    }
+
+    // -- display map (folding) ----------------------------------------------
+    //
+    // Display rows are the buffer rows with every folded range's inner rows
+    // replaced by one placeholder row under its start line.
+
+    fn display_count(&self) -> u32 {
+        display_count(&self.folds, self.buf.line_count())
+    }
+
+    fn display_of_line(&self, line: u32) -> u32 {
+        display_of_line(&self.folds, line)
+    }
+
+    fn resolve_display(&self, display: u32) -> (u32, Option<Fold>) {
+        resolve_display(&self.folds, self.buf.line_count(), display)
+    }
+
+    /// Folds or unfolds the candidate starting at `line`.
+    fn toggle_fold(&mut self, line: u32, cx: &mut gpui::Context<Self>) {
+        if let Some(at) = self.folds.iter().position(|f| f.start_line == line) {
+            self.folds.remove(at);
+        } else if let Some((start, end)) = self.fold_candidates.iter().find(|(s, _)| *s == line) {
+            // Not already hidden inside another fold (candidates may nest).
+            if self.folds.iter().all(|f| line > f.end_line || line < f.start_line) {
+                self.folds.push(Fold { start_line: *start, end_line: *end });
+                self.folds.sort_by_key(|f| f.start_line);
+            }
+        } else {
+            return;
+        }
+        cx.notify();
+    }
+
+    /// Unfolds the range the placeholder at `line` belongs to.
+    fn unfold_placeholder(&mut self, line: u32, cx: &mut gpui::Context<Self>) {
+        self.folds.retain(|f| f.start_line != line);
+        cx.notify();
     }
 }
 
@@ -1005,6 +1105,54 @@ fn inverse_changes(changes: &[TextChange], originals: &[String], strip_inserts: 
         delta += inserted as i64 - (change.to - change.from) as i64;
     }
     inverse
+}
+
+// -- display map (folding) --------------------------------------------------
+//
+// Display rows are the buffer rows with every folded range's inner rows
+// replaced by one placeholder row under its start line. Free functions over
+// the sorted, non-overlapping fold list so the math stays unit-testable.
+
+/// Hidden buffer rows strictly above `line`.
+fn hidden_before(folds: &[Fold], line: u32) -> u32 {
+    folds.iter().map(|f| f.end_line.min(line.saturating_sub(1)).saturating_sub(f.start_line)).sum()
+}
+
+/// Total display rows: visible buffer lines plus one placeholder per fold
+/// (each fold keeps its start line and hides `end - start` rows).
+fn display_count(folds: &[Fold], line_count: u32) -> u32 {
+    line_count - hidden_before(folds, u32::MAX) + folds.len() as u32
+}
+
+/// The display row a buffer line renders on; lines hidden inside a fold
+/// clamp onto that fold's placeholder row.
+fn display_of_line(folds: &[Fold], line: u32) -> u32 {
+    line - hidden_before(folds, line)
+}
+
+/// The buffer content of a display row: a buffer line, or (for a placeholder
+/// row) the fold whose placeholder it is.
+fn resolve_display(folds: &[Fold], line_count: u32, display: u32) -> (u32, Option<Fold>) {
+    let mut remaining = display;
+    let mut line = 0u32;
+    for fold in folds {
+        let visible_before = fold.start_line - line;
+        if remaining < visible_before {
+            return (line + remaining, None);
+        }
+        remaining -= visible_before;
+        if remaining == 0 {
+            return (fold.start_line, None); // the fold's first line renders
+        }
+        remaining -= 1;
+        if remaining == 0 {
+            return (fold.start_line, Some(*fold)); // its placeholder row
+        }
+        remaining -= 1;
+        line = fold.end_line + 1;
+    }
+    let last = line_count.saturating_sub(1);
+    (line.min(last) + remaining.min(last.saturating_sub(line)), None)
 }
 
 /// Clamp one selection into the document length.
@@ -1082,18 +1230,28 @@ struct EditorElement {
 }
 
 struct PrepaintState {
-    /// The laid-out rows in buffer order: (line index, shaped line). One row
-    /// of buffer above and below the viewport, so slow scrolls never show a
-    /// gap; everything outside is never shaped.
-    rows: Vec<(u32, ShapedLine)>,
+    /// The laid-out display rows: buffer lines with folded inner rows
+    /// replaced by placeholder rows. One row of slack above and below the
+    /// viewport, so slow scrolls never show a gap.
+    rows: Vec<DisplayedRow>,
     /// One caret per selection head.
     carets: Vec<Bounds<Pixels>>,
     /// Selection rectangles for the visible rows (painted under the text).
     selection_rects: Vec<Bounds<Pixels>>,
-    /// The primary's line, for the brighter gutter number.
+    /// Gutter chevron rows: (display row, already folded).
+    chevrons: Vec<(u32, bool)>,
+    /// The primary cursor's buffer line, for the brighter gutter number.
     caret_line: u32,
     gutter_w: Pixels,
     numbers_w: Pixels,
+}
+
+struct DisplayedRow {
+    /// The display row index (the paint position).
+    display: u32,
+    /// The buffer line, `None` for a fold placeholder row.
+    line: Option<u32>,
+    shaped: ShapedLine,
 }
 
 fn text_run(range: Range<usize>, color: gpui::Hsla) -> TextRun {
@@ -1276,48 +1434,65 @@ impl Element for EditorElement {
         let line_height = theme::px_line_height();
 
         let marked = pane.buf.marked.clone();
-        let caret_line = pane.selections.first().map_or(0, |s| pane.buf.line_of(s.head));
-        let line_count = pane.buf.line_count();
+        let caret_buffer_line = pane.selections.first().map_or(0, |s| pane.buf.line_of(s.head));
         let scroll = pane.scroll.get();
 
         // Gutter geometry: the widest line number sets the width (at least
         // three digits, so small files do not look cramped).
-        let digits = line_count.to_string().len().max(3);
+        let digits = pane.buf.line_count().to_string().len().max(3);
         let numbers_w = shaped_width(window, &"8".repeat(digits), font_size);
         let gutter_w = px(theme::GUTTER_PAD_L) + numbers_w + px(theme::GUTTER_PAD_R);
         let gutter_x = bounds.origin.x;
         let origin = point(gutter_x + gutter_w, bounds.origin.y + px(theme::TEXT_INSET));
 
-        // Only the visible rows are laid out, with one row of buffer above
-        // and below; a 50 MB file costs the same as a small one.
-        let first_visible = (scroll.floor().max(0.0) as u32).min(line_count.saturating_sub(1));
+        // Only the visible display rows are laid out, with one row of slack
+        // above and below; a 50 MB file costs the same as a small one.
+        let display_count = pane.display_count();
+        let first_visible = (scroll.floor().max(0.0) as u32).min(display_count.saturating_sub(1));
         let visible = ((bounds.size.height - px(theme::TEXT_INSET) * 2.0) / line_height).ceil() as u32;
         let first = first_visible.saturating_sub(1);
-        let last = (first_visible + visible + 1).min(line_count);
+        let last = (first_visible + visible + 1).min(display_count);
 
         let fg = theme::fg();
-        let rows = (first..last)
-            .map(|line| {
-                let span = pane.buf.line_span(line);
-                let content = pane.buf.slice_utf16(span.clone());
-                let line_start_byte = pane.buf.doc.rope().line_to_byte(line as usize);
-                let runs = line_runs(&content, span, marked.clone(), line_start_byte, &pane.spans, fg);
-                let shaped = window.text_system().shape_line(content.into(), font_size, &runs, None);
-                (line, shaped)
-            })
-            .collect();
+        let muted = theme::fg_muted();
+        let mut rows = Vec::with_capacity((last - first) as usize);
+        let mut chevrons = Vec::new();
+        for display in first..last {
+            let (line, placeholder) = pane.resolve_display(display);
+            let shaped = match placeholder {
+                Some(fold) => {
+                    let label = format!("⋯ {} lines", fold.end_line - fold.start_line);
+                    let run = plain_run(label.len(), muted);
+                    window.text_system().shape_line(label.into(), font_size, &[run], None)
+                }
+                None => {
+                    let span = pane.buf.line_span(line);
+                    let content = pane.buf.slice_utf16(span.clone());
+                    let line_start_byte = pane.buf.doc.rope().line_to_byte(line as usize);
+                    let runs = line_runs(&content, span, marked.clone(), line_start_byte, &pane.spans, fg);
+                    window.text_system().shape_line(content.into(), font_size, &runs, None)
+                }
+            };
+            let folded_here = placeholder.is_some();
+            let foldable_here = !folded_here && pane.fold_candidates.iter().any(|(start, _)| *start == line);
+            if folded_here || foldable_here {
+                chevrons.push((display, folded_here));
+            }
+            rows.push(DisplayedRow { display, line: placeholder.is_none().then_some(line), shaped });
+        }
 
         // Carets (one per selection head) and selection rectangles for the
-        // visible rows.
+        // visible rows (positions go through the display map).
         let mut carets = Vec::with_capacity(pane.selections.len());
         let mut selection_rects = Vec::new();
         for selection in &pane.selections {
             let head_line = pane.buf.line_of(selection.head);
-            if (first..last).contains(&head_line) {
+            let head_display = pane.display_of_line(head_line);
+            if (first..last).contains(&head_display) {
                 let span = pane.buf.line_span(head_line);
                 let line_text = pane.buf.slice_utf16(span.clone());
                 let head_x = x_at_utf16(window, &line_text, selection.head - span.start, font_size);
-                let head_y = origin.y + line_height * (head_line as f32 - scroll);
+                let head_y = origin.y + line_height * (head_display as f32 - scroll);
                 carets.push(Bounds::new(point(origin.x + head_x, head_y), size(px(2.0), line_height)));
             }
             let (start, end) = selection.normalized();
@@ -1326,8 +1501,9 @@ impl Element for EditorElement {
             }
             let start_line = pane.buf.line_of(start);
             let end_line = pane.buf.line_of(end).max(start_line);
-            for row in first..last {
-                if row < start_line || row > end_line {
+            for display in first..last {
+                let (row, placeholder) = pane.resolve_display(display);
+                if placeholder.is_some() || row < start_line || row > end_line {
                     continue;
                 }
                 let span = pane.buf.line_span(row);
@@ -1342,7 +1518,7 @@ impl Element for EditorElement {
                 } else {
                     x_at_utf16(window, &line_text, end - span.start, font_size)
                 };
-                let y = origin.y + line_height * (row as f32 - scroll);
+                let y = origin.y + line_height * (display as f32 - scroll);
                 selection_rects.push(Bounds::new(point(origin.x + x0, y), size((x1 - x0).max(px(0.0)), line_height)));
             }
         }
@@ -1356,7 +1532,7 @@ impl Element for EditorElement {
             height: bounds.size.height,
         }));
 
-        PrepaintState { rows, carets, selection_rects, caret_line, gutter_w, numbers_w }
+        PrepaintState { rows, carets, selection_rects, chevrons, caret_line: caret_buffer_line, gutter_w, numbers_w }
     }
 
     fn paint(
@@ -1379,16 +1555,26 @@ impl Element for EditorElement {
         // over the workbench chrome around the editor.
         window.paint_layer(bounds, |window| {
             // Gutter: right-aligned line numbers, the caret's row brighter,
-            // separated from the text by the border color.
-            for (row, _) in prepaint.rows.iter() {
-                let number = (row + 1).to_string();
-                let width = shaped_width(window, &number, font_size);
-                let color = if *row == prepaint.caret_line { theme::fg() } else { theme::fg_muted() };
-                let x = gutter_x + px(theme::GUTTER_PAD_L) + prepaint.numbers_w - width;
-                let y = origin.y + line_height * (*row as f32 - geometry.scroll);
-                let run = plain_run(number.len(), color);
-                let shaped = window.text_system().shape_line(number.into(), font_size, &[run], None);
-                let _ = shaped.paint(point(x, y), line_height, TextAlign::Left, None, window, cx);
+            // separated from the text by the border color; fold chevrons at
+            // the left edge.
+            for row in &prepaint.rows {
+                let y = origin.y + line_height * (row.display as f32 - geometry.scroll);
+                if let Some(line) = row.line {
+                    let number = (line + 1).to_string();
+                    let width = shaped_width(window, &number, font_size);
+                    let color = if Some(line) == Some(prepaint.caret_line) { theme::fg() } else { theme::fg_muted() };
+                    let x = gutter_x + px(theme::GUTTER_PAD_L) + prepaint.numbers_w - width;
+                    let run = plain_run(number.len(), color);
+                    let shaped = window.text_system().shape_line(number.into(), font_size, &[run], None);
+                    let _ = shaped.paint(point(x, y), line_height, TextAlign::Left, None, window, cx);
+                }
+            }
+            for (display, folded) in &prepaint.chevrons {
+                let glyph = if *folded { "▸" } else { "▾" };
+                let run = plain_run(glyph.len(), theme::fg_muted());
+                let shaped = window.text_system().shape_line(glyph.into(), font_size, &[run], None);
+                let y = origin.y + line_height * (*display as f32 - geometry.scroll);
+                let _ = shaped.paint(point(gutter_x + px(2.0), y), line_height, TextAlign::Left, None, window, cx);
             }
             let separator = Bounds::new(
                 point(gutter_x + prepaint.gutter_w - px(1.0), bounds.origin.y),
@@ -1400,9 +1586,9 @@ impl Element for EditorElement {
             for rect in &prepaint.selection_rects {
                 window.paint_quad(fill(*rect, rgba_of(theme::SELECTION_BG)));
             }
-            for (row, shaped) in prepaint.rows.drain(..) {
-                let y = origin.y + line_height * (row as f32 - geometry.scroll);
-                let _ = shaped.paint(point(origin.x, y), line_height, TextAlign::Left, None, window, cx);
+            for row in prepaint.rows.drain(..) {
+                let y = origin.y + line_height * (row.display as f32 - geometry.scroll);
+                let _ = row.shaped.paint(point(origin.x, y), line_height, TextAlign::Left, None, window, cx);
             }
             for caret in &prepaint.carets {
                 window.paint_quad(fill(*caret, rgba_of(theme::ACCENT)));
@@ -1636,5 +1822,36 @@ mod tests {
         assert_eq!(buf.line_span(0), 0..3);
         assert_eq!(buf.line_span(1), 4..7);
         assert_eq!(buf.slice_utf16(0..buf.utf16_len()), "abc\ndef");
+    }
+
+    #[test]
+    fn display_map_collapses_folded_rows() {
+        // Lines 6..10 hidden under a placeholder at line 5.
+        let folds = vec![Fold { start_line: 5, end_line: 10 }];
+        assert_eq!(display_count(&folds, 20), 16, "15 visible lines + 1 placeholder");
+        assert_eq!(display_of_line(&folds, 5), 5);
+        assert_eq!(display_of_line(&folds, 7), 6, "hidden lines clamp onto the placeholder");
+        assert_eq!(display_of_line(&folds, 11), 6);
+        assert_eq!(display_of_line(&folds, 19), 14);
+        // Walk the whole map: rows 0-5 buffer, row 6 placeholder, 7-15 buffer.
+        let resolved: Vec<_> = (0..16).map(|d| resolve_display(&folds, 20, d)).collect();
+        assert_eq!(resolved[0].0, 0);
+        assert_eq!(resolved[5].0, 5);
+        assert_eq!(resolved[6], (5, Some(folds[0])));
+        assert_eq!(resolved[7].0, 11);
+        assert_eq!(resolved[14].0, 18);
+        assert_eq!(resolved[15].0, 19);
+        // Two folds compose: b0, b1, ph(f1), b3, b4, b5, ph(f2), b9.
+        let folds = vec![Fold { start_line: 1, end_line: 2 }, Fold { start_line: 5, end_line: 8 }];
+        assert_eq!(display_count(&folds, 10), 8);
+        let resolved: Vec<_> = (0..8).map(|d| resolve_display(&folds, 10, d)).collect();
+        assert_eq!(
+            resolved.iter().map(|(l, p)| (*l, p.is_some())).collect::<Vec<_>>(),
+            // Placeholders report their fold's start line.
+            vec![(0, false), (1, false), (1, true), (3, false), (4, false), (5, false), (5, true), (9, false)]
+        );
+        // Without folds everything is identity.
+        assert_eq!(display_count(&[], 7), 7);
+        assert_eq!(resolve_display(&[], 7, 6), (6, None));
     }
 }
