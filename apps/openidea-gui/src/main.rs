@@ -27,9 +27,9 @@ use gpui_kit_assets::AllAssets;
 use crate::actions::{
     Cancel, CloseTab, CursorDocEnd, CursorDocStart, CursorDown, CursorLeft, CursorLineEnd, CursorLineHome, CursorRight,
     CursorUp, CursorWordLeft, CursorWordRight, DeleteBackward, DeleteForward, DeleteWordBackward, DeleteWordForward,
-    FindUsages, GoToFile, GotoDefinition, Newline, OpenFile, Quit, Redo, Rename, Save, SearchEverywhere, SelectDocEnd,
-    SelectDocStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineHome, SelectRight, SelectUp, SelectWordLeft,
-    SelectWordRight, TogglePerfHud, Undo,
+    FindUsages, GoToFile, GotoDefinition, Newline, OpenFile, Quit, Redo, Rename, Save, SelectDocEnd, SelectDocStart,
+    SelectDown, SelectLeft, SelectLineEnd, SelectLineHome, SelectRight, SelectUp, SelectWordLeft, SelectWordRight,
+    TogglePerfHud, Undo,
 };
 use crate::actions::{SelectNext, SelectPrev};
 use crate::bus::Bus;
@@ -98,8 +98,10 @@ fn main() {
                     KeyBinding::new("shift-cmd-z", Redo, None),
                     // M3: navigation and the command surfaces (the handlers land
                     // with their features; an unhandled action is a no-op).
+                    // (Search Everywhere has no key binding: double ⇧ is a
+                    // modifiers-event gesture in the workbench, since
+                    // modifier-only presses never become keystrokes.)
                     KeyBinding::new("shift-cmd-o", GoToFile, None),
-                    KeyBinding::new("shift shift", SearchEverywhere, None),
                     KeyBinding::new("cmd-b", GotoDefinition, None),
                     KeyBinding::new("shift-f6", Rename, None),
                     KeyBinding::new("alt-f7", FindUsages, None),
