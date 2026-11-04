@@ -27,11 +27,11 @@ use gpui_component::{Root, Theme, ThemeMode};
 use gpui_kit_assets::AllAssets;
 
 use crate::actions::{
-    Cancel, CloseTab, Commit, CursorDocEnd, CursorDocStart, CursorDown, CursorLeft, CursorLineEnd, CursorLineHome,
-    CursorRight, CursorUp, CursorWordLeft, CursorWordRight, DeleteBackward, DeleteForward, DeleteWordBackward,
-    DeleteWordForward, FindUsages, GoToFile, GotoDefinition, Newline, OpenFile, Paste, Quit, Redo, Rename, Run, Save,
-    SelectDocEnd, SelectDocStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineHome, SelectRight, SelectUp,
-    SelectWordLeft, SelectWordRight, ShowDiff, TogglePerfHud, Undo,
+    Cancel, CloseTab, Commit, CommitConfirm, CursorDocEnd, CursorDocStart, CursorDown, CursorLeft, CursorLineEnd,
+    CursorLineHome, CursorRight, CursorUp, CursorWordLeft, CursorWordRight, DeleteBackward, DeleteForward,
+    DeleteWordBackward, DeleteWordForward, FindUsages, GoToFile, GotoDefinition, Newline, OpenFile, Paste, Quit, Redo,
+    Rename, Run, Save, SelectDocEnd, SelectDocStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineHome,
+    SelectRight, SelectUp, SelectWordLeft, SelectWordRight, ShowDiff, TogglePerfHud, Undo,
 };
 use crate::actions::{SelectNext, SelectPrev};
 use crate::bus::Bus;
@@ -112,6 +112,9 @@ fn main() {
                     KeyBinding::new("ctrl-r", Run, None),
                     KeyBinding::new("ctrl-d", ShowDiff, None),
                     KeyBinding::new("cmd-k", Commit, None),
+                    // Commit-dialog plumbing (⌘Enter commits, Enter = newline
+                    // in the message input).
+                    KeyBinding::new("cmd-enter", CommitConfirm, Some("Commit")),
                     // Escape cancels panels/popups first (whatever has focus),
                     // then collapses the editor's own state.
                     KeyBinding::new("escape", Cancel, None),

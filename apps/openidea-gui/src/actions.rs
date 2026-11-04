@@ -10,7 +10,21 @@ use gpui::actions;
 
 actions!(
     workbench,
-    [OpenFile, Save, CloseTab, Undo, Redo, Quit, Cancel, GoToFile, SearchEverywhere, Run, ShowDiff, Commit,]
+    [
+        OpenFile,
+        Save,
+        CloseTab,
+        Undo,
+        Redo,
+        Quit,
+        Cancel,
+        GoToFile,
+        SearchEverywhere,
+        Run,
+        ShowDiff,
+        Commit,
+        CommitConfirm,
+    ]
 );
 
 // Palette plumbing (⇧⌘O / double-⇧ popup): deliberately not in REGISTRY —
