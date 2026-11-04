@@ -8,7 +8,10 @@
 
 use gpui::actions;
 
-actions!(workbench, [OpenFile, Save, CloseTab, Undo, Redo, Quit, Cancel, GoToFile, SearchEverywhere,]);
+actions!(
+    workbench,
+    [OpenFile, Save, CloseTab, Undo, Redo, Quit, Cancel, GoToFile, SearchEverywhere, Run, ShowDiff, Commit,]
+);
 
 // Palette plumbing (⇧⌘O / double-⇧ popup): deliberately not in REGISTRY —
 // these are the list's own keys, not user-invocable commands.
@@ -78,6 +81,9 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("workbench::CloseTab", "Close Tab", "File", "⌘W"),
     action_info!("workbench::GoToFile", "Go to File", "Navigate", "⇧⌘O"),
     action_info!("workbench::SearchEverywhere", "Search Everywhere", "Navigate", "Double ⇧"),
+    action_info!("workbench::Run", "Run…", "Run", "⌃R"),
+    action_info!("workbench::ShowDiff", "Show Diff", "Git", "⌃D"),
+    action_info!("workbench::Commit", "Commit…", "Git", "⌘K"),
     action_info!("workbench::Undo", "Undo", "Edit", "⌘Z"),
     action_info!("workbench::Redo", "Redo", "Edit", "⇧⌘Z"),
     action_info!("editor::Paste", "Paste", "Edit", "⌘V"),

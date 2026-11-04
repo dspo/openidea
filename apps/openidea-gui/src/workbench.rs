@@ -26,15 +26,17 @@ use ide_core::event::NotifyLevel;
 use ide_core::event::ServerStatus;
 use ide_core::{Diagnostic, DocId, IdeEvent, ServerId};
 use ide_index::{FileMatch, SymbolFilter, SymbolMatch};
+use ide_run::RunConfig;
 use ide_vfs::EntryKind;
 
 use crate::actions as acts;
-use crate::actions::{Cancel, CloseTab, GoToFile, OpenFile, Redo, Save, SearchEverywhere, Undo};
+use crate::actions::{Cancel, CloseTab, GoToFile, OpenFile, Redo, Run, Save, SearchEverywhere, Undo};
 use crate::bus::{Bus, BusMessage};
 use crate::editor::EditorPane;
 use crate::file_tree::{FileTree, Row};
 use crate::fuzzy;
 use crate::host::Host;
+use crate::run_panel::{RunPanel, stream_of};
 use crate::{strings, theme};
 
 /// One open file: the editor pane, its document in the backend, and the two
@@ -71,26 +73,42 @@ struct RankedAction {
     indices: Vec<usize>,
 }
 
-/// The ⇧⌘O / double-⇧ palette (M3 phase 6): one list, grouped Files /
-/// Symbols / Actions. Files and symbols come from the project index; actions
-/// are the app's registry table filtered by the in-app fuzzy matcher.
+/// Which surface the ⇧⌘O / double-⇧ / ⌃R palette shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerMode {
+    /// Go to File (files only).
+    Files,
+    /// Search Everywhere: files + symbols + actions.
+    Everywhere,
+    /// Run configurations (⌃R): pick one, or type a one-off shell command.
+    Run,
+}
+
+/// The ⇧⌘O / double-⇧ / ⌃R palette: one list, grouped per mode. Files and
+/// symbols come from the project index; actions are the app's registry table
+/// filtered by the in-app fuzzy matcher; run configs are detected + user.
 struct Picker {
-    /// `false` = Go to File (files only); `true` = Search Everywhere.
-    everywhere: bool,
+    mode: PickerMode,
     input: Entity<InputState>,
     query: String,
     files: Vec<FileMatch>,
     symbols: Vec<SymbolMatch>,
     actions: Vec<RankedAction>,
+    /// Run mode: the configurations offered, cached at open.
+    configs: Vec<RunConfig>,
     selected: usize,
 }
 
-/// One selectable palette row (the flat form across the three sections).
+/// One selectable palette row (the flat form across the sections).
 #[derive(Clone)]
 enum PickerRow {
     File(FileMatch),
     Symbol(SymbolMatch),
     Action(RankedAction),
+    /// Boxed: `RunConfig` dwarfs the other variants (clippy::large_enum_variant).
+    Run(Box<RunConfig>),
+    /// A one-off shell command line typed into the Run palette.
+    Shell(String),
 }
 
 pub struct Workbench {
@@ -109,10 +127,13 @@ pub struct Workbench {
     /// for the pane's line lookups.
     diagnostics: HashMap<PathBuf, HashMap<String, Vec<Diagnostic>>>,
     bus: Bus,
-    /// The open Go to File / Search Everywhere palette, if any.
+    /// The open Go to File / Search Everywhere / Run palette, if any.
     picker: Option<Picker>,
     /// The input's Change / PressEnter subscription, alive while the picker is.
     picker_sub: Option<gpui::Subscription>,
+    /// The Run dock (M4), from the first run until the project closes: one
+    /// run at a time, output streaming through the bus.
+    run_panel: Option<Entity<RunPanel>>,
     /// The last bare ⇧ press, for the double-⇧ Search Everywhere gesture.
     last_shift: Cell<Option<Instant>>,
     /// Whether ⇧ was held at the last modifiers event (rising-edge detection).
@@ -140,6 +161,7 @@ impl Workbench {
             bus,
             picker: None,
             picker_sub: None,
+            run_panel: None,
             last_shift: Cell::new(None),
             shift_held: Cell::new(false),
         }
@@ -221,11 +243,17 @@ impl Workbench {
     // accepts, Esc closes and focus returns to the editor.
 
     fn on_go_to_file(&mut self, _: &GoToFile, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_picker(false, window, cx);
+        self.open_picker(PickerMode::Files, window, cx);
     }
 
     fn on_search_everywhere(&mut self, _: &SearchEverywhere, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_picker(true, window, cx);
+        self.open_picker(PickerMode::Everywhere, window, cx);
+    }
+
+    /// ⌃R: the Run palette — pick a detected / user configuration, or type a
+    /// one-off shell command line.
+    fn on_run(&mut self, _: &Run, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_picker(PickerMode::Run, window, cx);
     }
 
     /// Bare-⇧ taps, two within a short window, open Search Everywhere.
@@ -245,26 +273,37 @@ impl Workbench {
                 .is_some_and(|at| now.duration_since(at) < Duration::from_millis(600));
             if again {
                 self.last_shift.set(None);
-                self.open_picker(true, window, cx);
+                self.open_picker(PickerMode::Everywhere, window, cx);
             }
         }
     }
 
-    fn open_picker(&mut self, everywhere: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_picker(&mut self, mode: PickerMode, window: &mut Window, cx: &mut Context<Self>) {
         if self.picker.is_some() {
             return;
         }
-        let placeholder =
-            if everywhere { strings::PICKER_EVERYWHERE_PLACEHOLDER } else { strings::PICKER_FILE_PLACEHOLDER };
+        let placeholder = match mode {
+            PickerMode::Files => strings::PICKER_FILE_PLACEHOLDER,
+            PickerMode::Everywhere => strings::PICKER_EVERYWHERE_PLACEHOLDER,
+            PickerMode::Run => strings::PICKER_RUN_PLACEHOLDER,
+        };
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         window.focus(&input.read(cx).presentation().focus_handle().clone(), cx);
+        // Run mode caches the configuration list once at open (the detector
+        // reads package.json / Cargo.toml / …; fixture-scale work).
+        let configs = if mode == PickerMode::Run {
+            self.host.as_ref().map(|host| host.run_configs()).unwrap_or_else(|| Ok(Vec::new())).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         self.picker = Some(Picker {
-            everywhere,
+            mode,
             input: input.clone(),
             query: String::new(),
             files: Vec::new(),
             symbols: Vec::new(),
             actions: Vec::new(),
+            configs,
             selected: 0,
         });
         self.picker_sub =
@@ -273,12 +312,6 @@ impl Workbench {
                 InputEvent::PressEnter { .. } => this.picker_accept(window, cx),
                 _ => {}
             }));
-        eprintln!(
-            "[picker] refreshed: {} files, {} symbols, {} actions",
-            self.picker.as_ref().map_or(0, |p| p.files.len()),
-            self.picker.as_ref().map_or(0, |p| p.symbols.len()),
-            self.picker.as_ref().map_or(0, |p| p.actions.len())
-        );
         self.refresh_picker(cx);
     }
 
@@ -304,30 +337,35 @@ impl Workbench {
         self.refresh_picker(cx);
     }
 
-    /// Re-runs the palette's queries against the index and the action
-    /// registry. The index answers from whatever is indexed so far and is
-    /// fast at fixture scale, so this runs on the UI thread (moving it behind
-    /// a request channel is an M4 seam).
+    /// Re-runs the palette's queries against the index, the action registry
+    /// and the cached run configs. The index answers from whatever is indexed
+    /// so far and is fast at fixture scale, so this runs on the UI thread
+    /// (moving it behind a request channel is an M4 seam).
     fn refresh_picker(&mut self, cx: &mut Context<Self>) {
         let Some(picker) = &mut self.picker else { return };
         let query = picker.query.trim().to_string();
         let Some(host) = self.host.clone() else { return };
-        picker.files = if query.is_empty() {
-            host.index
-                .recent_files()
-                .into_iter()
-                .take(8)
-                .map(|path| FileMatch {
-                    rel_path: path.strip_prefix(&host.root).unwrap_or(&path).display().to_string(),
-                    path: ide_core::IpcPath(path),
-                    score: 0,
-                    indices: Vec::new(),
-                })
-                .collect()
-        } else {
-            host.index.find_files(&query, 12)
-        };
-        if picker.everywhere {
+        match picker.mode {
+            PickerMode::Run => {}
+            _ => {
+                picker.files = if query.is_empty() {
+                    host.index
+                        .recent_files()
+                        .into_iter()
+                        .take(8)
+                        .map(|path| FileMatch {
+                            rel_path: path.strip_prefix(&host.root).unwrap_or(&path).display().to_string(),
+                            path: ide_core::IpcPath(path),
+                            score: 0,
+                            indices: Vec::new(),
+                        })
+                        .collect()
+                } else {
+                    host.index.find_files(&query, 12)
+                };
+            }
+        }
+        if picker.mode == PickerMode::Everywhere {
             picker.symbols =
                 if query.is_empty() { Vec::new() } else { host.index.find_symbols(&query, SymbolFilter::All, 8) };
             picker.actions = ranked_actions(&query);
@@ -336,17 +374,45 @@ impl Workbench {
         cx.notify();
     }
 
-    /// The flat selectable rows: files, then symbols, then actions.
+    /// The run palette's rows: configs matching the query (name or command),
+    /// plus a trailing one-off shell row for a non-empty query.
+    fn run_rows(&self) -> (Vec<PickerRow>, usize) {
+        let Some(picker) = &self.picker else { return (Vec::new(), 0) };
+        let query = picker.query.trim();
+        let mut rows: Vec<PickerRow> = picker
+            .configs
+            .iter()
+            .filter(|config| {
+                query.is_empty()
+                    || fuzzy::match_text(&config.name, query).is_some()
+                    || fuzzy::match_text(&config.command, query).is_some()
+            })
+            .cloned()
+            .map(|config| PickerRow::Run(Box::new(config)))
+            .collect();
+        // The typed query is always runnable as a shell line.
+        if !query.is_empty() {
+            rows.push(PickerRow::Shell(query.to_owned()));
+        }
+        let shell_index = rows.len().saturating_sub(1);
+        (rows, shell_index)
+    }
+
+    /// The flat selectable rows per mode: files, then symbols, then actions;
+    /// or the run list.
     fn picker_rows(&self) -> Vec<PickerRow> {
         let Some(picker) = &self.picker else { return Vec::new() };
-        picker
-            .files
-            .iter()
-            .cloned()
-            .map(PickerRow::File)
-            .chain(picker.symbols.iter().cloned().map(PickerRow::Symbol))
-            .chain(picker.actions.iter().cloned().map(PickerRow::Action))
-            .collect()
+        match picker.mode {
+            PickerMode::Run => self.run_rows().0,
+            _ => picker
+                .files
+                .iter()
+                .cloned()
+                .map(PickerRow::File)
+                .chain(picker.symbols.iter().cloned().map(PickerRow::Symbol))
+                .chain(picker.actions.iter().cloned().map(PickerRow::Action))
+                .collect(),
+        }
     }
 
     fn picker_move(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -391,7 +457,73 @@ impl Workbench {
                     }
                 }
             }
+            PickerRow::Run(config) => {
+                self.close_picker(window, cx);
+                self.start_run(*config, cx);
+            }
+            PickerRow::Shell(line) => {
+                self.close_picker(window, cx);
+                self.start_run(shell_config(line), cx);
+            }
         }
+    }
+
+    // -- run (M4) ----------------------------------------------------------
+    //
+    // ⌃R opens the Run palette; a picked (or typed shell) configuration
+    // starts through the host on the background executor. Output streams
+    // through the bus into the Run dock; the exit lands as an `IdeEvent` on
+    // the same bus. One run at a time.
+
+    fn start_run(&mut self, config: RunConfig, cx: &mut Context<Self>) {
+        let Some(host) = self.host.clone() else {
+            self.message = Some((NotifyLevel::Warning, strings::NO_PROJECT.to_owned()));
+            cx.notify();
+            return;
+        };
+        if self.run_panel.as_ref().is_some_and(|panel| panel.read(cx).running()) {
+            self.message = Some((NotifyLevel::Warning, strings::RUN_ALREADY_RUNNING.to_owned()));
+            cx.notify();
+            return;
+        }
+        let name = config.name.clone();
+        self.run_panel = Some(cx.new(|cx| RunPanel::new(host.clone(), name.clone(), cx)));
+        let bus = self.bus.clone();
+        let on_output = {
+            let bus = bus.clone();
+            move |chunk: ide_run::OutputChunk| bus.send(BusMessage::RunOutput { chunk })
+        };
+        // start_run forks the process and spawns its own reader threads, so
+        // it stays off the UI thread; the answer comes back through the bus.
+        let task_name = name.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let result = host.start_run(&config, Box::new(on_output));
+                bus.send(BusMessage::RunStarted { name: task_name, result });
+            })
+            .detach();
+        // Elapsed-time ticks for the header / status bar while the run is
+        // quiet (output chunks notify anyway).
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(500)).await;
+                let live = this
+                    .update(cx, |this, cx| {
+                        let live = this.run_panel.as_ref().is_some_and(|panel| panel.read(cx).running());
+                        if live {
+                            cx.notify();
+                        }
+                        live
+                    })
+                    .ok();
+                if live != Some(true) {
+                    return;
+                }
+            }
+        })
+        .detach();
+        eprintln!("[run] starting {name}");
+        cx.notify();
     }
 
     // -- tab plumbing -----------------------------------------------------
@@ -571,6 +703,51 @@ impl Workbench {
                 self.servers.retain(|row| row.id != server);
                 cx.notify();
             }
+            BusMessage::RunStarted { name, result } => {
+                match result {
+                    Ok(info) => {
+                        if let Some(panel) = &self.run_panel {
+                            panel.update(cx, |panel, cx| {
+                                panel.started(&info);
+                                cx.notify();
+                            });
+                        }
+                        eprintln!("[run] started {name} (run {})", info.id.0);
+                    }
+                    Err(e) => {
+                        if let Some(panel) = &self.run_panel {
+                            panel.update(cx, |panel, cx| {
+                                panel.start_failed(&e.message);
+                                cx.notify();
+                            });
+                        }
+                        self.message =
+                            Some((NotifyLevel::Error, format!("{} {name}: {}", strings::RUN_LAUNCH_FAILED, e.message)));
+                    }
+                }
+                cx.notify();
+            }
+            BusMessage::RunOutput { chunk } => {
+                if let Some(panel) = &self.run_panel {
+                    let (stream, text) = stream_of(&chunk);
+                    panel.update(cx, |panel, cx| {
+                        panel.append(stream, text);
+                        cx.notify();
+                    });
+                }
+            }
+            BusMessage::Ide(IdeEvent::RunExited { run, code }) => {
+                eprintln!("[run] exited {run} code {code:?}");
+                let mine = self.run_panel.as_ref().is_some_and(|panel| panel.read(cx).run_id == Some(run));
+                if mine && let Some(panel) = &self.run_panel {
+                    panel.update(cx, |panel, cx| {
+                        panel.exited(code);
+                        cx.notify();
+                    });
+                    self.message = Some((NotifyLevel::Info, format!("{} {code:?}", strings::RUN_EXITED)));
+                }
+                cx.notify();
+            }
             BusMessage::Ide(_) => {}
         }
     }
@@ -636,6 +813,25 @@ impl Workbench {
 
 fn file_name(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
+}
+
+/// A one-off shell command line from the Run palette, as a configuration
+/// (ide-run runs a command with shell characters through the platform shell).
+fn shell_config(line: String) -> RunConfig {
+    RunConfig {
+        id: format!("shell:{}", ide_core::RunId::next().0),
+        name: format!("{}{line}", strings::RUN_SHELL_PREFIX),
+        kind: "shell".into(),
+        command: line,
+        args: Vec::new(),
+        cwd: None,
+        env: Default::default(),
+        detected: false,
+        is_test: false,
+        debug_adapter: None,
+        allow_parallel: false,
+        extras: Default::default(),
+    }
 }
 
 /// The registry filtered and ranked by the local fuzzy matcher (empty query =
@@ -728,6 +924,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::on_go_to_file))
             .on_action(cx.listener(Self::on_search_everywhere))
+            .on_action(cx.listener(Self::on_run))
             // Double ⇧ gesture (modifier presses arrive as modifiers events).
             .on_modifiers_changed(cx.listener(Self::on_modifiers))
             .child(
@@ -739,6 +936,14 @@ impl Render for Workbench {
                     .child(self.render_tree(cx))
                     .child(self.render_editor_area(cx)),
             )
+            // The Run dock sits between the editor area and the status bar,
+            // from the first run onward (one run at a time; hiding it is an
+            // M4 leftover).
+            .when_some(self.run_panel.clone(), |area, panel| {
+                area.child(
+                    div().h(px(240.0)).flex_none().min_h_0().border_t_1().border_color(theme::border()).child(panel),
+                )
+            })
             .child(self.render_status())
             .children(self.render_picker(cx))
     }
@@ -929,11 +1134,15 @@ impl Workbench {
         let picker = self.picker.as_ref()?;
         let selected = picker.selected;
         let rows = self.picker_rows();
-        let bounds = [
-            ("Files", 0..picker.files.len()),
-            ("Symbols", picker.files.len()..picker.files.len() + picker.symbols.len()),
-            ("Actions", picker.files.len() + picker.symbols.len()..rows.len()),
-        ];
+        let bounds: Vec<(&str, std::ops::Range<usize>)> = match picker.mode {
+            PickerMode::Run => vec![("Run", 0..rows.len())],
+            PickerMode::Files => vec![("Files", 0..rows.len())],
+            PickerMode::Everywhere => vec![
+                ("Files", 0..picker.files.len()),
+                ("Symbols", picker.files.len()..picker.files.len() + picker.symbols.len()),
+                ("Actions", picker.files.len() + picker.symbols.len()..rows.len()),
+            ],
+        };
         let mut list = div().id("picker-list").max_h(px(420.0)).overflow_y_scroll().py_1();
         if rows.is_empty() {
             list = list.child(
@@ -1021,6 +1230,40 @@ impl Workbench {
                 (content.into_any_element(), Some(secondary))
             }
             PickerRow::Action(action) => (highlighted(action.title, &action.indices), Some(action.keys.to_owned())),
+            PickerRow::Run(config) => (
+                div()
+                    .flex()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_color(theme::fg()).child(SharedString::from(config.name.clone())))
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .text_color(theme::fg_muted())
+                            .text_size(px(11.))
+                            .child(SharedString::from(config.command.clone())),
+                    )
+                    .into_any_element(),
+                None,
+            ),
+            PickerRow::Shell(line) => (
+                div()
+                    .flex()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme::accent())
+                            .child(SharedString::from(strings::RUN_SHELL_PREFIX.to_owned())),
+                    )
+                    .child(div().truncate().text_color(theme::fg()).child(SharedString::from(line)))
+                    .into_any_element(),
+                None,
+            ),
         };
         row_shell(content, secondary)
             .id(("picker-row", index))

@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{App, WeakEntity};
-use ide_core::{IdeEvent, Pos, SharedSink};
+use ide_core::{IdeEvent, IdeResult, Pos, SharedSink};
+use ide_run::{OutputChunk, RunInfo};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::workbench::Workbench;
@@ -28,6 +29,18 @@ pub enum BusMessage {
     OpenLocation {
         path: PathBuf,
         pos: Pos,
+    },
+    /// A run configuration start attempt finished (M4; spawned onto the
+    /// background executor).
+    RunStarted {
+        name: String,
+        result: IdeResult<RunInfo>,
+    },
+    /// One output chunk of the run (ide-run batches at ~8 ms). The dock is
+    /// single-run, so the chunk routes to the current panel; exits carry the
+    /// run id through `IdeEvent::RunExited`.
+    RunOutput {
+        chunk: OutputChunk,
     },
 }
 

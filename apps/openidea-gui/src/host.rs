@@ -28,10 +28,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ide_core::{ChangeSet, DocId, IdeError, IdeResult, SharedSink};
+use ide_core::{ChangeSet, DocId, IdeError, IdeResult, RunId, SharedSink};
 use ide_index::ProjectIndex;
 use ide_language::{LanguageRegistry, Syntax};
 use ide_lsp::LspManager;
+use ide_run::{OutputChunk, ProcessManager, RunConfig, RunInfo, StartOptions};
 use ide_text::AppliedChange;
 use ide_vfs::{FileEntry, Watcher};
 use ide_workspace::documents::DocumentObserver;
@@ -63,6 +64,10 @@ pub struct Host {
     /// The project index (M3): fuzzy file / symbol search behind Go to File
     /// and Search Everywhere, kept fresh by the same watcher as the documents.
     pub index: Arc<ProjectIndex>,
+    /// Run configurations and their processes (M4): the same engine the Tauri
+    /// host's Run tool window drives. Output streams through a plain callback;
+    /// exits arrive as `IdeEvent::RunExited` on the sink.
+    pub run: ProcessManager,
     /// The app-owned tokio runtime's handle: LSP feature requests
     /// (`completion`, `goto`, …) must spawn onto it, and it drives the
     /// servers' IO. Kept alongside the host so callers share one runtime.
@@ -127,7 +132,7 @@ impl Host {
             )?
         };
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        Ok(Self { root, name, documents, sink, lsp, index, runtime, _watcher: watcher })
+        Ok(Self { root, name, documents, sink, lsp, index, run: ProcessManager::new(), runtime, _watcher: watcher })
     }
 
     /// Lists `dir` (VFS entries with ignore flags applied).
@@ -180,6 +185,39 @@ impl Host {
         self.runtime.spawn(async move {
             let _ = tokio::time::timeout(Duration::from_secs(2), lsp.shutdown_all()).await;
         });
+    }
+
+    // -- run (M4) -----------------------------------------------------------
+
+    /// The run configurations to offer: user-defined ones (`.openidea/
+    /// run.toml`) first, then the detector's (package.json scripts, Cargo
+    /// targets, …) that user config with the same id does not shadow.
+    pub fn run_configs(&self) -> IdeResult<Vec<RunConfig>> {
+        let mut configs = ide_run::load_user_configs(&self.root)?;
+        for detected in ide_run::detect(&self.root) {
+            if !configs.iter().any(|c| c.id == detected.id) {
+                configs.push(detected);
+            }
+        }
+        Ok(configs)
+    }
+
+    /// Starts `config`: spawning happens on this (background) thread —
+    /// `ProcessManager::start` forks the process and spawns its own reader /
+    /// waiter threads; output streams through `on_output`, and the exit lands
+    /// on `sink` as `IdeEvent::RunExited`.
+    pub fn start_run(
+        &self,
+        config: &RunConfig,
+        on_output: Box<dyn Fn(OutputChunk) + Send + Sync>,
+    ) -> IdeResult<RunInfo> {
+        self.run.start(&self.root, config, &StartOptions::default(), self.sink.clone(), on_output)
+    }
+
+    /// Graceful stop (SIGINT to the process group, SIGKILL after a grace
+    /// period) — ide-run's own cancellation path.
+    pub fn stop_run(&self, id: RunId) -> IdeResult<()> {
+        self.run.stop(id)
     }
 }
 

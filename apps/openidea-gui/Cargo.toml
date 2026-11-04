@@ -48,6 +48,9 @@ ide-lsp = { path = "../../crates/ide-lsp" }
 # M3: the project index — Go to File / Search Everywhere's fuzzy file and
 # symbol engine (the same one the Tauri host queries).
 ide-index = { path = "../../crates/ide-index" }
+# M4: run configurations and process management (the same engine the Tauri
+# host's Run tool window drives).
+ide-run = { path = "../../crates/ide-run" }
 # The grammar Language values come from ide-language; this must resolve to the
 # same tree-sitter the main workspace pins (0.25.10) so the types unify.
 tree-sitter = "=0.25.10"
