@@ -22,10 +22,10 @@ use std::sync::Arc;
 use gpui::{
     App, Bounds, Element, ElementId, Entity, FocusHandle, Focusable, GlobalElementId, InputHandler, InspectorElementId,
     InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, Render, ScrollWheelEvent, ShapedLine, Styled, TextAlign, TextRun, UTF16Selection,
-    UnderlineStyle, Window, fill, point, px, relative, rgba, size,
+    ParentElement, Pixels, Point, Render, ScrollWheelEvent, ShapedLine, SharedString, Styled, TextAlign, TextRun,
+    UTF16Selection, UnderlineStyle, Window, fill, point, px, relative, rgba, size,
 };
-use ide_core::{ChangeSet, DocId, TextChange};
+use ide_core::{ChangeSet, Diagnostic, DocId, Severity, TextChange};
 use ide_workspace::DocumentInfo;
 use tree_sitter::Tree;
 
@@ -316,6 +316,16 @@ fn char_class(ch: char) -> u8 {
     }
 }
 
+/// The diagnostic the pointer rests on: the pane parks it for the hover
+/// tooltip (plain text in M3) until the pointer moves off it.
+#[derive(Clone, PartialEq, Eq)]
+struct HoverDiag {
+    message: String,
+    severity: Severity,
+    /// The buffer line the pointer was on (the tooltip anchors under it).
+    line: u32,
+}
+
 /// Element geometry the IME handler needs between frames, in window
 /// coordinates: where the gutter and the text area start, how tall a line is,
 /// which line is scrolled to the top and the viewport height.
@@ -412,6 +422,10 @@ pub struct EditorPane {
     // Folding (phase 5): the syntax candidates plus the user's folded subset.
     fold_candidates: Vec<(u32, u32)>,
     folds: Vec<Fold>,
+    // Diagnostics (M3 phase 3): the merged list for this file, sorted by
+    // position, and what the pointer rests on.
+    diagnostics: Vec<Diagnostic>,
+    hover: Cell<Option<HoverDiag>>,
     /// F12 perf overlay counters (phase 7).
     hud: Hud,
     /// When the pane was created; the first paint logs the open latency.
@@ -453,6 +467,8 @@ impl EditorPane {
             last_edit: None,
             fold_candidates: Vec::new(),
             folds: Vec::new(),
+            diagnostics: Vec::new(),
+            hover: Cell::new(None),
             hud: Hud::default(),
             created_at: std::time::Instant::now(),
             first_paint_done: Cell::new(false),
@@ -627,6 +643,7 @@ impl EditorPane {
         }
         self.last_edit =
             Some((std::time::Instant::now(), matches!(cause, Cause::Typing | Cause::Delete | Cause::ImeCommit)));
+        self.hover.set(None);
         self.after_edits(&byte_edits, cx);
         self.clamp_scroll_to_primary();
         cx.notify();
@@ -860,6 +877,29 @@ impl EditorPane {
         }
     }
 
+    /// Replaces the pane's diagnostics (the workbench merges the producers).
+    pub fn set_diagnostics(&mut self, merged: Vec<Diagnostic>, cx: &mut gpui::Context<Self>) {
+        self.diagnostics = merged;
+        self.hover.set(None);
+        cx.notify();
+    }
+
+    /// The diagnostics of one buffer line, by their start line (the list is
+    /// position-sorted). The gutter marks these; squiggles also show what
+    /// merely crosses the line.
+    fn line_diagnostics(&self, line: u32) -> &[Diagnostic] {
+        let start = self.diagnostics.partition_point(|d| d.range.start.line < line);
+        let end = start + self.diagnostics[start..].partition_point(|d| d.range.start.line == line);
+        &self.diagnostics[start..end]
+    }
+
+    /// UTF-16 buffer range of a diagnostic, clamped into the document.
+    fn diag_range(&self, d: &Diagnostic) -> Range<usize> {
+        let start = self.buf.line_start(d.range.start.line).min(self.buf.utf16_len()) + d.range.start.col as usize;
+        let end = self.buf.line_start(d.range.end.line).min(self.buf.utf16_len()) + d.range.end.col as usize;
+        start..end.max(start)
+    }
+
     // -- IME (composition happens at the primary cursor; others freeze) ----
 
     /// `setMarkedText:selectedRange:replacementRange:` at the primary cursor.
@@ -985,14 +1025,15 @@ impl EditorPane {
         span.start + col
     }
 
-    /// The display row a window y falls on.
+    /// The display row a window y falls on. The viewport-relative row clamps
+    /// into the visible band *before* the scroll offset joins: clamping the
+    /// final row instead would pull scrolled views' lower rows onto one line.
     fn row_at(&self, geometry: &Geometry, y: Pixels) -> u32 {
         let count = self.display_count();
         let visible = ((geometry.height - px(theme::TEXT_INSET) * 2.0) / geometry.line_height) as i64;
-        let row = (((y - geometry.origin.y) / geometry.line_height) as i64 + self.scroll.get() as i64)
-            .clamp(0, visible.max(1) - 1)
-            .clamp(0, count as i64 - 1);
-        row.max(0) as u32
+        let row = (((y - geometry.origin.y) / geometry.line_height) as i64).clamp(0, visible.max(1) - 1)
+            + self.scroll.get() as i64;
+        (row.clamp(0, count.max(1) as i64 - 1)).max(0) as u32
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut gpui::Context<Self>) {
@@ -1061,7 +1102,27 @@ impl EditorPane {
                 self.selections = self.columnar_selections(window, &geometry, from, ev.position);
                 cx.notify();
             }
-            _ => {}
+            _ => self.update_hover(ev.position, window, cx),
+        }
+    }
+
+    /// Parks (or clears) the diagnostic under the pointer for the tooltip.
+    /// Only a change notifies — moves within one diagnostic re-render nothing.
+    fn update_hover(&mut self, position: Point<Pixels>, window: &Window, cx: &mut gpui::Context<Self>) {
+        let next = self.geometry.get().and_then(|geometry| {
+            let offset = self.offset_at(window, &geometry, position);
+            let line = self.buf.line_of(offset);
+            self.diagnostics
+                .iter()
+                .find(|d| {
+                    let range = self.diag_range(d);
+                    // An empty range (bare caret position) still shows on hover.
+                    (range.start..range.end.max(range.start + 1)).contains(&offset)
+                })
+                .map(|d| HoverDiag { message: d.message.clone(), severity: d.severity, line })
+        });
+        if self.hover.replace(next.clone()) != next {
+            cx.notify();
         }
     }
 
@@ -1382,8 +1443,40 @@ impl Render for EditorPane {
                     this.command(Command::Move(Motion::DocEnd, true), cx)
                 }),
             )
+            // Hover tooltip: a plain-text bubble under the hovered diagnostic.
+            .children(self.render_hover_tooltip(cx))
             // Navigation/refactoring handlers arrive in later M3 phases.
             .child(EditorElement { view: cx.entity() })
+    }
+}
+
+impl EditorPane {
+    /// The hover tooltip for the diagnostic under the pointer, positioned
+    /// under its line from the last frame's geometry.
+    fn render_hover_tooltip(&self, _cx: &mut gpui::Context<Self>) -> Option<gpui::AnyElement> {
+        let hover = self.hover.replace(None);
+        self.hover.set(hover.clone());
+        let hover = hover?;
+        let geometry = self.geometry.get()?;
+        let row = self.display_of_line(hover.line);
+        let y = geometry.origin.y + geometry.line_height * ((row as f32 - geometry.scroll) + 1.0) + px(4.0);
+        let x = geometry.origin.x + px(24.0);
+        Some(
+            gpui::div()
+                .absolute()
+                .left(x)
+                .top(y)
+                .max_w(px(480.0))
+                .border_1()
+                .border_color(theme::severity_color(hover.severity))
+                .bg(theme::raised_bg())
+                .px_2()
+                .py_1()
+                .text_size(px(12.))
+                .text_color(theme::fg())
+                .child(SharedString::from(hover.message))
+                .into_any_element(),
+        )
     }
 }
 
@@ -1407,6 +1500,8 @@ struct PrepaintState {
     selection_rects: Vec<Bounds<Pixels>>,
     /// Gutter chevron rows: (display row, already folded).
     chevrons: Vec<(u32, bool)>,
+    /// Gutter diagnostic marks: (display row, strongest severity on the line).
+    diag_marks: Vec<(u32, Severity)>,
     /// The primary cursor's buffer line, for the brighter gutter number.
     caret_line: u32,
     gutter_w: Pixels,
@@ -1442,6 +1537,7 @@ fn line_runs(
     marked: Option<Range<usize>>,
     line_start_byte: usize,
     spans: &[(Range<usize>, Kind)],
+    diags: &[(Range<usize>, Severity)],
     fg: gpui::Hsla,
 ) -> Vec<TextRun> {
     let len = line.len();
@@ -1482,8 +1578,21 @@ fn line_runs(
         return runs;
     }
 
-    // Highlight runs: slice the whole-document spans onto this line's bytes.
-    let mut runs: Vec<TextRun> = Vec::new();
+    // Per-byte underline severity: the strongest diagnostic covering the byte.
+    let mut underline = vec![None::<Severity>; len];
+    for (range, severity) in diags {
+        let start = byte_at_utf16(line, range.start);
+        let end = byte_at_utf16(line, range.end).max(start).min(len);
+        for slot in underline[start..end].iter_mut() {
+            if severity_rank(*severity) > slot.map(severity_rank).unwrap_or(0) {
+                *slot = Some(*severity);
+            }
+        }
+    }
+
+    // Highlight runs (syntax spans sliced onto this line's bytes), split at
+    // every underline change so a squiggle can ride the syntax segments.
+    let mut segments: Vec<(usize, usize, gpui::Hsla)> = Vec::new();
     let mut cursor = 0usize;
     let idx = spans.partition_point(|s| s.0.end <= line_start_byte);
     for (range, kind) in &spans[idx..] {
@@ -1493,20 +1602,52 @@ fn line_runs(
         let start = range.start.saturating_sub(line_start_byte).min(len);
         let end = range.end.saturating_sub(line_start_byte).min(len);
         if start > cursor {
-            runs.push(text_run(cursor..start, fg));
+            segments.push((cursor, start, fg));
         }
         if end > start {
-            runs.push(text_run(start..end, theme::syntax_color(*kind)));
+            segments.push((start, end, theme::syntax_color(*kind)));
             cursor = end;
         }
     }
     if cursor < len {
-        runs.push(text_run(cursor..len, fg));
+        segments.push((cursor, len, fg));
+    }
+    let mut runs: Vec<TextRun> = Vec::new();
+    for (start, end, color) in segments {
+        // Split where the underline severity changes; the segments already
+        // ascend without gaps, so runs stay contiguous.
+        let mut at = start;
+        while at < end {
+            let severity = underline[at];
+            let mut stop = at + 1;
+            while stop < end && underline[stop] == severity {
+                stop += 1;
+            }
+            let mut run = text_run(at..stop, color);
+            if let Some(severity) = severity {
+                run.underline = Some(UnderlineStyle {
+                    thickness: px(1.0),
+                    color: Some(theme::severity_color(severity)),
+                    wavy: true,
+                });
+            }
+            runs.push(run);
+            at = stop;
+        }
     }
     if runs.is_empty() {
         runs.push(plain_run(len, fg));
     }
     runs
+}
+
+/// Error squiggles win over warnings, warnings over info hints.
+fn severity_rank(severity: Severity) -> u8 {
+    match severity {
+        Severity::Error => 3,
+        Severity::Warning => 2,
+        Severity::Info | Severity::Hint => 1,
+    }
 }
 
 /// Width of `text` shaped as one plain run — the prefix-width primitive every
@@ -1624,6 +1765,7 @@ impl Element for EditorElement {
         let muted = theme::fg_muted();
         let mut rows = Vec::with_capacity((last - first) as usize);
         let mut chevrons = Vec::new();
+        let mut diag_marks = Vec::new();
         for display in first..last {
             let (line, placeholder) = pane.resolve_display(display);
             let shaped = match placeholder {
@@ -1636,7 +1778,23 @@ impl Element for EditorElement {
                     let span = pane.buf.line_span(line);
                     let content = pane.buf.slice_utf16(span.clone());
                     let line_start_byte = pane.buf.doc.rope().line_to_byte(line as usize);
-                    let runs = line_runs(&content, span, marked.clone(), line_start_byte, &pane.spans, fg);
+                    // The line's diagnostics as line-local UTF-16 ranges. What
+                    // starts here also marks the gutter.
+                    let mut line_diags = Vec::new();
+                    let mut mark: Option<Severity> = None;
+                    for d in pane.line_diagnostics(line) {
+                        let range = pane.diag_range(d);
+                        let local = range.start.clamp(span.start, span.end) - span.start
+                            ..range.end.clamp(span.start, span.end) - span.start;
+                        line_diags.push((local, d.severity));
+                        if d.range.start.line == line && severity_rank(d.severity) > mark.map_or(0, severity_rank) {
+                            mark = Some(d.severity);
+                        }
+                    }
+                    if let Some(severity) = mark {
+                        diag_marks.push((display, severity));
+                    }
+                    let runs = line_runs(&content, span, marked.clone(), line_start_byte, &pane.spans, &line_diags, fg);
                     window.text_system().shape_line(content.into(), font_size, &runs, None)
                 }
             };
@@ -1719,7 +1877,16 @@ impl Element for EditorElement {
             height: bounds.size.height,
         }));
 
-        PrepaintState { rows, carets, selection_rects, chevrons, caret_line: caret_buffer_line, gutter_w, numbers_w }
+        PrepaintState {
+            rows,
+            carets,
+            selection_rects,
+            chevrons,
+            diag_marks,
+            caret_line: caret_buffer_line,
+            gutter_w,
+            numbers_w,
+        }
     }
 
     fn paint(
@@ -1762,6 +1929,16 @@ impl Element for EditorElement {
                 let shaped = window.text_system().shape_line(glyph.into(), font_size, &[run], None);
                 let y = origin.y + line_height * (*display as f32 - geometry.scroll);
                 let _ = shaped.paint(point(gutter_x + px(2.0), y), line_height, TextAlign::Left, None, window, cx);
+            }
+            // Diagnostic marks: a severity-colored bar at the gutter's right
+            // edge, before the separator.
+            for (display, severity) in &prepaint.diag_marks {
+                let y = origin.y + line_height * (*display as f32 - geometry.scroll);
+                let bar = Bounds::new(
+                    point(gutter_x + prepaint.gutter_w - px(theme::GUTTER_PAD_R) + px(3.0), y + px(4.0)),
+                    size(px(3.0), line_height - px(8.0)),
+                );
+                window.paint_quad(fill(bar, theme::severity_color_rgba(*severity)));
             }
             let separator = Bounds::new(
                 point(gutter_x + prepaint.gutter_w - px(1.0), bounds.origin.y),

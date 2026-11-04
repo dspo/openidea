@@ -103,3 +103,17 @@ pub fn px_font_size() -> Pixels {
 pub fn px_line_height() -> Pixels {
     px(FONT_SIZE * LINE_HEIGHT)
 }
+
+/// Squiggle / gutter / tooltip color for a diagnostic severity.
+pub fn severity_color_rgba(severity: ide_core::Severity) -> gpui::Rgba {
+    let c = match severity {
+        ide_core::Severity::Error => ERROR,
+        ide_core::Severity::Warning => WARNING,
+        ide_core::Severity::Info | ide_core::Severity::Hint => ACCENT,
+    };
+    rgba((c << 8) | 0xff)
+}
+
+pub fn severity_color(severity: ide_core::Severity) -> gpui::Hsla {
+    severity_color_rgba(severity).into()
+}
