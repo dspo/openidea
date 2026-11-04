@@ -32,17 +32,15 @@ use crate::{strings, theme};
 actions!(workbench, [OpenFile, Save, CloseTab, Quit]);
 
 /// One open file: the editor pane, its document in the backend, and the two
-/// flags the chrome shows. `dirty` mirrors the backend (`DocDirty`) and the
-/// pane's own edit counter; `stale` means the file changed on disk while the
-/// buffer had unsaved edits.
+/// flags the chrome shows. The pane pushes its edits to the backend live, so
+/// `dirty` simply mirrors the backend's `DocDirty` events; `stale` means the
+/// file changed on disk while the buffer had unsaved edits.
 struct Tab {
     path: PathBuf,
     doc: DocId,
     pane: Entity<EditorPane>,
     dirty: bool,
     stale: bool,
-    /// The pane edit counter as of the last time this tab looked at it.
-    last_seen_edits: u32,
 }
 
 /// What the status bar shows on the right, until the next message.
@@ -104,17 +102,18 @@ impl Workbench {
         cx.notify();
     }
 
-    /// ⌘S: pushes the buffer text into the document model and writes it to
-    /// disk through the VFS.
+    /// ⌘S: writes the document to disk through the VFS. The pane's edits
+    /// already reached the backend document model (every keystroke goes
+    /// through `Documents::edit`), so there is nothing to push.
     fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.active else { return };
         let Some(host) = self.host.clone() else { return };
-        let (doc, text, name) = {
+        let (doc, name) = {
             let tab = &self.tabs[index];
-            (tab.doc, tab.pane.read(cx).text(), file_name(&tab.path))
+            (tab.doc, file_name(&tab.path))
         };
         let tab = &mut self.tabs[index];
-        match host.push_text(doc, &text).and_then(|_| host.save_document(doc)) {
+        match host.save_document(doc) {
             Ok(()) => {
                 tab.dirty = false;
                 tab.stale = false;
@@ -189,37 +188,13 @@ impl Workbench {
                 return;
             }
         };
-        let pane = cx.new(|cx| EditorPane::new(info.text.clone(), cx));
+        let doc_id = info.id;
+        let pane = cx.new(|cx| EditorPane::new(host, info, cx));
         let path = path.to_path_buf();
-        self.tabs.push(Tab {
-            path: path.clone(),
-            doc: info.id,
-            pane: pane.clone(),
-            dirty: false,
-            stale: false,
-            last_seen_edits: pane.read(cx).edit_count(),
-        });
+        self.tabs.push(Tab { path: path.clone(), doc: doc_id, pane: pane.clone(), dirty: false, stale: false });
         self.active = Some(self.tabs.len() - 1);
         self.tree.select(path);
-        self.observe_pane_edits(&pane, cx);
         cx.notify();
-    }
-
-    /// Any pane mutation beyond the last seen count marks its tab dirty
-    /// (caret moves notify too, without touching the counter).
-    fn observe_pane_edits(&self, pane: &Entity<EditorPane>, cx: &mut Context<Self>) {
-        cx.observe(pane, |this, pane, cx| {
-            let edits = pane.read(cx).edit_count();
-            let entity = pane.entity_id();
-            if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.pane.entity_id() == entity)
-                && tab.last_seen_edits != edits
-            {
-                tab.last_seen_edits = edits;
-                tab.dirty = true;
-                cx.notify();
-            }
-        })
-        .detach();
     }
 
     // -- bus --------------------------------------------------------------
@@ -245,21 +220,13 @@ impl Workbench {
                 }
                 cx.notify();
             }
-            BusMessage::Ide(IdeEvent::DocPatched { doc, .. }) => {
-                // A clean buffer was reloaded from disk under us (the save
-                // path's own echo carries the same text and is skipped).
-                let reloaded = self.tabs.iter().position(|tab| tab.doc == doc);
-                let fresh = self.host.as_ref().and_then(|host| host.text_of(doc).ok());
-                if let (Some(index), Some(fresh)) = (reloaded, fresh) {
-                    let tab = &mut self.tabs[index];
-                    if tab.pane.read(cx).text() != fresh {
-                        tab.pane.update(cx, |pane, cx| pane.set_text(fresh, cx));
-                        tab.dirty = false;
-                        // `set_text` restarts the pane's edit counter; the
-                        // baseline must follow or the observer would read the
-                        // reload itself as a user edit.
-                        tab.last_seen_edits = tab.pane.read(cx).edit_count();
-                    }
+            BusMessage::Ide(IdeEvent::DocPatched { doc, base_version, changes, .. }) => {
+                // A backend-originated patch reached an open tab (external
+                // reload of a clean buffer). The pane reconciles by version:
+                // exact base match applies incrementally, anything else
+                // resyncs from the backend snapshot.
+                if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.doc == doc) {
+                    tab.pane.update(cx, |pane, cx| pane.backend_patched(base_version, changes, cx));
                 }
                 cx.notify();
             }

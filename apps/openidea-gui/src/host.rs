@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ide_core::{DocId, IdeError, IdeResult, LanguageId, SharedSink};
+use ide_core::{ChangeSet, DocId, IdeError, IdeResult, LanguageId, SharedSink};
 use ide_vfs::{FileEntry, Watcher};
 use ide_workspace::{DocumentInfo, Documents};
 
@@ -86,10 +86,18 @@ impl Host {
         self.documents.open(path)
     }
 
-    /// Pushes the editor buffer's full text into the document model (dirty
-    /// flag follows; `DocDirty` fires through the sink).
-    pub fn push_text(&self, doc: DocId, text: &str) -> IdeResult<u32> {
-        self.documents.replace_all(doc, text)
+    /// Applies a UI-originated change set (UTF-16 offsets of the pre-edit
+    /// text) to the document model. The dirty flag follows (`DocDirty` fires
+    /// through the sink); returns the new version. M2's editor mirrors the
+    /// document version-for-version, so edits are incremental — no full-text
+    /// pushes.
+    pub fn edit(&self, doc: DocId, base_version: u32, changes: ChangeSet) -> IdeResult<u32> {
+        self.documents.edit(doc, base_version, changes)
+    }
+
+    /// Full snapshot (text, version, flags) for out-of-sync recovery.
+    pub fn snapshot(&self, doc: DocId) -> IdeResult<DocumentInfo> {
+        self.documents.snapshot(doc)
     }
 
     /// Writes the document to disk through the VFS (original encoding, BOM
@@ -101,11 +109,6 @@ impl Host {
     /// Detaches the document: external changes stop reaching the UI tab.
     pub fn close_document(&self, doc: DocId) {
         self.documents.close(doc)
-    }
-
-    /// Current backend text of an open document (the truth after a `DocPatched`).
-    pub fn text_of(&self, doc: DocId) -> IdeResult<String> {
-        Ok(self.documents.text_snapshot(doc)?.text)
     }
 }
 

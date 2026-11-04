@@ -36,6 +36,7 @@ gpui-component = { version = "=0.8.0" }
 gpui-kit-assets = { version = "=0.8.0" }
 # The openidea backend, in-process: the same crates the Tauri host drives.
 ide-core = { path = "../../crates/ide-core" }
+ide-text = { path = "../../crates/ide-text" }
 ide-vfs = { path = "../../crates/ide-vfs" }
 ide-workspace = { path = "../../crates/ide-workspace" }
 # Windows-friendly path canonicalization, the repo-wide convention.
