@@ -62,6 +62,9 @@ pub struct Host {
     pub sink: SharedSink,
     /// Language servers (M3): started per document language, observed below.
     pub lsp: Arc<LspManager>,
+    /// The `languages/*.toml` registry (M5): the editor reads each document
+    /// language's `indent` policy from here (editorconfig still wins).
+    pub languages: Arc<LanguageRegistry>,
     /// The project index (M3): fuzzy file / symbol search behind Go to File
     /// and Search Everywhere, kept fresh by the same watcher as the documents.
     pub index: Arc<ProjectIndex>,
@@ -145,6 +148,7 @@ impl Host {
             documents,
             sink,
             lsp,
+            languages,
             index,
             run: ProcessManager::new(),
             repo,

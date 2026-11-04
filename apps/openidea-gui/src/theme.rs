@@ -28,6 +28,10 @@ pub const TEXT_INSET: f32 = 16.0;
 /// Gutter paddings: element edge to line numbers, numbers to the text area.
 pub const GUTTER_PAD_L: f32 = 12.0;
 pub const GUTTER_PAD_R: f32 = 14.0;
+/// Editor scrollbars (M5): track + thumb thickness and colors, always visible.
+pub const SCROLLBAR_SIZE: f32 = 8.0;
+const SCROLLBAR_TRACK: u32 = 0x26282b;
+const SCROLLBAR_THUMB: u32 = 0x3f4349;
 
 // Syntax palette: dark, low-contrast greys, one cool accent (same family as
 // the chrome colors above); hardcoded like everything else in M2.
@@ -92,6 +96,14 @@ pub fn accent() -> gpui::Hsla {
 }
 pub fn border() -> gpui::Hsla {
     rgba((BORDER << 8) | 0xff).into()
+}
+
+pub fn scrollbar_track() -> gpui::Hsla {
+    rgba((SCROLLBAR_TRACK << 8) | 0xff).into()
+}
+
+pub fn scrollbar_thumb() -> gpui::Hsla {
+    rgba((SCROLLBAR_THUMB << 8) | 0xff).into()
 }
 pub fn warning() -> gpui::Hsla {
     rgba((WARNING << 8) | 0xff).into()

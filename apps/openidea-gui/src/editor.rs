@@ -47,6 +47,90 @@ fn rgba_of(c: u32) -> gpui::Rgba {
     rgba((c << 8) | 0xff)
 }
 
+/// The document's indent policy: what Tab inserts and Enter keeps. Resolved
+/// once at pane creation — `.editorconfig` wins over the language's
+/// `languages/*.toml` `indent`, which wins over the default (4 spaces).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Indent {
+    tab_size: u32,
+    insert_spaces: bool,
+}
+
+impl Default for Indent {
+    fn default() -> Self {
+        Self { tab_size: 4, insert_spaces: true }
+    }
+}
+
+impl Indent {
+    /// The one-unit string Tab inserts (`"\t"` or spaces).
+    fn unit(&self) -> String {
+        if self.insert_spaces { " ".repeat(self.tab_size.max(1) as usize) } else { "\t".to_owned() }
+    }
+
+    /// Removes one unit from leading whitespace `s` (Shift-Tab's step).
+    fn dedent(&self, s: &str) -> String {
+        if !self.insert_spaces {
+            return s.strip_prefix('\t').map_or_else(|| s.to_owned(), str::to_owned);
+        }
+        let spaces = s.len() - s.trim_start_matches(' ').len();
+        let drop = spaces.min(self.tab_size.max(1) as usize);
+        s[drop..].to_owned()
+    }
+}
+
+/// The pane's indent policy for a document: editorconfig's
+/// style/size/width over the language's `indent`, over the default.
+fn indent_for(info: &DocumentInfo, languages: &ide_language::LanguageRegistry) -> Indent {
+    let mut indent = Indent::default();
+    if let Some(config) = languages.get(&info.language)
+        && let Some(configured) = config.indent
+    {
+        indent = Indent { tab_size: configured.tab_size, insert_spaces: configured.insert_spaces };
+    }
+    if let Some(props) = &info.editorconfig {
+        if let Some(style) = props.indent_style {
+            indent.insert_spaces = style == ide_workspace::editorconfig::IndentStyle::Space;
+        }
+        if let Some(size) = props.indent_size {
+            indent.tab_size = size.max(1);
+        }
+        if let Some(width) = props.tab_width {
+            indent.tab_size = width.max(1);
+        }
+    }
+    indent
+}
+
+/// The indentation Enter gives the new line: the current line's own leading
+/// whitespace, plus one unit when its code (a trailing line comment stripped)
+/// ends with `{` and the caret sat at end of line, minus one unit when the
+/// text after the caret starts with `}` (the closing brace keeps its own
+/// line's indent).
+fn enter_indent(
+    current_line: &str,
+    caret_at_line_end: bool,
+    rest: &str,
+    line_comment: Option<&str>,
+    indent: &Indent,
+) -> String {
+    let leading = current_line.len() - current_line.trim_start_matches([' ', '\t']).len();
+    let mut out = current_line[..leading].to_owned();
+    let mut code = current_line.trim_end();
+    if let Some(comment) = line_comment
+        && let Some((before, _)) = code.split_once(comment)
+    {
+        code = before.trim_end();
+    }
+    if caret_at_line_end && code.ends_with('{') {
+        out.push_str(&indent.unit());
+    }
+    if rest.trim_start().starts_with('}') {
+        out = indent.dedent(&out);
+    }
+    out
+}
+
 fn plain_run(len: usize, color: gpui::Hsla) -> TextRun {
     TextRun { len, font: theme::font(), color, background_color: None, underline: None, strikethrough: None }
 }
@@ -125,11 +209,15 @@ impl Selection {
     }
 }
 
-/// What a press started: a normal anchor drag, or a ⌥ column selection.
+/// What a press started: a normal anchor drag, a ⌥ column selection, or a
+/// scrollbar thumb drag (`grab` is the distance from the drag start to the
+/// thumb's leading edge, so the thumb does not jump to the pointer).
 #[derive(Clone, Copy)]
 enum Drag {
     Normal { anchor: usize },
     Columnar { from: Point<Pixels> },
+    ScrollV { grab: Pixels },
+    ScrollH { grab: Pixels },
 }
 
 /// Motions the keymap maps onto. Word/line variants are chosen by modifier.
@@ -153,6 +241,8 @@ enum Command {
     Move(Motion, bool),
     Delete { forward: bool, word: bool },
     Newline,
+    Tab,
+    Outdent,
     Paste,
     Cancel,
     ToggleHud,
@@ -171,6 +261,9 @@ enum Cause {
     /// A clipboard paste (⌘V): its own undo step, cursors land after the
     /// inserted text like typing.
     Paste,
+    /// Tab/Shift-Tab line indentation: its own undo step, selections kept
+    /// (indentation happens at line starts, the selection rides along).
+    Indent,
     /// Undo/redo/IME marked-text application: no undo entry, selections are
     /// managed by the caller.
     Mechanical,
@@ -405,9 +498,34 @@ impl CompletionPopup {
     }
 }
 
+/// One scrollbar's frame geometry, published between frames so the mouse
+/// handlers can hit-test and drag the thumb.
+#[derive(Clone, Copy)]
+struct Scrollbar {
+    track: Bounds<Pixels>,
+    thumb: Bounds<Pixels>,
+}
+
+impl Scrollbar {
+    fn hit_thumb(&self, p: Point<Pixels>) -> bool {
+        p.x >= self.thumb.origin.x
+            && p.x <= self.thumb.origin.x + self.thumb.size.width
+            && p.y >= self.thumb.origin.y
+            && p.y <= self.thumb.origin.y + self.thumb.size.height
+    }
+
+    fn hit_track(&self, p: Point<Pixels>) -> bool {
+        p.x >= self.track.origin.x
+            && p.x <= self.track.origin.x + self.track.size.width
+            && p.y >= self.track.origin.y
+            && p.y <= self.track.origin.y + self.track.size.height
+    }
+}
+
 /// Element geometry the IME handler needs between frames, in window
 /// coordinates: where the gutter and the text area start, how tall a line is,
-/// which line is scrolled to the top and the viewport height.
+/// which line is scrolled to the top, the horizontal scroll offset, the text
+/// area's size and the two scrollbars.
 #[derive(Clone, Copy)]
 struct Geometry {
     /// Left edge of the line-number gutter (the element's left inset).
@@ -418,7 +536,13 @@ struct Geometry {
     origin: Point<Pixels>,
     line_height: Pixels,
     scroll: f32,
+    /// Horizontal scroll offset in px (rows paint at `origin.x - scroll_x`).
+    scroll_x: f32,
     height: Pixels,
+    /// Width of the text area (element width minus the gutter).
+    width: Pixels,
+    vscroll: Scrollbar,
+    hscroll: Scrollbar,
 }
 
 /// The F12 perf HUD's counters. Cells, so the element's prepaint/paint phases
@@ -474,6 +598,16 @@ pub struct EditorPane {
     geometry: Cell<Option<Geometry>>,
     /// Top visible line, in lines (clamped on use).
     scroll: Cell<f32>,
+    /// Horizontal scroll offset in px (clamped on use; rows paint shifted).
+    scroll_x: Cell<f32>,
+    /// The widest line width observed so far (shaped rows report their width;
+    /// exact for anything the viewport has shown, which is what the
+    /// horizontal clamp and scrollbar need).
+    max_line_w: Cell<f32>,
+    /// The document's indent policy (Tab / Enter / Shift-Tab).
+    indent: Indent,
+    /// The language's line comment (Enter's `{`-detection strips it).
+    line_comment: Option<String>,
     focused_once: Cell<bool>,
     /// Syntax highlighting (phase 3): the query, the incrementally parsed
     /// tree, and the whole-document spans the paint path slices per line.
@@ -533,6 +667,8 @@ impl Focusable for EditorPane {
 impl EditorPane {
     pub fn new(host: Arc<Host>, bus: Bus, info: DocumentInfo, cx: &mut gpui::Context<Self>) -> Self {
         let language = info.language.clone();
+        let indent = indent_for(&info, &host.languages);
+        let line_comment = host.languages.get(&language).and_then(|config| config.line_comment);
         let mut pane = Self {
             host,
             doc_id: info.id,
@@ -541,6 +677,10 @@ impl EditorPane {
             focus: cx.focus_handle(),
             geometry: Cell::new(None),
             scroll: Cell::new(0.0),
+            scroll_x: Cell::new(0.0),
+            max_line_w: Cell::new(0.0),
+            indent,
+            line_comment,
             focused_once: Cell::new(false),
             highlighter: None,
             language,
@@ -728,9 +868,10 @@ impl EditorPane {
         let selections_before = std::mem::take(&mut self.selections);
         let selections_after = match cause {
             Cause::Typing | Cause::Delete | Cause::Paste => Selection::after_inserts(&changes),
-            // Mechanical batches keep the caller's cursors; they are restored
-            // (undo/redo) or clamped (IME, patches) afterwards.
-            Cause::ImeCommit | Cause::Mechanical => selections_before.clone(),
+            // Mechanical/indent batches keep the caller's cursors: they are
+            // restored (undo/redo), ride along (indentation at line starts)
+            // or clamped (IME, patches) afterwards.
+            Cause::ImeCommit | Cause::Mechanical | Cause::Indent => selections_before.clone(),
         };
         self.selections = normalize_selections(
             selections_after.into_iter().map(|s| clamp_selection(s, self.buf.utf16_len())).collect(),
@@ -819,6 +960,78 @@ impl EditorPane {
             .map(|(start, end)| TextChange { from: start as u32, to: end as u32, insert: text.to_owned() })
             .collect();
         self.apply_edits(changes, Cause::Typing, cx);
+    }
+
+    /// Enter with auto-indent: the new line keeps the current line's leading
+    /// whitespace, plus one indent unit when the caret sat at end of a line
+    /// whose text ends with `{`, minus one when the text after the caret
+    /// starts with `}`. One change per cursor, one typing batch.
+    fn newline(&mut self, cx: &mut gpui::Context<Self>) {
+        let mut changes: Vec<TextChange> = Vec::new();
+        for selection in &self.selections {
+            let (start, end) = selection.normalized();
+            let line = self.buf.line_of(start);
+            let span = self.buf.line_span(line);
+            let text = self.buf.slice_utf16(span.clone());
+            let at_eol = end >= span.end;
+            let rest = self.buf.slice_utf16(end..span.end);
+            let indent = enter_indent(&text, at_eol, &rest, self.line_comment.as_deref(), &self.indent);
+            // The cursor's own line (multi-cursor Enter on one line: each
+            // cursor splits at its own offset).
+            changes.push(TextChange { from: start as u32, to: end as u32, insert: format!("\n{indent}") });
+        }
+        self.apply_edits(changes, Cause::Typing, cx);
+    }
+
+    /// Tab: a non-empty selection indents its lines; bare carets insert one
+    /// indent unit at each cursor. (A snippet trigger expands instead —
+    /// phase 5 hooks in here.)
+    fn tab(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.selections.iter().any(|s| !s.is_empty()) {
+            self.indent_lines(1, cx);
+        } else {
+            let unit = self.indent.unit();
+            self.insert_text(&unit, cx);
+        }
+    }
+
+    /// Indents (or with `-1` outdents) every buffer line a selection touches:
+    /// one change per line in a single batch; selections ride along clamped.
+    /// Its own undo step ([`Cause::Indent`]).
+    fn indent_lines(&mut self, delta: i8, cx: &mut gpui::Context<Self>) {
+        let unit = self.indent.unit();
+        let mut changes: Vec<TextChange> = Vec::new();
+        for selection in &self.selections {
+            let (start, end) = selection.normalized();
+            let first = self.buf.line_of(start);
+            // A caret at column 0 does not count the line below the caret; a
+            // selection's tail line is touched only when text is selected on it.
+            let last = if end > start { self.buf.line_of(end - 1) } else { first };
+            for line in first..=last {
+                let from = self.buf.line_start(line) as u32;
+                match delta {
+                    1 => changes.push(TextChange { from, to: from, insert: unit.clone() }),
+                    _ => {
+                        let span = self.buf.line_span(line);
+                        let text = self.buf.slice_utf16(span.clone());
+                        let dedented = self.indent.dedent(&text);
+                        if dedented.len() < text.len() {
+                            changes.push(TextChange {
+                                from,
+                                to: from + (text.len() - dedented.len()) as u32,
+                                insert: String::new(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        if changes.is_empty() {
+            return;
+        }
+        changes.sort_by_key(|c| (c.from, c.to));
+        changes.dedup_by_key(|c| (c.from, c.to));
+        self.apply_edits(changes, Cause::Indent, cx);
     }
 
     /// ⌘V: pastes `text` at every cursor (replacing each selection) as one
@@ -983,6 +1196,8 @@ impl EditorPane {
             self.undo.clear();
             self.redo.clear();
             self.scroll.set(0.0);
+            self.scroll_x.set(0.0);
+            self.max_line_w.set(0.0);
             // The old tree and its queued edits describe text that no longer
             // exists anywhere; the in-flight parse (if any) is invalidated.
             self.parse_generation += 1;
@@ -1570,7 +1785,12 @@ impl EditorPane {
                     self.rename_cancel_flow(window, cx);
                     return;
                 }
-                Command::Move(..) | Command::Delete { .. } | Command::Paste | Command::ToggleHud => return,
+                Command::Move(..)
+                | Command::Delete { .. }
+                | Command::Paste
+                | Command::Tab
+                | Command::Outdent
+                | Command::ToggleHud => return,
             }
         }
         if matches!(self.rename, Some(RenameFlow::Preview { .. })) {
@@ -1644,7 +1864,9 @@ impl EditorPane {
         match cmd {
             Command::Move(motion, extend) => self.move_cursors(motion, extend, cx),
             Command::Delete { forward, word } => self.delete(forward, word, cx),
-            Command::Newline => self.insert_text("\n", cx),
+            Command::Newline => self.newline(cx),
+            Command::Tab => self.tab(cx),
+            Command::Outdent => self.indent_lines(-1, cx),
             Command::Paste => {
                 let text = cx.read_from_clipboard().and_then(|item| item.text());
                 if let Some(text) = text {
@@ -1688,7 +1910,12 @@ impl EditorPane {
         let (line, _) = self.resolve_display(self.row_at(geometry, position.y));
         let span = self.buf.line_span(line);
         let line = self.buf.slice_utf16(span.clone());
-        let col = utf16_index_at_x(window, &line, position.x - geometry.origin.x, theme::px_font_size());
+        let col = utf16_index_at_x(
+            window,
+            &line,
+            position.x - geometry.origin.x + px(geometry.scroll_x),
+            theme::px_font_size(),
+        );
         span.start + col
     }
 
@@ -1706,6 +1933,35 @@ impl EditorPane {
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut gpui::Context<Self>) {
         window.focus(&self.focus, cx);
         let Some(geometry) = self.geometry.get() else { return };
+        // The scrollbars take their hits first: drags and page jumps, never
+        // caret/edit logic.
+        if geometry.vscroll.hit_thumb(ev.position) {
+            self.drag.set(Some(Drag::ScrollV { grab: ev.position.y - geometry.vscroll.thumb.origin.y }));
+            return;
+        }
+        if geometry.vscroll.hit_track(ev.position) {
+            // A track click pages toward the click: the thumb centers there.
+            let track_y = geometry.vscroll.track.origin.y;
+            let travel = (geometry.vscroll.track.size.height - geometry.vscroll.thumb.size.height).max(px(1.0));
+            let ratio = ((ev.position.y - track_y - geometry.vscroll.thumb.size.height / 2.0) / travel).clamp(0.0, 1.0);
+            self.scroll.set(ratio * self.scroll_range());
+            self.drag.set(Some(Drag::ScrollV { grab: geometry.vscroll.thumb.size.height / 2.0 }));
+            cx.notify();
+            return;
+        }
+        if geometry.hscroll.hit_thumb(ev.position) {
+            self.drag.set(Some(Drag::ScrollH { grab: ev.position.x - geometry.hscroll.thumb.origin.x }));
+            return;
+        }
+        if geometry.hscroll.hit_track(ev.position) {
+            let track_x = geometry.hscroll.track.origin.x;
+            let travel = (geometry.hscroll.track.size.width - geometry.hscroll.thumb.size.width).max(px(1.0));
+            let ratio = ((ev.position.x - track_x - geometry.hscroll.thumb.size.width / 2.0) / travel).clamp(0.0, 1.0);
+            self.scroll_x.set(ratio * self.max_scroll_x());
+            self.drag.set(Some(Drag::ScrollH { grab: geometry.hscroll.thumb.size.width / 2.0 }));
+            cx.notify();
+            return;
+        }
         let display_row = self.row_at(&geometry, ev.position.y);
         // The gutter folds: a chevron row toggles its fold.
         if ev.position.x < geometry.gutter_x + geometry.gutter_w {
@@ -1760,6 +2016,20 @@ impl EditorPane {
             }
             Some(Drag::Columnar { from }) if ev.position != from => {
                 self.selections = self.columnar_selections(window, &geometry, from, ev.position);
+                cx.notify();
+            }
+            Some(Drag::ScrollV { grab }) => {
+                let track_y = geometry.vscroll.track.origin.y;
+                let travel = (geometry.vscroll.track.size.height - geometry.vscroll.thumb.size.height).max(px(1.0));
+                let ratio = ((ev.position.y - grab - track_y) / travel).clamp(0.0, 1.0);
+                self.scroll.set(ratio * self.scroll_range());
+                cx.notify();
+            }
+            Some(Drag::ScrollH { grab }) => {
+                let track_x = geometry.hscroll.track.origin.x;
+                let travel = (geometry.hscroll.track.size.width - geometry.hscroll.thumb.size.width).max(px(1.0));
+                let ratio = ((ev.position.x - grab - track_x) / travel).clamp(0.0, 1.0);
+                self.scroll_x.set(ratio * self.max_scroll_x());
                 cx.notify();
             }
             _ => self.update_hover(ev.position, window, cx),
@@ -1830,8 +2100,9 @@ impl EditorPane {
             }
             let span = self.buf.line_span(line);
             let text = self.buf.slice_utf16(span.clone());
-            let c0 = utf16_index_at_x(window, &text, x_left - geometry.origin.x, theme::px_font_size());
-            let c1 = utf16_index_at_x(window, &text, x_right - geometry.origin.x, theme::px_font_size());
+            let scroll_x = px(geometry.scroll_x);
+            let c0 = utf16_index_at_x(window, &text, x_left - geometry.origin.x + scroll_x, theme::px_font_size());
+            let c1 = utf16_index_at_x(window, &text, x_right - geometry.origin.x + scroll_x, theme::px_font_size());
             let start = span.start + c0;
             let end = span.start + c1;
             selections.push(if down {
@@ -1844,12 +2115,19 @@ impl EditorPane {
     }
 
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, _window: &mut Window, cx: &mut gpui::Context<Self>) {
-        let delta = match ev.delta {
-            gpui::ScrollDelta::Pixels(point) => point.y / theme::px_line_height(),
-            gpui::ScrollDelta::Lines(point) => point.y,
+        let (dy_lines, dx_px) = match ev.delta {
+            gpui::ScrollDelta::Pixels(point) => (point.y / theme::px_line_height(), f32::from(point.x)),
+            gpui::ScrollDelta::Lines(point) => (point.y, point.x * theme::FONT_SIZE * 0.6),
         };
-        self.scroll.set(self.scroll.get() - delta);
+        if ev.modifiers.shift {
+            // Shift turns a vertical wheel into horizontal motion (mice).
+            self.scroll_x.set(self.scroll_x.get() - dy_lines * f32::from(theme::px_line_height()));
+        } else {
+            self.scroll.set(self.scroll.get() - dy_lines);
+            self.scroll_x.set(self.scroll_x.get() - dx_px);
+        }
         self.clamp_scroll();
+        self.clamp_scroll_x();
         cx.notify();
     }
 
@@ -1857,6 +2135,27 @@ impl EditorPane {
     fn clamp_scroll(&self) {
         let max = self.display_count().saturating_sub(1) as f32;
         self.scroll.set(self.scroll.get().clamp(0.0, max));
+    }
+
+    /// The topmost scroll value the viewport can reach (display rows minus
+    /// the rows that fit) — the scrollbar's ratio maps onto exactly this.
+    fn scroll_range(&self) -> f32 {
+        let visible =
+            self.geometry.get().map_or(20.0, |g| (g.height - px(theme::TEXT_INSET) * 2.0) / g.line_height).max(1.0);
+        (self.display_count() as f32 - visible).max(0.0)
+    }
+
+    /// The farthest the viewport may shift right: the widest observed line
+    /// minus the text area (plus the scrollbar's breathing room).
+    fn max_scroll_x(&self) -> f32 {
+        self.geometry
+            .get()
+            .map_or(0.0, |g| (self.max_line_w.get() - f32::from(g.width) + theme::SCROLLBAR_SIZE).max(0.0))
+    }
+
+    fn clamp_scroll_x(&self) {
+        let max = self.max_scroll_x();
+        self.scroll_x.set(self.scroll_x.get().clamp(0.0, max));
     }
 
     /// Scrolls the primary cursor's line into view.
@@ -2060,6 +2359,10 @@ impl Render for EditorPane {
             )
             .on_action(cx.listener(|this, _: &acts::Cancel, window, cx| this.command(Command::Cancel, window, cx)))
             .on_action(cx.listener(|this, _: &acts::Newline, window, cx| this.command(Command::Newline, window, cx)))
+            .on_action(cx.listener(|this, _: &acts::TabIndent, window, cx| this.command(Command::Tab, window, cx)))
+            .on_action(
+                cx.listener(|this, _: &acts::OutdentLine, window, cx| this.command(Command::Outdent, window, cx)),
+            )
             .on_action(cx.listener(|this, _: &acts::Paste, window, cx| this.command(Command::Paste, window, cx)))
             .on_action(cx.listener(|this, _: &acts::DeleteBackward, window, cx| {
                 this.command(Command::Delete { forward: false, word: false }, window, cx)
@@ -2357,7 +2660,7 @@ impl EditorPane {
         Some(
             gpui::div()
                 .absolute()
-                .left(geometry.origin.x + x)
+                .left(geometry.origin.x + x - px(geometry.scroll_x))
                 .top(y)
                 .w(px(420.0))
                 .max_h(px((MAX_ROWS as f32) * 22.0 + 8.0))
@@ -2672,6 +2975,7 @@ impl Element for EditorElement {
         let gutter_w = px(theme::GUTTER_PAD_L) + numbers_w + px(theme::GUTTER_PAD_R);
         let gutter_x = bounds.origin.x;
         let origin = point(gutter_x + gutter_w, bounds.origin.y + px(theme::TEXT_INSET));
+        let text_area_w = bounds.size.width - gutter_w;
 
         // Only the visible display rows are laid out, with one row of slack
         // above and below; a 50 MB file costs the same as a small one.
@@ -2686,6 +2990,7 @@ impl Element for EditorElement {
         let mut rows = Vec::with_capacity((last - first) as usize);
         let mut chevrons = Vec::new();
         let mut diag_marks = Vec::new();
+        let mut frame_max_w = px(0.0);
         for display in first..last {
             let (line, placeholder) = pane.resolve_display(display);
             let shaped = match placeholder {
@@ -2723,11 +3028,36 @@ impl Element for EditorElement {
             if folded_here || foldable_here {
                 chevrons.push((display, folded_here));
             }
+            frame_max_w = frame_max_w.max(shaped.width());
             rows.push(DisplayedRow { display, line: placeholder.is_none().then_some(line), shaped });
         }
 
+        // Horizontal scroll: widen the observed-max with this frame's rows,
+        // clamp, then pan the primary caret into view. Everything below
+        // (carets, rects, geometry) uses this final offset.
+        pane.max_line_w.set(pane.max_line_w.get().max(f32::from(frame_max_w)));
+        let text_area_w = f32::from(text_area_w);
+        let max_x = (pane.max_line_w.get() - text_area_w + theme::SCROLLBAR_SIZE).max(0.0);
+        {
+            let caret = pane.selections.first().map_or(0, |s| s.head);
+            let caret_line = pane.buf.line_of(caret);
+            let span = pane.buf.line_span(caret_line);
+            let caret_x =
+                f32::from(x_at_utf16(window, &pane.buf.slice_utf16(span.clone()), caret - span.start, font_size));
+            let pad = 48.0;
+            let mut x = pane.scroll_x.get().clamp(0.0, max_x);
+            if caret_x < x {
+                x = (caret_x - pad).max(0.0);
+            } else if caret_x > x + text_area_w - pad {
+                x = (caret_x - text_area_w + pad).max(0.0);
+            }
+            pane.scroll_x.set(x.clamp(0.0, max_x));
+        }
+        let scroll_x = pane.scroll_x.get();
+
         // Carets (one per selection head) and selection rectangles for the
-        // visible rows (positions go through the display map).
+        // visible rows (positions go through the display map and shift left
+        // with the horizontal scroll).
         let mut carets = Vec::with_capacity(pane.selections.len());
         let mut selection_rects = Vec::new();
         for selection in &pane.selections {
@@ -2736,7 +3066,7 @@ impl Element for EditorElement {
             if (first..last).contains(&head_display) {
                 let span = pane.buf.line_span(head_line);
                 let line_text = pane.buf.slice_utf16(span.clone());
-                let head_x = x_at_utf16(window, &line_text, selection.head - span.start, font_size);
+                let head_x = x_at_utf16(window, &line_text, selection.head - span.start, font_size) - px(scroll_x);
                 let head_y = origin.y + line_height * (head_display as f32 - scroll);
                 carets.push(Bounds::new(point(origin.x + head_x, head_y), size(px(2.0), line_height)));
             }
@@ -2764,9 +3094,39 @@ impl Element for EditorElement {
                     x_at_utf16(window, &line_text, end - span.start, font_size)
                 };
                 let y = origin.y + line_height * (display as f32 - scroll);
-                selection_rects.push(Bounds::new(point(origin.x + x0, y), size((x1 - x0).max(px(0.0)), line_height)));
+                let left = origin.x + x0 - px(scroll_x);
+                selection_rects.push(Bounds::new(point(left, y), size((x1 - x0).max(px(0.0)), line_height)));
             }
         }
+
+        // Scrollbar frames (published for hit-testing and drag mapping;
+        // painting happens in the paint phase).
+        let margin = px(2.0);
+        let v_track = Bounds::new(
+            point(bounds.origin.x + bounds.size.width - px(theme::SCROLLBAR_SIZE) - margin, bounds.origin.y + margin),
+            size(px(theme::SCROLLBAR_SIZE), (bounds.size.height - margin * 2.0).max(px(0.0))),
+        );
+        let total = pane.display_count().max(1) as f32;
+        let visible_rows = ((bounds.size.height - px(theme::TEXT_INSET) * 2.0) / line_height).max(1.0);
+        let v_over = (total - visible_rows).max(1.0);
+        let v_thumb_h = (v_track.size.height * (visible_rows / total).min(1.0)).max(px(24.0)).min(v_track.size.height);
+        let v_travel = (v_track.size.height - v_thumb_h).max(px(1.0));
+        let v_thumb = Bounds::new(
+            point(v_track.origin.x, v_track.origin.y + pane.scroll.get().clamp(0.0, v_over) / v_over * v_travel),
+            size(v_track.size.width, v_thumb_h),
+        );
+        let h_track = Bounds::new(
+            point(bounds.origin.x + margin, bounds.origin.y + bounds.size.height - px(theme::SCROLLBAR_SIZE) - margin),
+            size((bounds.size.width - margin * 2.0).max(px(0.0)), px(theme::SCROLLBAR_SIZE)),
+        );
+        let h_thumb_w = (h_track.size.width * (text_area_w / pane.max_line_w.get().max(1.0)).min(1.0))
+            .max(px(24.0))
+            .min(h_track.size.width);
+        let h_travel = (h_track.size.width - h_thumb_w).max(px(1.0));
+        let h_thumb = Bounds::new(
+            point(h_track.origin.x + (pane.scroll_x.get() / max_x.max(1.0) * h_travel).min(h_travel), h_track.origin.y),
+            size(h_thumb_w, h_track.size.height),
+        );
 
         if !pane.first_paint_done.replace(true) {
             eprintln!("[perf] first paint {:.0} ms after open", pane.created_at.elapsed().as_secs_f32() * 1000.0);
@@ -2794,7 +3154,11 @@ impl Element for EditorElement {
             origin,
             line_height,
             scroll,
+            scroll_x: pane.scroll_x.get(),
             height: bounds.size.height,
+            width: px(text_area_w),
+            vscroll: Scrollbar { track: v_track, thumb: v_thumb },
+            hscroll: Scrollbar { track: h_track, thumb: h_thumb },
         }));
 
         PrepaintState {
@@ -2828,9 +3192,32 @@ impl Element for EditorElement {
         // Clip to the element: long lines and mid-scroll rows must not paint
         // over the workbench chrome around the editor.
         window.paint_layer(bounds, |window| {
+            // Selections under the text, then the rows (shifted left by the
+            // horizontal scroll), then the gutter (repainted over any text
+            // scrolled under it), then the carets and the scrollbars.
+            for rect in &prepaint.selection_rects {
+                window.paint_quad(fill(*rect, rgba_of(theme::SELECTION_BG)));
+            }
+            for row in prepaint.rows.drain(..) {
+                let y = origin.y + line_height * (row.display as f32 - geometry.scroll);
+                let _ = row.shaped.paint(
+                    point(origin.x - px(geometry.scroll_x), y),
+                    line_height,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+            }
+
             // Gutter: right-aligned line numbers, the caret's row brighter,
             // separated from the text by the border color; fold chevrons at
             // the left edge.
+            let gutter_bg = Bounds::new(
+                point(bounds.origin.x, bounds.origin.y),
+                size(gutter_x + geometry.gutter_w - bounds.origin.x, bounds.size.height),
+            );
+            window.paint_quad(fill(gutter_bg, theme::surface_bg()));
             for row in &prepaint.rows {
                 let y = origin.y + line_height * (row.display as f32 - geometry.scroll);
                 if let Some(line) = row.line {
@@ -2866,17 +3253,15 @@ impl Element for EditorElement {
             );
             window.paint_quad(fill(separator, theme::border()));
 
-            // Selections under the text, then the rows, then the carets.
-            for rect in &prepaint.selection_rects {
-                window.paint_quad(fill(*rect, rgba_of(theme::SELECTION_BG)));
-            }
-            for row in prepaint.rows.drain(..) {
-                let y = origin.y + line_height * (row.display as f32 - geometry.scroll);
-                let _ = row.shaped.paint(point(origin.x, y), line_height, TextAlign::Left, None, window, cx);
-            }
             for caret in &prepaint.carets {
                 window.paint_quad(fill(*caret, rgba_of(theme::ACCENT)));
             }
+
+            // Scrollbars: subtle track, brighter thumb (M5).
+            window.paint_quad(fill(geometry.vscroll.track, theme::scrollbar_track()));
+            window.paint_quad(fill(geometry.vscroll.thumb, theme::scrollbar_thumb()));
+            window.paint_quad(fill(geometry.hscroll.track, theme::scrollbar_track()));
+            window.paint_quad(fill(geometry.hscroll.thumb, theme::scrollbar_thumb()));
 
             // F12 perf HUD, top right, above everything.
             let hud = &self.view.read(cx).hud;
@@ -3016,7 +3401,10 @@ impl InputHandler for EditorInputHandler {
         let x0 = shaped_width(window, &pane.buf.slice_utf16(span.start..start), theme::px_font_size());
         let x1 = shaped_width(window, &pane.buf.slice_utf16(span.start..end), theme::px_font_size());
         let bounds = Bounds::new(
-            point(geometry.origin.x + x0, geometry.origin.y + geometry.line_height * (line as f32 - geometry.scroll)),
+            point(
+                geometry.origin.x + x0 - px(geometry.scroll_x),
+                geometry.origin.y + geometry.line_height * (line as f32 - geometry.scroll),
+            ),
             size(x1 - x0, geometry.line_height),
         );
         eprintln!("[ime] firstRect {range_utf16:?} -> {bounds:?}");
@@ -3035,7 +3423,12 @@ impl InputHandler for EditorInputHandler {
         }
         let span = pane.buf.line_span(row as u32);
         let line_text = pane.buf.slice_utf16(span.clone());
-        let col = utf16_index_at_x(window, &line_text, point.x - geometry.origin.x, theme::px_font_size());
+        let col = utf16_index_at_x(
+            window,
+            &line_text,
+            point.x - geometry.origin.x + px(geometry.scroll_x),
+            theme::px_font_size(),
+        );
         Some(span.start + col)
     }
 
@@ -3058,6 +3451,84 @@ mod tests {
 
     fn tc(from: u32, to: u32, insert: &str) -> TextChange {
         TextChange { from, to, insert: insert.into() }
+    }
+
+    fn doc_info(language: &str, editorconfig: Option<ide_workspace::EditorConfigProps>) -> DocumentInfo {
+        DocumentInfo {
+            id: DocId::next(),
+            path: ide_core::IpcPath(std::path::PathBuf::from("/tmp/x.rs")),
+            text: String::new(),
+            version: 0,
+            language: ide_core::LanguageId::new(language),
+            encoding: "utf-8".into(),
+            line_ending: ide_text::LineEnding::Lf,
+            read_only: false,
+            dirty: false,
+            large: false,
+            editorconfig,
+            uri: None,
+            ui_mode: None,
+        }
+    }
+
+    #[test]
+    fn indent_resolves_language_then_editorconfig() {
+        let languages = ide_language::LanguageRegistry::load(None).expect("builtin languages");
+        // go.toml declares tab-size 4, insert-spaces false.
+        let go = indent_for(&doc_info("go", None), &languages);
+        assert_eq!(go, Indent { tab_size: 4, insert_spaces: false });
+        assert_eq!(go.unit(), "\t");
+        // Rust has no explicit indent: the default applies.
+        assert_eq!(indent_for(&doc_info("rust", None), &languages), Indent::default());
+        // editorconfig wins over the language.
+        let props = ide_workspace::EditorConfigProps {
+            indent_style: Some(ide_workspace::editorconfig::IndentStyle::Space),
+            indent_size: Some(2),
+            tab_width: None,
+            end_of_line: None,
+            charset: None,
+            trim_trailing_whitespace: None,
+            insert_final_newline: None,
+            max_line_length: None,
+        };
+        let go_ec = indent_for(&doc_info("go", Some(props)), &languages);
+        assert_eq!(go_ec, Indent { tab_size: 2, insert_spaces: true });
+        assert_eq!(go_ec.unit(), "  ");
+    }
+
+    #[test]
+    fn indent_unit_and_dedent() {
+        let spaces = Indent { tab_size: 4, insert_spaces: true };
+        assert_eq!(spaces.unit(), "    ");
+        assert_eq!(spaces.dedent("        x"), "    x");
+        assert_eq!(spaces.dedent("  x"), "x");
+        assert_eq!(spaces.dedent("x"), "x");
+        let tabs = Indent { tab_size: 4, insert_spaces: false };
+        assert_eq!(tabs.unit(), "\t");
+        assert_eq!(tabs.dedent("\t\tx"), "\tx");
+        assert_eq!(tabs.dedent("    x"), "    x", "a tab policy only removes real tabs");
+    }
+
+    #[test]
+    fn enter_keeps_and_grows_indent() {
+        let spaces = Indent { tab_size: 4, insert_spaces: true };
+        // Plain continuation keeps the line's own indent.
+        assert_eq!(enter_indent("    let x = 1;", true, "", None, &spaces), "    ");
+        // Caret mid-line keeps the indent too.
+        assert_eq!(enter_indent("fn main() {", false, "}", None, &spaces), "");
+        // A line ending in '{' at end-of-line grows by one unit.
+        assert_eq!(enter_indent("fn main() {", true, "", None, &spaces), "    ");
+        // A closing brace after the caret dedents back one unit.
+        assert_eq!(enter_indent("    fn main() {", true, "}", None, &spaces), "    ");
+        // A trailing line comment does not hide the '{'.
+        assert_eq!(enter_indent("if x { // note", true, "", Some("//"), &spaces), "    ");
+        assert_eq!(enter_indent("let x = { 1 };", true, "", None, &spaces), "", "brace not at the end: no growth");
+        // Tab policy: the unit is a real tab; splitting before a `}` puts the
+        // caret one unit deeper than the closing brace's own indent.
+        let tabs = Indent { tab_size: 4, insert_spaces: false };
+        assert_eq!(enter_indent("func main() {", true, "", None, &tabs), "\t");
+        assert_eq!(enter_indent("\tfunc main() {", true, "}", None, &tabs), "\t");
+        assert_eq!(enter_indent("\tx := 1", true, "", None, &tabs), "\t");
     }
 
     #[test]
