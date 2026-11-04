@@ -18,6 +18,7 @@
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
     App, Bounds, Element, ElementId, Entity, FocusHandle, Focusable, GlobalElementId, InputHandler, InspectorElementId,
@@ -25,7 +26,9 @@ use gpui::{
     ParentElement, Pixels, Point, Render, ScrollWheelEvent, ShapedLine, SharedString, Styled, TextAlign, TextRun,
     UTF16Selection, UnderlineStyle, Window, fill, point, px, relative, rgba, size,
 };
-use ide_core::{ChangeSet, Diagnostic, DocId, Severity, TextChange};
+use ide_core::IdeResult;
+use ide_core::{CancellationToken, ChangeSet, Diagnostic, DocId, Pos, Severity, TextChange};
+use ide_lsp::types::{CompletionItem, CompletionKind, CompletionList};
 use ide_workspace::DocumentInfo;
 use tree_sitter::Tree;
 
@@ -326,6 +329,60 @@ struct HoverDiag {
     line: u32,
 }
 
+/// The open completion popup: the server's items for the request, the
+/// buffer offset the typed word began at (the client-side filter and the
+/// default replace base), and the selection into the filtered view.
+struct CompletionPopup {
+    items: Vec<CompletionItem>,
+    replace_start: usize,
+    selected: usize,
+    is_incomplete: bool,
+}
+
+impl CompletionPopup {
+    /// The items matching the currently typed word (a case-insensitive
+    /// subsequence of `filter_text`, falling back to `label`), server order
+    /// kept (rust-analyzer pre-sorts by relevance).
+    fn filtered(&self, filter: &str) -> Vec<&CompletionItem> {
+        let lower = filter.to_lowercase();
+        self.items
+            .iter()
+            .filter(|item| {
+                if item.is_snippet {
+                    return false;
+                }
+                let text = item.filter_text.as_ref().unwrap_or(&item.label).to_lowercase();
+                let mut at = 0;
+                for ch in lower.chars() {
+                    match text[at..].find(ch) {
+                        Some(found) => at += found + ch.len_utf16().max(1),
+                        None => return false,
+                    }
+                }
+                true
+            })
+            .collect()
+    }
+
+    /// The one-line letter badge for the completion kind.
+    fn kind_badge(kind: Option<CompletionKind>) -> &'static str {
+        use CompletionKind as K;
+        match kind {
+            Some(K::Method | K::Function | K::Constructor) => "f",
+            Some(K::Variable | K::Constant) => "v",
+            Some(K::Field | K::Property | K::EnumMember) => "m",
+            Some(K::Class | K::Struct | K::Interface | K::Enum) => "s",
+            Some(K::Module | K::File | K::Folder) => "M",
+            Some(K::Keyword) => "k",
+            Some(K::Snippet) => "S",
+            Some(K::Unit | K::Value | K::Text | K::Color) => "t",
+            Some(K::TypeParameter) => "T",
+            Some(K::Reference) | Some(K::Event) | Some(K::Operator) => "r",
+            None => "?",
+        }
+    }
+}
+
 /// Element geometry the IME handler needs between frames, in window
 /// coordinates: where the gutter and the text area start, how tall a line is,
 /// which line is scrolled to the top and the viewport height.
@@ -426,6 +483,11 @@ pub struct EditorPane {
     // position, and what the pointer rests on.
     diagnostics: Vec<Diagnostic>,
     hover: Cell<Option<HoverDiag>>,
+    // Completion (M3 phase 4): the open popup, the debounce/request
+    // generation (stale answers are dropped), and the request's cancel token.
+    completion: Option<CompletionPopup>,
+    completion_gen: u32,
+    completion_cancel: Option<CancellationToken>,
     /// F12 perf overlay counters (phase 7).
     hud: Hud,
     /// When the pane was created; the first paint logs the open latency.
@@ -469,6 +531,9 @@ impl EditorPane {
             folds: Vec::new(),
             diagnostics: Vec::new(),
             hover: Cell::new(None),
+            completion: None,
+            completion_gen: 0,
+            completion_cancel: None,
             hud: Hud::default(),
             created_at: std::time::Instant::now(),
             first_paint_done: Cell::new(false),
@@ -644,6 +709,11 @@ impl EditorPane {
         self.last_edit =
             Some((std::time::Instant::now(), matches!(cause, Cause::Typing | Cause::Delete | Cause::ImeCommit)));
         self.hover.set(None);
+        // The macOS IME commits printable input per character (Cause::
+        // ImeCommit); plain keydowns (Cause::Typing) and deletions re-filter.
+        if matches!(cause, Cause::Typing | Cause::Delete | Cause::ImeCommit) {
+            self.schedule_completion(cx);
+        }
         self.after_edits(&byte_edits, cx);
         self.clamp_scroll_to_primary();
         cx.notify();
@@ -877,6 +947,202 @@ impl EditorPane {
         }
     }
 
+    // -- completion (M3 phase 4) ---------------------------------------------
+    //
+    // Typing schedules a debounced LSP request (immediately for a server
+    // trigger character); the answer opens a self-drawn popup overlay at the
+    // caret, filtered client-side against the typed word. Enter applies the
+    // selected item through the one edit pipeline; Esc closes.
+
+    /// The primary caret as an IDE position (UTF-16 columns).
+    fn caret_pos(&self) -> Pos {
+        let head = self.selections.first().map_or(0, |s| s.head);
+        let line = self.buf.line_of(head);
+        Pos::new(line, (head - self.buf.line_start(line)) as u32)
+    }
+
+    /// The word being typed at the primary caret: the run of identifier
+    /// characters ending at the caret (the popup's filter and the items'
+    /// default replace base).
+    fn typed_word_start(&self) -> usize {
+        let head = self.selections.first().map_or(0, |s| s.head);
+        let mut start = head;
+        while start > 0 {
+            let prev = self.buf.prev_boundary(start);
+            if !self.buf.char_of(prev).is_alphanumeric() && self.buf.char_of(prev) != '_' {
+                break;
+            }
+            start = prev;
+        }
+        start
+    }
+
+    /// Schedules the debounced request; a trigger character skips the wait.
+    fn schedule_completion(&mut self, cx: &mut gpui::Context<Self>) {
+        let caret = self.selections.first().map_or(0, |s| s.head);
+        let typed = self.buf.slice_utf16(self.typed_word_start()..caret);
+        // Typing beyond the word (space, newline, punctuation) dismisses; a
+        // server trigger character requests right away with it.
+        let triggers = [":", ".", "'", "("];
+        let trigger = if typed.is_empty() {
+            triggers
+                .iter()
+                .find(|t| {
+                    self.buf.slice_utf16(caret.saturating_sub(t.chars().map(char::len_utf16).sum::<usize>())..caret)
+                        == **t
+                })
+                .map(|t| t.to_string())
+        } else {
+            None
+        };
+        let word_ended = typed.is_empty() && trigger.is_none();
+        if word_ended {
+            self.close_completion(cx);
+            return;
+        }
+        // An open popup re-queries faster: the user is narrowing down.
+        let debounce = if self.completion.as_ref().is_some_and(|open| open.is_incomplete) { 60 } else { 140 };
+        self.completion_gen += 1;
+        let req = self.completion_gen;
+        let runtime = self.host.runtime.clone();
+        cx.spawn(async move |this, cx| {
+            runtime
+                .spawn(async move {
+                    // The debounce lives on the tokio side so a burst of
+                    // keystrokes collapses into the last generation.
+                    tokio::time::sleep(Duration::from_millis(debounce)).await;
+                })
+                .await
+                .ok();
+            this.update(cx, |pane, cx| {
+                if pane.completion_gen == req {
+                    pane.request_completion(trigger.clone(), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Fires the LSP completion request onto the app runtime; the answer
+    /// lands in [`EditorPane::completion_ready`].
+    fn request_completion(&mut self, trigger: Option<String>, cx: &mut gpui::Context<Self>) {
+        self.completion_gen += 1;
+        let req = self.completion_gen;
+        let cancel = CancellationToken::new();
+        self.completion_cancel = Some(cancel.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let lsp = self.host.lsp.clone();
+        let doc = self.doc_id;
+        let pos = self.caret_pos();
+        self.host.runtime.spawn(async move {
+            let result = lsp.completion(doc, pos, trigger, cancel).await;
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.await {
+                this.update(cx, |pane, cx| pane.completion_ready(req, result, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Lands an answer: opens (or refreshes) the popup unless the caret kept
+    /// moving past this request's generation.
+    fn completion_ready(&mut self, req: u32, result: IdeResult<CompletionList>, cx: &mut gpui::Context<Self>) {
+        if req != self.completion_gen {
+            return;
+        }
+        let Ok(list) = result else {
+            // No server, unsupported, or timed out: the popup simply stays as
+            // it is (typing re-requests).
+            return;
+        };
+        if list.items.iter().all(|item| item.is_snippet) || list.items.is_empty() {
+            self.close_completion(cx);
+            return;
+        }
+        let replace_start = match self.completion.as_ref() {
+            Some(open) => open.replace_start,
+            None => self.typed_word_start(),
+        };
+        let selected = self.completion.as_ref().map_or(0, |open| open.selected.min(list.items.len() - 1));
+        self.completion =
+            Some(CompletionPopup { items: list.items, replace_start, selected, is_incomplete: list.is_incomplete });
+        cx.notify();
+    }
+
+    /// The filter: the text between the popup's word start and the caret.
+    fn completion_filter(&self) -> String {
+        self.completion
+            .as_ref()
+            .and_then(|open| {
+                let caret = self.selections.first().map_or(0, |s| s.head);
+                (caret >= open.replace_start).then(|| self.buf.slice_utf16(open.replace_start..caret))
+            })
+            .unwrap_or_default()
+    }
+
+    fn completion_move(&mut self, delta: isize, cx: &mut gpui::Context<Self>) {
+        if let Some(mut open) = self.completion.take() {
+            let count = open.filtered(&self.completion_filter()).len().max(1) as isize;
+            open.selected = ((open.selected as isize + delta).rem_euclid(count)) as usize;
+            self.completion = Some(open);
+            cx.notify();
+        }
+    }
+
+    /// Closes the popup without touching the buffer.
+    fn close_completion(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.completion.take().is_some() {
+            if let Some(token) = self.completion_cancel.take() {
+                token.cancel();
+            }
+            cx.notify();
+        }
+    }
+
+    /// Applies the selected item: its `replace_range` (or the typed word)
+    /// becomes `insert_text`, plus any additional edits, in one batch through
+    /// the ordinary pipeline (so undo, tree-sitter and server sync all see an
+    /// ordinary edit).
+    fn completion_accept(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(open) = self.completion.take() else { return };
+        let filter = self.completion_filter();
+        let visible = open.filtered(&filter);
+        let Some(item) = visible.get(open.selected.min(visible.len().saturating_sub(1))).map(|item| (*item).clone())
+        else {
+            self.completion = Some(open);
+            return;
+        };
+        let caret = self.selections.first().map_or(0, |s| s.head);
+        let (start, end) = match &item.replace_range {
+            Some(range) => {
+                let start = self.buf.line_start(range.start.line).min(self.buf.utf16_len()) + range.start.col as usize;
+                let end = self.buf.line_start(range.end.line).min(self.buf.utf16_len()) + range.end.col as usize;
+                (start.min(caret).min(end), end.max(start))
+            }
+            None => (open.replace_start, caret),
+        };
+        let mut changes = vec![TextChange {
+            from: start.min(end) as u32,
+            to: end.max(start) as u32,
+            insert: item.insert_text.clone(),
+        }];
+        for edit in &item.additional_edits {
+            let from =
+                self.buf.line_start(edit.range.start.line).min(self.buf.utf16_len()) + edit.range.start.col as usize;
+            let to = self.buf.line_start(edit.range.end.line).min(self.buf.utf16_len()) + edit.range.end.col as usize;
+            changes.push(TextChange { from: from as u32, to: to.max(from) as u32, insert: edit.new_text.clone() });
+        }
+        self.close_completion(cx);
+        self.apply_edits(changes, Cause::Typing, cx);
+        // The caret lands at the end of the inserted text.
+        self.selections = vec![Selection::caret(start.min(end) + crate::editor::utf16_len(&item.insert_text))];
+        self.clamp_scroll_to_primary();
+        cx.notify();
+    }
+
     /// Replaces the pane's diagnostics (the workbench merges the producers).
     pub fn set_diagnostics(&mut self, merged: Vec<Diagnostic>, cx: &mut gpui::Context<Self>) {
         self.diagnostics = merged;
@@ -982,6 +1248,38 @@ impl EditorPane {
         }
         if self.buf.marked.is_some() {
             return;
+        }
+        // While the completion popup is open it owns navigation, accept and
+        // cancel; every other command (typing continues through the raw key
+        // path) re-filters through schedule_completion.
+        if self.completion.is_some() {
+            match cmd {
+                Command::Move(Motion::Up, false) => {
+                    self.completion_move(-1, cx);
+                    return;
+                }
+                Command::Move(Motion::Down, false) => {
+                    self.completion_move(1, cx);
+                    return;
+                }
+                Command::Move(Motion::DocStart, false) => {
+                    self.completion_move(-999, cx);
+                    return;
+                }
+                Command::Move(Motion::DocEnd, false) => {
+                    self.completion_move(999, cx);
+                    return;
+                }
+                Command::Newline => {
+                    self.completion_accept(cx);
+                    return;
+                }
+                Command::Cancel => {
+                    self.close_completion(cx);
+                    return;
+                }
+                _ => {}
+            }
         }
         match cmd {
             Command::Move(motion, extend) => self.move_cursors(motion, extend, cx),
@@ -1445,12 +1743,96 @@ impl Render for EditorPane {
             )
             // Hover tooltip: a plain-text bubble under the hovered diagnostic.
             .children(self.render_hover_tooltip(cx))
+            // Completion popup: the filtered item list at the caret.
+            .children(self.render_completion_popup(window, cx))
             // Navigation/refactoring handlers arrive in later M3 phases.
             .child(EditorElement { view: cx.entity() })
     }
 }
 
 impl EditorPane {
+    /// The completion popup, anchored at the primary caret from the last
+    /// frame's geometry. The typed word filters server order; ↑/↓ move, Enter
+    /// accepts, Esc closes (all through [`EditorPane::command`]).
+    fn render_completion_popup(&self, window: &mut Window, _cx: &mut gpui::Context<Self>) -> Option<gpui::AnyElement> {
+        let open = self.completion.as_ref()?;
+        let geometry = self.geometry.get()?;
+        let caret = self.selections.first().map_or(0, |s| s.head);
+        let caret_line = self.buf.line_of(caret);
+        let span = self.buf.line_span(caret_line);
+        let line_text = self.buf.slice_utf16(span.clone());
+        let x = x_at_utf16(window, &line_text, caret - span.start, theme::px_font_size());
+        let row = self.display_of_line(caret_line) as f32 - geometry.scroll;
+        let y = geometry.origin.y + geometry.line_height * (row + 1.0) + px(2.0);
+
+        let filter = self.completion_filter();
+        let visible = open.filtered(&filter);
+        if visible.is_empty() {
+            return None;
+        }
+        let selected = open.selected.min(visible.len() - 1);
+        // A sliding window of rows around the selection, at most ten.
+        const MAX_ROWS: usize = 10;
+        let first = selected.saturating_sub(MAX_ROWS / 2).min(visible.len().saturating_sub(MAX_ROWS));
+        let rows = &visible[first..(first + MAX_ROWS).min(visible.len())];
+
+        let mut list = gpui::div().flex().flex_col();
+        for (index, item) in rows.iter().enumerate() {
+            let is_selected = first + index == selected;
+            let mut row = gpui::div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .h(px(22.0))
+                .text_size(px(12.))
+                .child(
+                    gpui::div()
+                        .w(px(16.0))
+                        .text_size(px(10.))
+                        .text_color(theme::accent())
+                        .child(CompletionPopup::kind_badge(item.kind)),
+                )
+                .child(
+                    gpui::div()
+                        .text_color(if is_selected { theme::fg() } else { theme::fg_muted() })
+                        .child(SharedString::from(item.label.clone())),
+                );
+            if let Some(detail) = &item.label_detail {
+                row = row.child(gpui::div().text_color(theme::fg_muted()).child(SharedString::from(detail.clone())));
+            }
+            if let Some(detail) = &item.detail {
+                row = row.child(
+                    gpui::div()
+                        .flex_1()
+                        .text_right()
+                        .truncate()
+                        .text_color(theme::fg_muted())
+                        .child(SharedString::from(detail.clone())),
+                );
+            }
+            if is_selected {
+                row = row.bg(theme::selected_bg());
+            }
+            list = list.child(row);
+        }
+        Some(
+            gpui::div()
+                .absolute()
+                .left(geometry.origin.x + x)
+                .top(y)
+                .w(px(420.0))
+                .max_h(px((MAX_ROWS as f32) * 22.0 + 8.0))
+                .overflow_hidden()
+                .border_1()
+                .border_color(theme::border())
+                .bg(theme::raised_bg())
+                .py_1()
+                .child(list)
+                .into_any_element(),
+        )
+    }
+
     /// The hover tooltip for the diagnostic under the pointer, positioned
     /// under its line from the last frame's geometry.
     fn render_hover_tooltip(&self, _cx: &mut gpui::Context<Self>) -> Option<gpui::AnyElement> {
