@@ -28,8 +28,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ide_core::{ChangeSet, DocId, IdeError, IdeResult, LanguageId, SharedSink};
-use ide_language::LanguageRegistry;
+use ide_core::{ChangeSet, DocId, IdeError, IdeResult, SharedSink};
+use ide_index::ProjectIndex;
+use ide_language::{LanguageRegistry, Syntax};
 use ide_lsp::LspManager;
 use ide_text::AppliedChange;
 use ide_vfs::{FileEntry, Watcher};
@@ -59,6 +60,9 @@ pub struct Host {
     pub sink: SharedSink,
     /// Language servers (M3): started per document language, observed below.
     pub lsp: Arc<LspManager>,
+    /// The project index (M3): fuzzy file / symbol search behind Go to File
+    /// and Search Everywhere, kept fresh by the same watcher as the documents.
+    pub index: Arc<ProjectIndex>,
     /// The app-owned tokio runtime's handle: LSP feature requests
     /// (`completion`, `goto`, …) must spawn onto it, and it drives the
     /// servers' IO. Kept alongside the host so callers share one runtime.
@@ -87,15 +91,24 @@ impl Host {
         };
         let documents = Arc::new(Documents::new(sink.clone(), detect));
         let lsp = LspManager::new(root.clone(), languages.clone(), sink.clone());
-        eprintln!(
-            "[host] languages loaded; rust servers: {:?}",
-            languages.get(&LanguageId::new("rust")).map(|cfg| cfg
-                .language_servers
-                .iter()
-                .map(|s| s.name.clone())
-                .collect::<Vec<_>>())
-        );
+        let index = {
+            // Persistent index cache keyed per project (the FNV-1a convention
+            // ide-host uses for its caches), under the platform cache dir.
+            let cache = dirs::cache_dir()
+                .map(|dir| dir.join("openidea-gui").join("index").join(project_key(&root)))
+                .unwrap_or_else(|| root.join(".openidea-index"));
+            ProjectIndex::open(
+                &root,
+                &cache,
+                Vec::new(),
+                excludes(),
+                languages.clone(),
+                Arc::new(Syntax::new()),
+                sink.clone(),
+            )?
+        };
         documents.add_observer(Arc::new(LspObserver(lsp.clone())));
+        let watcher_index = index.clone();
         let watcher = {
             let documents = documents.clone();
             Watcher::start(
@@ -105,14 +118,16 @@ impl Host {
                 Box::new(move |batch| {
                     // External changes reach open documents through the same
                     // door ide-host uses: clean buffers reload (the UI learns
-                    // via `DocPatched`), dirty ones warn (`Notify`).
+                    // via `DocPatched`), dirty ones warn (`Notify`). The index
+                    // hears the same batch so its search stays current.
                     let changed: Vec<PathBuf> = batch.created.iter().chain(&batch.modified).cloned().collect();
                     documents.on_disk_changed(&changed);
+                    watcher_index.update(&changed, &batch.removed);
                 }),
             )?
         };
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        Ok(Self { root, name, documents, sink, lsp, runtime, _watcher: watcher })
+        Ok(Self { root, name, documents, sink, lsp, index, runtime, _watcher: watcher })
     }
 
     /// Lists `dir` (VFS entries with ignore flags applied).
@@ -166,6 +181,18 @@ impl Host {
             let _ = tokio::time::timeout(Duration::from_secs(2), lsp.shutdown_all()).await;
         });
     }
+}
+
+/// Stable per-project cache-directory name (FNV-1a of the root), the same
+/// convention `ide-host` uses for its per-project caches.
+fn project_key(root: &Path) -> String {
+    let s = root.to_string_lossy();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{h:016x}")
 }
 
 /// Feeds the document life cycle to the language servers, exactly like

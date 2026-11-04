@@ -10,6 +10,7 @@ mod actions;
 mod bus;
 mod editor;
 mod file_tree;
+mod fuzzy;
 mod highlight;
 mod host;
 mod strings;
@@ -30,6 +31,7 @@ use crate::actions::{
     SelectDocStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineHome, SelectRight, SelectUp, SelectWordLeft,
     SelectWordRight, TogglePerfHud, Undo,
 };
+use crate::actions::{SelectNext, SelectPrev};
 use crate::bus::Bus;
 use crate::host::Host;
 use crate::workbench::Workbench;
@@ -133,6 +135,11 @@ fn main() {
                     KeyBinding::new("shift-cmd-right", SelectLineEnd, Some("Editor")),
                     KeyBinding::new("shift-cmd-up", SelectDocStart, Some("Editor")),
                     KeyBinding::new("shift-cmd-down", SelectDocEnd, Some("Editor")),
+                    // Palette list navigation (⇧⌘O / double-⇧). Registered after
+                    // gpui-component init, so for the same keystroke these beat
+                    // the query input's own cursor moves inside the palette.
+                    KeyBinding::new("up", SelectPrev, Some("Palette")),
+                    KeyBinding::new("down", SelectNext, Some("Palette")),
                 ]);
                 cx.on_action(|_: &Quit, cx| {
                     // Best-effort graceful server shutdown before the loop exits;

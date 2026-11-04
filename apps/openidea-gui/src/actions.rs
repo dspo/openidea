@@ -10,6 +10,10 @@ use gpui::actions;
 
 actions!(workbench, [OpenFile, Save, CloseTab, Undo, Redo, Quit, Cancel, GoToFile, SearchEverywhere,]);
 
+// Palette plumbing (⇧⌘O / double-⇧ popup): deliberately not in REGISTRY —
+// these are the list's own keys, not user-invocable commands.
+actions!(palette, [SelectPrev, SelectNext]);
+
 actions!(
     editor,
     [

@@ -45,6 +45,9 @@ ide-language = { path = "../../crates/ide-language" }
 # M3: language servers (rust-analyzer & co.) driven through the same
 # LspManager the Tauri and headless hosts use.
 ide-lsp = { path = "../../crates/ide-lsp" }
+# M3: the project index — Go to File / Search Everywhere's fuzzy file and
+# symbol engine (the same one the Tauri host queries).
+ide-index = { path = "../../crates/ide-index" }
 # The grammar Language values come from ide-language; this must resolve to the
 # same tree-sitter the main workspace pins (0.25.10) so the types unify.
 tree-sitter = "=0.25.10"
@@ -52,6 +55,9 @@ tree-sitter = "=0.25.10"
 streaming-iterator = "0.1"
 # Windows-friendly path canonicalization, the repo-wide convention.
 dunce = "1"
+# The index cache directory follows the platform's cache location, exactly
+# like ide-host (the main workspace pins `dirs = "6"`).
+dirs = "6"
 # bus.rs: the backend → UI event channel (the task pins tokio channels).
 # The sync channels feed the watcher threads; M3 adds the app-owned runtime
 # (rt-multi-thread + time) the LspManager captures and requests spawn onto.
