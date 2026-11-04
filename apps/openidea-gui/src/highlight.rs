@@ -150,8 +150,9 @@ impl Highlighter {
     }
 
     /// Sorted, non-overlapping `(byte range, kind)` spans of the whole text:
-    /// a smaller capture wins over the node containing it, and for the same
-    /// node the later pattern wins.
+    /// a smaller capture wins over the node containing it, for the same node
+    /// the later pattern wins, and the predicate keywords re-mark themselves
+    /// as keywords on top.
     fn spans(&self, tree: &Tree, text: &str) -> Vec<(Range<usize>, Kind)> {
         let mut captures: Vec<(Range<usize>, Kind)> = Vec::new();
         let mut cursor = QueryCursor::new();
@@ -166,6 +167,7 @@ impl Highlighter {
                 }
             }
         }
+        captures.extend(predicate_keyword_spans(tree, text));
         // Painted largest first, then by pattern order (later overwrites), so
         // inner nodes and winning patterns end up visible.
         captures.sort_by_key(|(range, _)| std::cmp::Reverse(range.len()));
@@ -190,6 +192,74 @@ fn resolve(captures: Vec<(Range<usize>, Kind)>, len: usize) -> Vec<(Range<usize>
         }
         if let Some(kind) = v {
             out.push((start..i, kind));
+        }
+    }
+    out
+}
+
+/// Merges two sorted, non-overlapping span lists with `extra` winning where
+/// they overlap (semantic tokens paint over the grammar capture, at any
+/// length). Two paint passes over one byte grid, compacted like [`resolve`]
+/// — only called when a source lands, never per frame.
+pub fn overlay(base: &[(Range<usize>, Kind)], extra: &[(Range<usize>, Kind)], len: usize) -> Vec<(Range<usize>, Kind)> {
+    let mut painted: Vec<Option<Kind>> = vec![None; len];
+    for (range, kind) in base {
+        painted[range.clone()].fill(Some(*kind));
+    }
+    for (range, kind) in extra {
+        painted[range.clone()].fill(Some(*kind));
+    }
+    let mut out: Vec<(Range<usize>, Kind)> = Vec::new();
+    let mut i = 0;
+    while i < len {
+        let start = i;
+        let v = painted[i];
+        while i < len && painted[i] == v {
+            i += 1;
+        }
+        if let Some(kind) = v {
+            out.push((start..i, kind));
+        }
+    }
+    out
+}
+
+/// The Rust keywords the grammar does not (fully) capture for this pane's
+/// query runner: `crate`/`self`/`super` are anonymous tokens no named-node
+/// pattern matches, `mut` rides `mutable_specifier`, and `Self` is a
+/// `type_identifier` the official query separates with a `#eq?` predicate.
+/// A tree walk re-marks all of them as keywords (the M2 leftover).
+const PREDICATE_KEYWORDS: &[&str] = &["crate", "mut", "self", "Self", "super"];
+
+const PREDICATE_KINDS: &[&str] = &["crate", "self", "super", "mutable_specifier", "identifier", "type_identifier"];
+
+/// `(byte range, Keyword)` spans for the keyword-shaped nodes whose text is
+/// one of [`PREDICATE_KEYWORDS`].
+fn predicate_keyword_spans(tree: &Tree, text: &str) -> Vec<(Range<usize>, Kind)> {
+    let mut out = Vec::new();
+    let mut cursor = tree.walk();
+    let mut done = false;
+    while !done {
+        if PREDICATE_KINDS.contains(&cursor.node().kind()) {
+            let range = cursor.node().byte_range();
+            if range.start < range.end && PREDICATE_KEYWORDS.contains(&&text[range.clone()]) {
+                out.push((range, Kind::Keyword));
+            }
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        if cursor.goto_next_sibling() {
+            continue;
+        }
+        loop {
+            if !cursor.goto_parent() {
+                done = true;
+                break;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
     out
@@ -348,5 +418,36 @@ mod tests {
         let mapped = input_edit(&edit);
         assert_eq!(mapped.start_byte, 1);
         assert_eq!(mapped.new_end_position, Point { row: 1, column: 2 });
+    }
+
+    #[test]
+    fn predicate_keywords_paint_as_keywords() {
+        // The five grammar-predicate keywords the plain query misses (M2
+        // leftover). `mut` rides `mutable_specifier`; the identifier-shaped
+        // ones come from the tree walk.
+        let src = "use crate::foo;\nfn f(&mut self) -> Self { super::g() }\n";
+        let got = spans(src);
+        for word in ["crate", "self", "Self", "super", "mut"] {
+            assert_eq!(kind_of(&got, word), Some(Kind::Keyword), "`{word}` must paint as a keyword");
+        }
+        // Regular identifiers stay plain.
+        assert_eq!(kind_of(&got, "foo"), None);
+    }
+
+    #[test]
+    fn overlay_lets_extra_win() {
+        use Kind::{Comment as C, Function as F, Keyword as K};
+        let base = vec![(0..10, C), (10..20, F)];
+        // A shorter extra span carves out of the base; an identical range wins.
+        let got = overlay(&base, &[(12..16, K)], 20);
+        assert_eq!(got, vec![(0..10, C), (10..12, F), (12..16, K), (16..20, F)]);
+        // An extra span wider than the base swallows it.
+        let got = overlay(&base, &[(0..15, K)], 20);
+        assert_eq!(got, vec![(0..15, K), (15..20, F)]);
+        // Disjoint extras append in order.
+        let got = overlay(&base, &[(20..24, K)], 30);
+        assert_eq!(got, vec![(0..10, C), (10..20, F), (20..24, K)]);
+        // Empty extra returns the base.
+        assert_eq!(overlay(&base, &[], 20), base);
     }
 }
