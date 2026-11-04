@@ -9,25 +9,31 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable as _, InteractiveElement, IntoElement,
-    KeyDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled, Window, div, px,
+    KeyDownEvent, Modifiers, MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled,
+    Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::status_bar::StatusBar;
 use gpui_component::tab::{Tab as ComponentTab, TabBar};
 use gpui_component::{Icon, IconName, Selectable as _, Sizable as _};
 use ide_core::event::NotifyLevel;
 use ide_core::event::ServerStatus;
 use ide_core::{Diagnostic, DocId, IdeEvent, ServerId};
+use ide_index::{FileMatch, SymbolFilter, SymbolMatch};
 use ide_vfs::EntryKind;
 
-use crate::actions::{CloseTab, OpenFile, Redo, Save, Undo};
+use crate::actions as acts;
+use crate::actions::{Cancel, CloseTab, GoToFile, OpenFile, Redo, Save, SearchEverywhere, Undo};
 use crate::bus::{Bus, BusMessage};
 use crate::editor::EditorPane;
 use crate::file_tree::{FileTree, Row};
+use crate::fuzzy;
 use crate::host::Host;
 use crate::{strings, theme};
 
@@ -55,6 +61,38 @@ struct ServerRow {
     message: Option<String>,
 }
 
+/// An action row of the palette: the registry entry plus its local fuzzy hit.
+#[derive(Clone)]
+struct RankedAction {
+    name: &'static str,
+    title: &'static str,
+    keys: &'static str,
+    score: i32,
+    indices: Vec<usize>,
+}
+
+/// The ⇧⌘O / double-⇧ palette (M3 phase 6): one list, grouped Files /
+/// Symbols / Actions. Files and symbols come from the project index; actions
+/// are the app's registry table filtered by the in-app fuzzy matcher.
+struct Picker {
+    /// `false` = Go to File (files only); `true` = Search Everywhere.
+    everywhere: bool,
+    input: Entity<InputState>,
+    query: String,
+    files: Vec<FileMatch>,
+    symbols: Vec<SymbolMatch>,
+    actions: Vec<RankedAction>,
+    selected: usize,
+}
+
+/// One selectable palette row (the flat form across the three sections).
+#[derive(Clone)]
+enum PickerRow {
+    File(FileMatch),
+    Symbol(SymbolMatch),
+    Action(RankedAction),
+}
+
 pub struct Workbench {
     host: Option<Arc<Host>>,
     tabs: Vec<Tab>,
@@ -71,6 +109,12 @@ pub struct Workbench {
     /// for the pane's line lookups.
     diagnostics: HashMap<PathBuf, HashMap<String, Vec<Diagnostic>>>,
     bus: Bus,
+    /// The open Go to File / Search Everywhere palette, if any.
+    picker: Option<Picker>,
+    /// The input's Change / PressEnter subscription, alive while the picker is.
+    picker_sub: Option<gpui::Subscription>,
+    /// The last bare ⇧ press, for the double-⇧ Search Everywhere gesture.
+    last_shift: Cell<Option<Instant>>,
 }
 
 impl Workbench {
@@ -92,6 +136,9 @@ impl Workbench {
             servers: Vec::new(),
             diagnostics: HashMap::new(),
             bus,
+            picker: None,
+            picker_sub: None,
+            last_shift: Cell::new(None),
         }
     }
 
@@ -162,6 +209,180 @@ impl Workbench {
         }
     }
 
+    // -- Go to File / Search Everywhere (M3 phase 6) -----------------------
+    //
+    // ⇧⌘O opens the palette in files-only mode; double ⇧ opens it over
+    // files + symbols + actions. The input keeps the focus; ↑/↓ move the
+    // selection through the flat row list (bindings in the "Palette" context
+    // beat the input's own cursor moves, being registered later), Enter
+    // accepts, Esc closes and focus returns to the editor.
+
+    fn on_go_to_file(&mut self, _: &GoToFile, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_picker(false, window, cx);
+    }
+
+    fn on_search_everywhere(&mut self, _: &SearchEverywhere, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_picker(true, window, cx);
+    }
+
+    /// Bare-⇧ taps, two within a short window, open Search Everywhere. The
+    /// action binding in `main.rs` (`"shift shift"`) may or may not fire
+    /// first depending on how the platform routes modifier-only keystrokes;
+    /// whichever path fires, `open_picker` is idempotent.
+    fn on_raw_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        let bare_shift = ks.key == "shift"
+            && ks.modifiers == Modifiers { control: false, alt: false, shift: true, platform: false, function: false };
+        if !bare_shift {
+            self.last_shift.set(None);
+            return;
+        }
+        let now = Instant::now();
+        let again =
+            self.last_shift.replace(Some(now)).is_some_and(|at| now.duration_since(at) < Duration::from_millis(600));
+        if again {
+            self.last_shift.set(None);
+            self.open_picker(true, window, cx);
+        }
+    }
+
+    fn open_picker(&mut self, everywhere: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() {
+            return;
+        }
+        let placeholder =
+            if everywhere { strings::PICKER_EVERYWHERE_PLACEHOLDER } else { strings::PICKER_FILE_PLACEHOLDER };
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        window.focus(&input.read(cx).presentation().focus_handle().clone(), cx);
+        self.picker = Some(Picker {
+            everywhere,
+            input: input.clone(),
+            query: String::new(),
+            files: Vec::new(),
+            symbols: Vec::new(),
+            actions: Vec::new(),
+            selected: 0,
+        });
+        self.picker_sub =
+            Some(cx.subscribe_in(&input, window, |this, input, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => this.picker_query_changed(input, window, cx),
+                InputEvent::PressEnter { .. } => this.picker_accept(window, cx),
+                _ => {}
+            }));
+        self.refresh_picker(cx);
+    }
+
+    fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.take().is_none() {
+            return;
+        }
+        self.picker_sub.take();
+        // Focus goes back to where editing happens (the tree when none).
+        if self.active.is_some() {
+            self.focus_active(window, cx);
+        } else {
+            window.focus(&self.tree_focus, cx);
+        }
+        cx.notify();
+    }
+
+    fn picker_query_changed(&mut self, input: &Entity<InputState>, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(picker) = &mut self.picker {
+            picker.query = input.read(cx).value().to_string();
+            self.refresh_picker(cx);
+        }
+    }
+
+    /// Re-runs the palette's queries against the index and the action
+    /// registry. The index answers from whatever is indexed so far and is
+    /// fast at fixture scale, so this runs on the UI thread (moving it behind
+    /// a request channel is an M4 seam).
+    fn refresh_picker(&mut self, cx: &mut Context<Self>) {
+        let Some(picker) = &mut self.picker else { return };
+        let query = picker.query.trim().to_string();
+        let Some(host) = self.host.clone() else { return };
+        picker.files = if query.is_empty() {
+            host.index
+                .recent_files()
+                .into_iter()
+                .take(8)
+                .map(|path| FileMatch {
+                    rel_path: path.strip_prefix(&host.root).unwrap_or(&path).display().to_string(),
+                    path: ide_core::IpcPath(path),
+                    score: 0,
+                    indices: Vec::new(),
+                })
+                .collect()
+        } else {
+            host.index.find_files(&query, 12)
+        };
+        if picker.everywhere {
+            picker.symbols =
+                if query.is_empty() { Vec::new() } else { host.index.find_symbols(&query, SymbolFilter::All, 8) };
+            picker.actions = ranked_actions(&query);
+        }
+        picker.selected = 0;
+        cx.notify();
+    }
+
+    /// The flat selectable rows: files, then symbols, then actions.
+    fn picker_rows(&self) -> Vec<PickerRow> {
+        let Some(picker) = &self.picker else { return Vec::new() };
+        picker
+            .files
+            .iter()
+            .cloned()
+            .map(PickerRow::File)
+            .chain(picker.symbols.iter().cloned().map(PickerRow::Symbol))
+            .chain(picker.actions.iter().cloned().map(PickerRow::Action))
+            .collect()
+    }
+
+    fn picker_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.picker_rows().len();
+        if count == 0 {
+            return;
+        }
+        if let Some(picker) = &mut self.picker {
+            picker.selected = (picker.selected as isize + delta).clamp(0, count as isize - 1) as usize;
+            cx.notify();
+        }
+    }
+
+    fn picker_accept(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let selected = self.picker.as_ref().map_or(0, |picker| picker.selected);
+        let Some(row) = self.picker_rows().get(selected).cloned() else { return };
+        match row {
+            PickerRow::File(file) => {
+                let path = file.path.0;
+                self.close_picker(window, cx);
+                self.open_path(&path, cx);
+                self.focus_active(window, cx);
+            }
+            PickerRow::Symbol(symbol) => {
+                let (path, pos) = (symbol.path.0, symbol.range.start);
+                self.close_picker(window, cx);
+                self.open_path(&path, cx);
+                if let Some(tab) = self.tabs.iter().find(|tab| tab.path == path) {
+                    tab.pane.update(cx, |pane, cx| pane.jump_to_offset(pos, cx));
+                }
+                self.focus_active(window, cx);
+            }
+            PickerRow::Action(action) => {
+                // Close first so the dispatch lands on the restored focus
+                // (dispatch_action is deferred to after this update).
+                self.close_picker(window, cx);
+                match cx.build_action(action.name, None) {
+                    Ok(action) => window.dispatch_action(action, cx),
+                    Err(e) => {
+                        self.message = Some((NotifyLevel::Error, format!("{} cannot run: {}", action.title, e)));
+                        cx.notify();
+                    }
+                }
+            }
+        }
+    }
+
     // -- tab plumbing -----------------------------------------------------
 
     fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -228,6 +449,11 @@ impl Workbench {
         let path = path.to_path_buf();
         self.tabs.push(Tab { path: path.clone(), doc: doc_id, pane: pane.clone(), dirty: false, stale: false });
         self.active = Some(self.tabs.len() - 1);
+        // Every open feeds the index's recency (the empty palette query lists
+        // recent files).
+        if let Some(host) = &self.host {
+            host.index.mark_recent(&path);
+        }
         self.tree.select(path);
         cx.notify();
     }
@@ -401,6 +627,71 @@ fn file_name(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
 }
 
+/// The registry filtered and ranked by the local fuzzy matcher (empty query =
+/// every action, registry order).
+fn ranked_actions(query: &str) -> Vec<RankedAction> {
+    let mut out: Vec<RankedAction> = crate::actions::REGISTRY
+        .iter()
+        .filter_map(|row| {
+            let hit = fuzzy::match_text(row.title, query)?;
+            Some(RankedAction {
+                name: row.name,
+                title: row.title,
+                keys: row.keys,
+                score: hit.score,
+                indices: hit.indices,
+            })
+        })
+        .collect();
+    // Stable: equal scores keep registry order.
+    out.sort_by_key(|action| std::cmp::Reverse(action.score));
+    out
+}
+
+/// Text with the matched chars accented (char-index runs).
+fn highlighted(text: &str, indices: &[usize]) -> gpui::AnyElement {
+    let mut runs: Vec<(String, bool)> = Vec::new();
+    for (i, c) in text.chars().enumerate() {
+        let matched = indices.contains(&i);
+        match runs.last_mut() {
+            Some((run, run_matched)) if *run_matched == matched => run.push(c),
+            _ => runs.push((c.to_string(), matched)),
+        }
+    }
+    let mut row = div().flex().min_w_0();
+    for (run, matched) in runs {
+        let span =
+            if matched { div().text_color(theme::accent()).font_weight(gpui::FontWeight::MEDIUM) } else { div() };
+        row = row.child(span.child(SharedString::from(run)));
+    }
+    row.into_any_element()
+}
+
+fn section_header(title: &str) -> gpui::Div {
+    div().px_2().pt_1().text_size(px(10.)).text_color(theme::fg_muted()).child(SharedString::from(title.to_owned()))
+}
+
+fn row_shell(content: gpui::AnyElement, secondary: Option<String>) -> gpui::Div {
+    let mut row = div().h(px(24.0)).px_2().flex().items_center().gap_2().text_size(px(12.)).child(content);
+    if let Some(secondary) = secondary {
+        row = row.child(
+            div()
+                .flex_1()
+                .truncate()
+                .text_color(theme::fg_muted())
+                .text_size(px(11.))
+                .child(SharedString::from(secondary)),
+        );
+    } else {
+        row = row.child(div().flex_1());
+    }
+    row
+}
+
+fn symbol_kind_label(kind: ide_core::SymbolKind) -> String {
+    format!("{kind:?}").to_lowercase()
+}
+
 impl Render for Workbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Seed the initial focus once (a view render cannot focus earlier):
@@ -414,6 +705,7 @@ impl Render for Workbench {
         }
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(theme::app_bg())
@@ -423,6 +715,10 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_redo))
+            .on_action(cx.listener(Self::on_go_to_file))
+            .on_action(cx.listener(Self::on_search_everywhere))
+            // Double ⇧ (the raw fallback for the gesture; see on_raw_key).
+            .on_key_down(cx.listener(Self::on_raw_key))
             .child(
                 div()
                     .flex_1()
@@ -433,6 +729,7 @@ impl Render for Workbench {
                     .child(self.render_editor_area(cx)),
             )
             .child(self.render_status())
+            .children(self.render_picker(cx))
     }
 }
 
@@ -609,6 +906,121 @@ impl Workbench {
             right = right.child(div().max_w_96().truncate().text_color(color).child(SharedString::from(text)));
         }
         StatusBar::new().left(left).right(right)
+    }
+}
+
+// -- Go to File / Search Everywhere palette -------------------------------------
+
+impl Workbench {
+    /// The floating palette over the workbench: query input on top, grouped
+    /// results below. Clicking outside closes it; clicks inside don't.
+    fn render_picker(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let picker = self.picker.as_ref()?;
+        let selected = picker.selected;
+        let rows = self.picker_rows();
+        let bounds = [
+            ("Files", 0..picker.files.len()),
+            ("Symbols", picker.files.len()..picker.files.len() + picker.symbols.len()),
+            ("Actions", picker.files.len() + picker.symbols.len()..rows.len()),
+        ];
+        let mut list = div().id("picker-list").max_h(px(420.0)).overflow_y_scroll().py_1();
+        if rows.is_empty() {
+            list = list.child(
+                div()
+                    .px_2()
+                    .py_2()
+                    .text_size(px(12.))
+                    .text_color(theme::fg_muted())
+                    .child(SharedString::from(strings::PICKER_NO_MATCHES)),
+            );
+        }
+        for (section, range) in bounds {
+            if range.is_empty() {
+                continue;
+            }
+            list = list.child(section_header(section));
+            for index in range {
+                list = list.child(self.render_picker_row(&rows[index], index, index == selected, cx));
+            }
+        }
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close_picker(window, cx)))
+                .child(
+                    div()
+                        .mt(px(56.0))
+                        .w(px(620.0))
+                        .max_h(px(520.0))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(theme::border())
+                        .bg(theme::raised_bg())
+                        .key_context("Palette")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            |_: &gpui::MouseDownEvent, _: &mut Window, cx: &mut gpui::App| cx.stop_propagation(),
+                        )
+                        .on_action(cx.listener(|this, _: &acts::SelectPrev, _, cx| this.picker_move(-1, cx)))
+                        .on_action(cx.listener(|this, _: &acts::SelectNext, _, cx| this.picker_move(1, cx)))
+                        .on_action(cx.listener(|this, _: &Cancel, window, cx| this.close_picker(window, cx)))
+                        .child(div().px_2().py_1().child(Input::new(&picker.input)))
+                        .child(div().h(px(1.0)).w_full().bg(theme::border()))
+                        .child(list),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_picker_row(
+        &self,
+        row: &PickerRow,
+        index: usize,
+        is_selected: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let (content, secondary) = match row {
+            PickerRow::File(file) => {
+                let indices: Vec<usize> = file.indices.iter().map(|&i| i as usize).collect();
+                (highlighted(&file.rel_path, &indices), None)
+            }
+            PickerRow::Symbol(symbol) => {
+                let indices: Vec<usize> = symbol.indices.iter().map(|&i| i as usize).collect();
+                let secondary = match (&symbol.container, symbol.rel_path.as_str()) {
+                    (Some(container), rel) => format!("{container} · {rel}"),
+                    (None, rel) => rel.to_owned(),
+                };
+                let content = div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_color(theme::fg_muted())
+                            .text_size(px(10.))
+                            .child(SharedString::from(symbol_kind_label(symbol.kind))),
+                    )
+                    .child(highlighted(&symbol.name, &indices));
+                (content.into_any_element(), Some(secondary))
+            }
+            PickerRow::Action(action) => (highlighted(action.title, &action.indices), Some(action.keys.to_owned())),
+        };
+        row_shell(content, secondary)
+            .id(("picker-row", index))
+            .when(is_selected, |row| row.bg(theme::selected_bg()))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                if let Some(picker) = &mut this.picker {
+                    picker.selected = index;
+                }
+                this.picker_accept(window, cx);
+            }))
+            .into_any_element()
     }
 }
 

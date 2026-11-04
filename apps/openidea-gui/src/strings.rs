@@ -18,3 +18,7 @@ pub const LS_READY: &str = "ready";
 pub const LS_STARTING: &str = "starting…";
 pub const LS_DOWN: &str = "down";
 pub const LS_STOPPED: &str = "stopped";
+// Go to File / Search Everywhere palette.
+pub const PICKER_FILE_PLACEHOLDER: &str = "Go to file (empty lists recent files)";
+pub const PICKER_EVERYWHERE_PLACEHOLDER: &str = "Search files, symbols and actions";
+pub const PICKER_NO_MATCHES: &str = "No matches";
