@@ -54,6 +54,9 @@ pub struct Host {
     /// Display name (the folder's own name).
     pub name: String,
     documents: Arc<Documents>,
+    /// The bus sink, for UI-originated notifications from the editor (a
+    /// failed navigation surfaces as a status-bar message).
+    pub sink: SharedSink,
     /// Language servers (M3): started per document language, observed below.
     pub lsp: Arc<LspManager>,
     /// The app-owned tokio runtime's handle: LSP feature requests
@@ -98,7 +101,7 @@ impl Host {
             Watcher::start(
                 &root,
                 excludes(),
-                sink,
+                sink.clone(),
                 Box::new(move |batch| {
                     // External changes reach open documents through the same
                     // door ide-host uses: clean buffers reload (the UI learns
@@ -109,7 +112,7 @@ impl Host {
             )?
         };
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        Ok(Self { root, name, documents, lsp, runtime, _watcher: watcher })
+        Ok(Self { root, name, documents, sink, lsp, runtime, _watcher: watcher })
     }
 
     /// Lists `dir` (VFS entries with ignore flags applied).
@@ -147,6 +150,12 @@ impl Host {
     /// (servers see `didClose` through the observer).
     pub fn close_document(&self, doc: DocId) {
         self.documents.close(doc)
+    }
+
+    /// Applies a server-produced workspace edit (rename) through Documents:
+    /// open tabs reconcile via `DocPatched { workspace_edit: true }`.
+    pub fn apply_workspace_edit(&self, edit: &ide_core::WorkspaceEdit) -> IdeResult<()> {
+        self.documents.apply_workspace_edit(edit)
     }
 
     /// Best-effort graceful server shutdown (`shutdown` request + `exit`),

@@ -20,19 +20,25 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
+use gpui::AppContext as _;
 use gpui::{
     App, Bounds, Element, ElementId, Entity, FocusHandle, Focusable, GlobalElementId, InputHandler, InspectorElementId,
     InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Point, Render, ScrollWheelEvent, ShapedLine, SharedString, Styled, TextAlign, TextRun,
     UTF16Selection, UnderlineStyle, Window, fill, point, px, relative, rgba, size,
 };
-use ide_core::IdeResult;
-use ide_core::{CancellationToken, ChangeSet, Diagnostic, DocId, Pos, Severity, TextChange};
-use ide_lsp::types::{CompletionItem, CompletionKind, CompletionList};
+use gpui_component::button::ButtonVariants as _;
+use gpui_component::input::{Input, InputState};
+use ide_core::{
+    CancellationToken, ChangeSet, Diagnostic, DocId, IdeResult, Location, Pos, Severity, TextChange, WorkspaceEdit,
+};
+use ide_lsp::LspManager;
+use ide_lsp::types::{CompletionItem, CompletionKind, CompletionList, GotoKind, Renamed};
 use ide_workspace::DocumentInfo;
 use tree_sitter::Tree;
 
 use crate::actions as acts;
+use crate::bus::{Bus, BusMessage};
 use crate::highlight::{Highlighter, Kind, ParseResult, input_edit};
 use crate::host::Host;
 use crate::theme;
@@ -127,7 +133,7 @@ enum Drag {
 }
 
 /// Motions the keymap maps onto. Word/line variants are chosen by modifier.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Motion {
     Left,
     Right,
@@ -142,7 +148,7 @@ enum Motion {
 }
 
 /// The editor commands the action handlers ask for.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Command {
     Move(Motion, bool),
     Delete { forward: bool, word: bool },
@@ -329,6 +335,13 @@ struct HoverDiag {
     line: u32,
 }
 
+/// The rename flow: an input overlay prefilled with the current name, then
+/// the server's workspace edit shown for confirmation before it applies.
+enum RenameFlow {
+    Input { input: gpui::Entity<InputState> },
+    Preview { edit: WorkspaceEdit, name: String },
+}
+
 /// The open completion popup: the server's items for the request, the
 /// buffer offset the typed word began at (the client-side filter and the
 /// default replace base), and the selection into the filtered view.
@@ -445,6 +458,8 @@ impl Hud {
 pub struct EditorPane {
     host: Arc<Host>,
     doc_id: DocId,
+    /// The document's path (same-file jumps stay in the pane).
+    path: std::path::PathBuf,
     buf: Buffer,
     focus: FocusHandle,
     geometry: Cell<Option<Geometry>>,
@@ -488,6 +503,11 @@ pub struct EditorPane {
     completion: Option<CompletionPopup>,
     completion_gen: u32,
     completion_cancel: Option<CancellationToken>,
+    // Navigation (M3 phase 5): a jump list of locations (definitions,
+    // usages) and the rename flow, if one is under way.
+    jump: Option<(Vec<Location>, usize)>,
+    rename: Option<RenameFlow>,
+    bus: Bus,
     /// F12 perf overlay counters (phase 7).
     hud: Hud,
     /// When the pane was created; the first paint logs the open latency.
@@ -502,11 +522,12 @@ impl Focusable for EditorPane {
 }
 
 impl EditorPane {
-    pub fn new(host: Arc<Host>, info: DocumentInfo, cx: &mut gpui::Context<Self>) -> Self {
+    pub fn new(host: Arc<Host>, bus: Bus, info: DocumentInfo, cx: &mut gpui::Context<Self>) -> Self {
         let language = info.language.clone();
         let mut pane = Self {
             host,
             doc_id: info.id,
+            path: info.path.0.clone(),
             buf: Buffer::new(&info.text),
             focus: cx.focus_handle(),
             geometry: Cell::new(None),
@@ -534,6 +555,9 @@ impl EditorPane {
             completion: None,
             completion_gen: 0,
             completion_cancel: None,
+            jump: None,
+            rename: None,
+            bus,
             hud: Hud::default(),
             created_at: std::time::Instant::now(),
             first_paint_done: Cell::new(false),
@@ -947,6 +971,234 @@ impl EditorPane {
         }
     }
 
+    // -- navigation & rename (M3 phase 5) --------------------------------------
+    //
+    // ⌘B / ⌘-click ask the server for definitions, ⌥F7 for project-wide
+    // references: one location jumps directly, several open the jump list,
+    // none surfaces a status message. ⇧F6 runs prepareRename → a small input
+    // overlay → textDocument/rename → the workspace edit preview with
+    // Apply/Cancel (apply goes through Documents, so open tabs receive the
+    // patch as DocPatched { workspace_edit }).
+
+    /// The action face: every request follows the same spawn → oneshot →
+    /// entity-update shape as completion.
+    pub fn goto_definition(&mut self, cx: &mut gpui::Context<Self>) {
+        self.request_locations(
+            "definition",
+            |lsp, doc, pos, _cancel| Box::pin(async move { lsp.goto(doc, pos, GotoKind::Definition).await }),
+            cx,
+        );
+    }
+
+    pub fn find_usages(&mut self, cx: &mut gpui::Context<Self>) {
+        self.request_locations(
+            "references",
+            |lsp, doc, pos, cancel| {
+                Box::pin(async move { lsp.references(doc, pos, true, true, cancel).await.map(|r| r.locations) })
+            },
+            cx,
+        );
+    }
+
+    fn request_locations(
+        &mut self,
+        feature: &'static str,
+        call: impl Fn(
+            Arc<LspManager>,
+            DocId,
+            Pos,
+            CancellationToken,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = IdeResult<Vec<Location>>> + Send>>
+        + Send
+        + 'static,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.jump = None;
+        self.close_completion(cx);
+        let cancel = CancellationToken::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let lsp = self.host.lsp.clone();
+        let doc = self.doc_id;
+        let pos = self.caret_pos();
+        self.host.runtime.spawn(async move {
+            let result = call(lsp, doc, pos, cancel).await;
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.await {
+                this.update(cx, |pane, cx| pane.locations_ready(feature, result, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Lands a locations answer: jump straight away when there is one,
+    /// otherwise open the jump list, otherwise say nothing was found.
+    fn locations_ready(
+        &mut self,
+        feature: &'static str,
+        result: IdeResult<Vec<Location>>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        match result {
+            Ok(locations) if locations.len() == 1 => {
+                let only = locations.into_iter().next().expect("checked above");
+                self.jump_to(&only, cx);
+            }
+            Ok(locations) if !locations.is_empty() => {
+                self.jump = Some((locations, 0));
+                cx.notify();
+            }
+            _ => {
+                self.host.sink.emit(ide_core::IdeEvent::Notify {
+                    level: ide_core::event::NotifyLevel::Warning,
+                    title: format!("No {feature} found"),
+                    body: None,
+                });
+            }
+        }
+    }
+
+    /// Jumps to a location: within this file the caret moves; across files
+    /// the workbench opens (or activates) the tab and places the caret.
+    fn jump_to(&mut self, location: &Location, cx: &mut gpui::Context<Self>) {
+        let path: std::path::PathBuf = location.path.0.clone();
+        self.jump = None;
+        let start = location.range.start;
+        if path == self.path {
+            self.jump_to_offset(Pos::new(start.line, start.col), cx);
+        } else {
+            self.bus.send(BusMessage::OpenLocation { path, pos: Pos::new(start.line, start.col) });
+        }
+        cx.notify();
+    }
+
+    /// Places the primary caret at an IDE position and scrolls it into view.
+    pub fn jump_to_offset(&mut self, pos: Pos, cx: &mut gpui::Context<Self>) {
+        let offset = (self.buf.line_start(pos.line) + pos.col as usize).min(self.buf.utf16_len());
+        self.selections = vec![Selection::caret(offset)];
+        self.clamp_scroll_to_primary();
+        cx.notify();
+    }
+
+    /// ⇧F6: the identifier around the caret opens the input overlay
+    /// immediately (locally computed range — what prepareRename returns for
+    /// well-formed sources anyway; its server round trip is an M4 refinement).
+    pub fn start_rename(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        self.close_completion(cx);
+        self.jump = None;
+        if self.rename.is_some() {
+            return;
+        }
+        let caret = self.selections.first().map_or(0, |s| s.head);
+        let mut start = caret.min(self.buf.utf16_len());
+        while start > 0 {
+            let prev = self.buf.prev_boundary(start);
+            if !(self.buf.char_of(prev).is_alphanumeric() || self.buf.char_of(prev) == '_') {
+                break;
+            }
+            start = prev;
+        }
+        let mut end = caret;
+        let len = self.buf.utf16_len();
+        while end < len {
+            let next = self.buf.next_boundary(end);
+            if next == end || !(self.buf.char_of(next).is_alphanumeric() || self.buf.char_of(next) == '_') {
+                break;
+            }
+            end = next;
+        }
+        if start == end {
+            self.host.sink.emit(ide_core::IdeEvent::Notify {
+                level: ide_core::event::NotifyLevel::Warning,
+                title: "Place the caret on an identifier to rename".into(),
+                body: None,
+            });
+            return;
+        }
+        let current = self.buf.slice_utf16(start..end);
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("new name"));
+        input.update(cx, |state, cx| state.set_value(current.clone(), window, cx));
+        self.rename = Some(RenameFlow::Input { input });
+        cx.notify();
+    }
+
+    /// Enter on the input: asks the server for the workspace edit and shows
+    /// the preview (Apply / Cancel).
+    fn rename_confirm(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(RenameFlow::Input { input, .. }) = &self.rename else { return };
+        let new_name = input.read(cx).value().to_string();
+        if new_name.is_empty() {
+            return;
+        }
+        let caret = self.selections.first().map_or(0, |s| s.head);
+        let pos = {
+            let line = self.buf.line_of(caret);
+            Pos::new(line, (caret - self.buf.line_start(line)) as u32)
+        };
+        let cancel = CancellationToken::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let lsp = self.host.lsp.clone();
+        let doc = self.doc_id;
+        self.host.runtime.spawn(async move {
+            let result = lsp.rename(doc, pos, new_name.clone(), cancel).await;
+            let _ = tx.send((result, new_name));
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok((result, name)) = rx.await {
+                this.update(cx, |pane, cx| pane.rename_preview(result, name, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Lands the rename answer and switches to the preview stage.
+    fn rename_preview(&mut self, result: IdeResult<Renamed>, name: String, cx: &mut gpui::Context<Self>) {
+        match result {
+            Ok(renamed) if !renamed.edit.files.is_empty() => {
+                self.rename = Some(RenameFlow::Preview { edit: renamed.edit, name });
+            }
+            Ok(_) => {
+                self.rename = None;
+                self.host.sink.emit(ide_core::IdeEvent::Notify {
+                    level: ide_core::event::NotifyLevel::Warning,
+                    title: "Rename produced no edits".into(),
+                    body: None,
+                });
+            }
+            Err(e) => {
+                self.rename = None;
+                self.host.sink.emit(ide_core::IdeEvent::Notify {
+                    level: ide_core::event::NotifyLevel::Error,
+                    title: format!("Rename failed: {}", e.message),
+                    body: None,
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Apply on the preview: Documents lands the edit atomically.
+    fn rename_apply(&mut self, cx: &mut gpui::Context<Self>) {
+        if let Some(RenameFlow::Preview { edit, .. }) = &self.rename {
+            let result = self.host.apply_workspace_edit(edit);
+            self.rename = None;
+            if let Err(e) = result {
+                self.host.sink.emit(ide_core::IdeEvent::Notify {
+                    level: ide_core::event::NotifyLevel::Error,
+                    title: format!("Rename failed: {}", e.message),
+                    body: None,
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    fn rename_cancel_flow(&mut self, cx: &mut gpui::Context<Self>) {
+        self.rename = None;
+        cx.notify();
+    }
+
     // -- completion (M3 phase 4) ---------------------------------------------
     //
     // Typing schedules a debounced LSP request (immediately for a server
@@ -1081,6 +1333,24 @@ impl EditorPane {
                 (caret >= open.replace_start).then(|| self.buf.slice_utf16(open.replace_start..caret))
             })
             .unwrap_or_default()
+    }
+
+    fn jump_move(&mut self, delta: isize, cx: &mut gpui::Context<Self>) {
+        if let Some((locations, selected)) = &mut self.jump {
+            *selected = ((*selected as isize + delta).rem_euclid(locations.len().max(1) as isize)) as usize;
+            cx.notify();
+        }
+    }
+
+    fn jump_accept(&mut self, cx: &mut gpui::Context<Self>) {
+        if let Some((locations, selected)) = self.jump.clone()
+            && let Some(location) = locations.get(selected)
+        {
+            self.jump_to(location, cx);
+            return;
+        }
+        self.jump = None;
+        cx.notify();
     }
 
     fn completion_move(&mut self, delta: isize, cx: &mut gpui::Context<Self>) {
@@ -1249,6 +1519,57 @@ impl EditorPane {
         if self.buf.marked.is_some() {
             return;
         }
+        // The rename input is modal: Enter confirms, Esc cancels; typing goes
+        // through the input's own handler (it holds focus via render).
+        if matches!(self.rename, Some(RenameFlow::Input { .. })) {
+            match cmd {
+                Command::Newline => {
+                    self.rename_confirm(cx);
+                    return;
+                }
+                Command::Cancel => {
+                    self.rename_cancel_flow(cx);
+                    return;
+                }
+                Command::Move(..) | Command::Delete { .. } | Command::ToggleHud => return,
+            }
+        }
+        if matches!(self.rename, Some(RenameFlow::Preview { .. })) {
+            match cmd {
+                Command::Cancel => {
+                    self.rename_cancel_flow(cx);
+                    return;
+                }
+                Command::Newline => {
+                    self.rename_apply(cx);
+                    return;
+                }
+                _ => return,
+            }
+        }
+        // The jump list owns navigation and confirm like the completion popup.
+        if self.jump.is_some() {
+            match cmd {
+                Command::Move(Motion::Up, false) => {
+                    self.jump_move(-1, cx);
+                    return;
+                }
+                Command::Move(Motion::Down, false) => {
+                    self.jump_move(1, cx);
+                    return;
+                }
+                Command::Newline => {
+                    self.jump_accept(cx);
+                    return;
+                }
+                Command::Cancel => {
+                    self.jump = None;
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
+        }
         // While the completion popup is open it owns navigation, accept and
         // cancel; every other command (typing continues through the raw key
         // path) re-filters through schedule_completion.
@@ -1354,26 +1675,19 @@ impl EditorPane {
             return;
         }
         if ev.modifiers.alt {
-            // ⌥-drag: column selection.
+            // ⌥ starts a column drag (the selections form once it moves);
+            // a bare ⌥-click (released without moving) toggles a cursor at
+            // the point — M2's click-add-cursor, displaced from ⌘ because
+            // ⌘-click is go-to-definition in M3 (IntelliJ's macOS mapping).
             self.drag.set(Some(Drag::Columnar { from: ev.position }));
-            self.selections = self.columnar_selections(window, &geometry, ev.position, ev.position);
-            cx.notify();
             return;
         }
         let offset = self.offset_at(window, &geometry, ev.position);
         if ev.modifiers.platform && !ev.modifiers.shift {
-            // ⌘-click toggles a cursor at the point.
-            let mut selections = self.selections.clone();
-            if let Some(at) = selections.iter().position(|s| s.is_empty() && s.head == offset) {
-                if selections.len() > 1 {
-                    selections.remove(at);
-                }
-            } else {
-                selections.push(Selection::caret(offset));
-                selections = normalize_selections(selections);
-            }
-            self.selections = selections;
-            cx.notify();
+            // ⌘-click: go to the definition under the point (⌥-click keeps
+            // M2's click-add-cursor; ⌥-drag still makes a column selection).
+            self.selections = vec![Selection::caret(offset)];
+            self.goto_definition(cx);
             return;
         }
         if ev.modifiers.shift {
@@ -1424,7 +1738,25 @@ impl EditorPane {
         }
     }
 
-    fn on_mouse_up(&mut self, _ev: &MouseUpEvent, _window: &mut Window, _cx: &mut gpui::Context<Self>) {
+    fn on_mouse_up(&mut self, ev: &MouseUpEvent, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        if let Some(Drag::Columnar { from }) = self.drag.get()
+            && ev.position == from
+            && let Some(geometry) = self.geometry.get()
+        {
+            // Bare ⌥-click: toggle a cursor at the point (M2 behaviour).
+            let offset = self.offset_at(window, &geometry, ev.position);
+            let mut selections = self.selections.clone();
+            if let Some(at) = selections.iter().position(|s| s.is_empty() && s.head == offset) {
+                if selections.len() > 1 {
+                    selections.remove(at);
+                }
+            } else {
+                selections.push(Selection::caret(offset));
+                selections = normalize_selections(selections);
+            }
+            self.selections = selections;
+            cx.notify();
+        }
         self.drag.set(None);
     }
 
@@ -1745,12 +2077,163 @@ impl Render for EditorPane {
             .children(self.render_hover_tooltip(cx))
             // Completion popup: the filtered item list at the caret.
             .children(self.render_completion_popup(window, cx))
+            // Jump list: definitions / usages across files.
+            .children(self.render_jump_list(cx))
+            // Rename: input overlay, then the workspace-edit preview.
+            .children(self.render_rename(window, cx))
+            .on_action(cx.listener(|this, _: &acts::GotoDefinition, _, cx| this.goto_definition(cx)))
+            .on_action(cx.listener(|this, _: &acts::FindUsages, _, cx| this.find_usages(cx)))
+            .on_action(cx.listener(|this, _: &acts::Rename, window, cx| this.start_rename(window, cx)))
             // Navigation/refactoring handlers arrive in later M3 phases.
             .child(EditorElement { view: cx.entity() })
     }
 }
 
 impl EditorPane {
+    /// The jump list (definitions / usages): `rel_path:line` rows from the
+    /// last frame's geometry, centered like a command palette.
+    fn render_jump_list(&self, _cx: &mut gpui::Context<Self>) -> Option<gpui::AnyElement> {
+        let (locations, selected) = self.jump.as_ref()?;
+        let geometry = self.geometry.get()?;
+        let x = geometry.origin.x + px(80.0);
+        let y = geometry.origin.y + px(40.0);
+        let mut list = gpui::div().flex().flex_col();
+        for (index, location) in locations.iter().enumerate().take(14) {
+            let is_selected = index == *selected;
+            let rel = location.path.0.strip_prefix(&self.host.root).unwrap_or(location.path.0.as_path());
+            let mut row = gpui::div().flex().items_center().gap_2().px_2().h(px(22.0)).text_size(px(12.)).child(
+                gpui::div().text_color(theme::accent()).child(SharedString::from(format!(
+                    "{}:{}",
+                    rel.display(),
+                    location.range.start.line + 1
+                ))),
+            );
+            if is_selected {
+                row = row.bg(theme::selected_bg());
+            }
+            list = list.child(row);
+        }
+        Some(
+            gpui::div()
+                .absolute()
+                .left(x)
+                .top(y)
+                .w(px(460.0))
+                .border_1()
+                .border_color(theme::border())
+                .bg(theme::raised_bg())
+                .py_1()
+                .child(list)
+                .into_any_element(),
+        )
+    }
+
+    /// The rename overlays: an input box over the caret (Input) or a
+    /// workspace-edit preview with Apply / Cancel (Preview).
+    fn render_rename(&self, window: &mut Window, cx: &mut gpui::Context<Self>) -> Option<gpui::AnyElement> {
+        let geometry = self.geometry.get()?;
+        match &self.rename {
+            Some(RenameFlow::Input { input, .. }) => {
+                // The input keeps focus while the overlay is up.
+                let handle = input.read(cx).presentation().focus_handle().clone();
+                if window.focused(cx).is_none_or(|f| f != handle) {
+                    window.focus(&handle, cx);
+                }
+                Some(
+                    gpui::div()
+                        .absolute()
+                        .left(geometry.origin.x + px(80.0))
+                        .top(geometry.origin.y + px(60.0))
+                        .w(px(320.0))
+                        .border_1()
+                        .border_color(theme::accent())
+                        .bg(theme::raised_bg())
+                        .p_2()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            gpui::div()
+                                .text_size(px(11.))
+                                .text_color(theme::fg_muted())
+                                .child("Rename — Enter to continue, Esc to cancel"),
+                        )
+                        .child(Input::new(input))
+                        .into_any_element(),
+                )
+            }
+            Some(RenameFlow::Preview { edit, name }) => {
+                let mut rows = gpui::div().flex().flex_col().gap_1();
+                let apply_edit = edit.clone();
+                let apply_name = name.clone();
+                let apply = cx.listener(move |this, _, _, cx| {
+                    this.rename = Some(RenameFlow::Preview { edit: apply_edit.clone(), name: apply_name.clone() });
+                    this.rename_apply(cx);
+                });
+                let cancel = cx.listener(|this, _, _, cx| this.rename_cancel_flow(cx));
+                let mut total = 0usize;
+                for file in &edit.files {
+                    if let ide_core::FileEdit::Edit { path, edits, .. } = file {
+                        total += edits.len();
+                        let rel = path.0.strip_prefix(&self.host.root).unwrap_or(path.0.as_path());
+                        rows = rows.child(
+                            gpui::div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_size(px(12.))
+                                .child(
+                                    gpui::div()
+                                        .text_color(theme::fg())
+                                        .child(SharedString::from(rel.display().to_string())),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .text_color(theme::fg_muted())
+                                        .child(SharedString::from(format!("{} edits", edits.len()))),
+                                ),
+                        );
+                    }
+                }
+                Some(
+                    gpui::div()
+                        .absolute()
+                        .left(geometry.origin.x + px(80.0))
+                        .top(geometry.origin.y + px(60.0))
+                        .w(px(520.0))
+                        .border_1()
+                        .border_color(theme::accent())
+                        .bg(theme::raised_bg())
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(gpui::div().text_size(px(12.)).text_color(theme::fg()).child(SharedString::from(
+                            format!("Rename to `{name}` — {total} edits in {} files", edit.files.len()),
+                        )))
+                        .child(rows.max_h(px(260.0)).overflow_hidden())
+                        .child(
+                            gpui::div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    gpui_component::button::Button::new("rename-apply")
+                                        .label("Apply")
+                                        .primary()
+                                        .on_click(apply),
+                                )
+                                .child(
+                                    gpui_component::button::Button::new("rename-cancel")
+                                        .label("Cancel")
+                                        .on_click(cancel),
+                                ),
+                        )
+                        .into_any_element(),
+                )
+            }
+            None => None,
+        }
+    }
     /// The completion popup, anchored at the primary caret from the last
     /// frame's geometry. The typed word filters server order; ↑/↓ move, Enter
     /// accepts, Esc closes (all through [`EditorPane::command`]).
