@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{App, WeakEntity};
-use ide_core::{IdeEvent, SharedSink};
+use ide_core::{IdeEvent, Pos, SharedSink};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::workbench::Workbench;
@@ -23,6 +23,12 @@ use crate::workbench::Workbench;
 pub enum BusMessage {
     Ide(IdeEvent),
     Picked(Option<PathBuf>),
+    /// The editor asks the workbench to open (or activate) a file and place
+    /// the caret at `pos` (goto definition / find usages across files).
+    OpenLocation {
+        path: PathBuf,
+        pos: Pos,
+    },
 }
 
 /// The UI end of the event bus. Cheap to clone; `send` never blocks

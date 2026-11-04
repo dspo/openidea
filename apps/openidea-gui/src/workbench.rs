@@ -218,7 +218,7 @@ impl Workbench {
             }
         };
         let doc_id = info.id;
-        let pane = cx.new(|cx| EditorPane::new(host, info, cx));
+        let pane = cx.new(|cx| EditorPane::new(host, self.bus.clone(), info, cx));
         // Diagnostics may have landed before the tab existed (the servers
         // publish for every open file in the project).
         let existing = self.diagnostics.get(&path.to_path_buf());
@@ -283,6 +283,13 @@ impl Workbench {
             }
             BusMessage::Ide(IdeEvent::Notify { level, title, .. }) => {
                 self.message = Some((level, title));
+                cx.notify();
+            }
+            BusMessage::OpenLocation { path, pos } => {
+                self.open_path(&path, cx);
+                if let Some(tab) = self.tabs.iter().find(|tab| tab.path == path) {
+                    tab.pane.update(cx, |pane, cx| pane.jump_to_offset(pos, cx));
+                }
                 cx.notify();
             }
             BusMessage::Ide(IdeEvent::Diagnostics { path, source, items }) => {
