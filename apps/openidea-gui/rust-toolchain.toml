@@ -1,0 +1,6 @@
+# App-local toolchain: the gpui stack requires a newer rustc than the main
+# workspace floor (rust-version = 1.96). Applies only inside this directory;
+# the repo root stays on whatever the user has selected.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
