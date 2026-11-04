@@ -48,6 +48,13 @@ pub enum BusMessage {
         statuses: Vec<ide_vcs::FileStatus>,
         branch: Option<String>,
     },
+    /// A file's diff against HEAD finished building (M4; hunks render as a
+    /// unified read-only view).
+    DiffReady {
+        path: PathBuf,
+        title: String,
+        result: IdeResult<Vec<crate::diff_view::DiffLine>>,
+    },
 }
 
 /// The UI end of the event bus. Cheap to clone; `send` never blocks

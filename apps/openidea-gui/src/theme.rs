@@ -138,3 +138,8 @@ pub fn git_status_color(kind: ide_vcs::ChangeKind) -> Option<gpui::Hsla> {
     };
     Some(rgba((c << 8) | 0xff).into())
 }
+
+/// The diff view's `+` line color (the git added green).
+pub fn diff_added() -> gpui::Hsla {
+    rgba((GIT_ADDED << 8) | 0xff).into()
+}

@@ -31,8 +31,9 @@ use ide_vcs::ChangeKind;
 use ide_vfs::EntryKind;
 
 use crate::actions as acts;
-use crate::actions::{Cancel, CloseTab, GoToFile, OpenFile, Redo, Run, Save, SearchEverywhere, Undo};
+use crate::actions::{Cancel, CloseTab, GoToFile, OpenFile, Redo, Run, Save, SearchEverywhere, ShowDiff, Undo};
 use crate::bus::{Bus, BusMessage};
+use crate::diff_view::{self, DiffLine};
 use crate::editor::EditorPane;
 use crate::file_tree::{FileTree, Row};
 use crate::fuzzy;
@@ -112,6 +113,12 @@ enum PickerRow {
     Shell(String),
 }
 
+/// The open diff overlay (M4): one file's unified changes against HEAD.
+struct DiffState {
+    title: String,
+    lines: Vec<DiffLine>,
+}
+
 pub struct Workbench {
     host: Option<Arc<Host>>,
     tabs: Vec<Tab>,
@@ -146,6 +153,11 @@ pub struct Workbench {
     git_refresh_queued: Cell<bool>,
     /// Seeded from the first render (a view render cannot act earlier).
     git_initialized: Cell<bool>,
+    /// The open diff overlay, its focus handle, and the deferred focus seed
+    /// (the overlay opens from the bus, which has no window).
+    diff: Option<DiffState>,
+    diff_focus: FocusHandle,
+    diff_focus_pending: Cell<bool>,
     /// The last bare ⇧ press, for the double-⇧ Search Everywhere gesture.
     last_shift: Cell<Option<Instant>>,
     /// Whether ⇧ was held at the last modifiers event (rising-edge detection).
@@ -179,6 +191,9 @@ impl Workbench {
             git_refreshing: Cell::new(false),
             git_refresh_queued: Cell::new(false),
             git_initialized: Cell::new(false),
+            diff: None,
+            diff_focus: cx.focus_handle(),
+            diff_focus_pending: Cell::new(false),
             last_shift: Cell::new(None),
             shift_held: Cell::new(false),
         }
@@ -289,6 +304,58 @@ impl Workbench {
     /// one-off shell command line.
     fn on_run(&mut self, _: &Run, window: &mut Window, cx: &mut Context<Self>) {
         self.open_picker(PickerMode::Run, window, cx);
+    }
+
+    /// ⌃D: the diff overlay for the changed file at hand — the tree's
+    /// selected row when it carries a git change, else the active tab's file.
+    fn on_show_diff(&mut self, _: &ShowDiff, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(host) = self.host.clone() else {
+            self.message = Some((NotifyLevel::Warning, strings::NO_PROJECT.to_owned()));
+            cx.notify();
+            return;
+        };
+        if host.repo.is_none() {
+            self.message = Some((NotifyLevel::Warning, strings::GIT_NOT_A_REPO.to_owned()));
+            cx.notify();
+            return;
+        }
+        let target = self
+            .tree
+            .selected
+            .clone()
+            .filter(|path| self.git_status.contains_key(path))
+            .or_else(|| self.active.and_then(|index| self.tabs.get(index)).map(|tab| tab.path.clone()));
+        let Some(path) = target else {
+            self.message = Some((NotifyLevel::Warning, strings::DIFF_TARGET_HINT.to_owned()));
+            cx.notify();
+            return;
+        };
+        // The dirty buffer wins over the disk (its changes are the diff).
+        let current = match self.tabs.iter().find(|tab| tab.path == path) {
+            Some(tab) if tab.dirty => Some(tab.pane.read(cx).buffer_text()),
+            _ => None,
+        };
+        let current = current.or_else(|| std::fs::read_to_string(&path).ok()).unwrap_or_default();
+        let title = file_name(&path);
+        let bus = self.bus.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let result = host.git_line_hunks(&path, &current).map(|hunks| diff_view::from_hunks(&hunks, &current));
+                bus.send(BusMessage::DiffReady { path, title, result });
+            })
+            .detach();
+    }
+
+    fn close_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.diff.take().is_none() {
+            return;
+        }
+        if self.active.is_some() {
+            self.focus_active(window, cx);
+        } else {
+            window.focus(&self.tree_focus, cx);
+        }
+        cx.notify();
     }
 
     /// Bare-⇧ taps, two within a short window, open Search Everywhere.
@@ -791,6 +858,23 @@ impl Workbench {
                 }
                 cx.notify();
             }
+            BusMessage::DiffReady { path, title, result } => {
+                match result {
+                    Ok(lines) if !lines.is_empty() => {
+                        eprintln!("[diff] {} — {} lines", path.display(), lines.len());
+                        self.diff = Some(DiffState { title, lines });
+                        self.diff_focus_pending.set(true);
+                    }
+                    Ok(_) => {
+                        self.message = Some((NotifyLevel::Info, strings::DIFF_NO_CHANGES.to_owned()));
+                    }
+                    Err(e) => {
+                        self.message =
+                            Some((NotifyLevel::Error, format!("{} {}: {}", strings::DIFF_FAILED, title, e.message)));
+                    }
+                }
+                cx.notify();
+            }
             BusMessage::Ide(IdeEvent::RunExited { run, code }) => {
                 eprintln!("[run] exited {run} code {code:?}");
                 let mine = self.run_panel.as_ref().is_some_and(|panel| panel.read(cx).run_id == Some(run));
@@ -969,6 +1053,11 @@ impl Render for Workbench {
         if !self.git_initialized.replace(true) {
             self.refresh_git(cx);
         }
+        // The diff overlay opens from the bus (no window there); take the
+        // focus on the next render so Esc lands on its Cancel handler.
+        if self.diff_focus_pending.replace(false) {
+            window.focus(&self.diff_focus, cx);
+        }
         div()
             .size_full()
             .relative()
@@ -984,6 +1073,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_go_to_file))
             .on_action(cx.listener(Self::on_search_everywhere))
             .on_action(cx.listener(Self::on_run))
+            .on_action(cx.listener(Self::on_show_diff))
             // Double ⇧ gesture (modifier presses arrive as modifiers events).
             .on_modifiers_changed(cx.listener(Self::on_modifiers))
             .child(
@@ -1005,6 +1095,7 @@ impl Render for Workbench {
             })
             .child(self.render_status())
             .children(self.render_picker(cx))
+            .children(self.render_diff(cx))
     }
 }
 
@@ -1340,6 +1431,112 @@ impl Workbench {
                 this.picker_accept(window, cx);
             }))
             .into_any_element()
+    }
+}
+
+// -- diff overlay ---------------------------------------------------------------
+
+impl Workbench {
+    /// The read-only diff overlay (⌃D): one file's unified changes against
+    /// HEAD, `+`/`-` colored, no syntax highlighting (per plan). Esc or a
+    /// click outside closes it.
+    fn render_diff(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let diff = self.diff.as_ref()?;
+        let mut body = div()
+            .id("diff-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .py_1()
+            .font_family(theme::FONT_FAMILY)
+            .text_size(px(12.))
+            .line_height(px(theme::FONT_SIZE * 1.35));
+        if diff.lines.is_empty() {
+            body = body.child(
+                div().px_3().py_2().text_color(theme::fg_muted()).child(SharedString::from(strings::DIFF_NO_CHANGES)),
+            );
+        }
+        for (index, line) in diff.lines.iter().enumerate() {
+            let (marker, color, text) = match line {
+                DiffLine::Hunk(text) => ("  ", theme::fg_muted(), text.clone()),
+                DiffLine::Del(text) => ("- ", theme::error(), text.clone()),
+                DiffLine::Add(text) => ("+ ", theme::diff_added(), text.clone()),
+            };
+            body = body.child(
+                div()
+                    .id(("diff-line", index))
+                    .h(px(18.0))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .when(index % 2 == 1, |row| row.bg(theme::app_bg()))
+                    .child(div().flex_none().w(px(18.0)).text_color(color).child(SharedString::from(marker.to_owned())))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(if matches!(line, DiffLine::Hunk(_)) { theme::fg_muted() } else { theme::fg() })
+                            .child(SharedString::from(text)),
+                    ),
+            );
+        }
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close_diff(window, cx)))
+                .child(
+                    div()
+                        .mt(px(48.0))
+                        .w(px(760.0))
+                        .h(px(560.0))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(theme::border())
+                        .bg(theme::raised_bg())
+                        .key_context("Diff")
+                        .track_focus(&self.diff_focus)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            |_: &gpui::MouseDownEvent, _: &mut Window, cx: &mut gpui::App| cx.stop_propagation(),
+                        )
+                        .on_action(cx.listener(|this, _: &Cancel, window, cx| this.close_diff(window, cx)))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .h_8()
+                                .border_b_1()
+                                .border_color(theme::border())
+                                .text_size(px(12.))
+                                .child(
+                                    div()
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme::fg())
+                                        .child(SharedString::from(strings::DIFF_TITLE)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_color(theme::fg_muted())
+                                        .child(SharedString::from(diff.title.clone())),
+                                )
+                                .child(Button::new("diff-close").icon(IconName::Close).xsmall().ghost().on_click(
+                                    cx.listener(|this, _: &ClickEvent, window, cx| this.close_diff(window, cx)),
+                                )),
+                        )
+                        .child(body),
+                )
+                .into_any_element(),
+        )
     }
 }
 

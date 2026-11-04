@@ -769,6 +769,12 @@ impl EditorPane {
         }
     }
 
+    /// The buffer's full text (UTF-16-normalized `\n`), for callers outside
+    /// the pane (the diff view reads a dirty buffer instead of the disk).
+    pub fn buffer_text(&self) -> String {
+        self.buf.slice_utf16(0..self.buf.utf16_len())
+    }
+
     /// ⌘Z: inverts the newest undo group (newest entry first) and parks the
     /// inversions on the redo stack.
     pub fn undo(&mut self, cx: &mut gpui::Context<Self>) {
