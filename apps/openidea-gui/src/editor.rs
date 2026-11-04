@@ -153,6 +153,7 @@ enum Command {
     Move(Motion, bool),
     Delete { forward: bool, word: bool },
     Newline,
+    Paste,
     Cancel,
     ToggleHud,
 }
@@ -167,6 +168,9 @@ enum Cause {
     /// An IME commit: undo removes the whole composition, not just the final
     /// text (the marked keystrokes were never undo entries).
     ImeCommit,
+    /// A clipboard paste (⌘V): its own undo step, cursors land after the
+    /// inserted text like typing.
+    Paste,
     /// Undo/redo/IME marked-text application: no undo entry, selections are
     /// managed by the caller.
     Mechanical,
@@ -723,8 +727,7 @@ impl EditorPane {
 
         let selections_before = std::mem::take(&mut self.selections);
         let selections_after = match cause {
-            Cause::Typing => Selection::after_inserts(&changes),
-            Cause::Delete => Selection::after_inserts(&changes),
+            Cause::Typing | Cause::Delete | Cause::Paste => Selection::after_inserts(&changes),
             // Mechanical batches keep the caller's cursors; they are restored
             // (undo/redo) or clamped (IME, patches) afterwards.
             Cause::ImeCommit | Cause::Mechanical => selections_before.clone(),
@@ -742,6 +745,10 @@ impl EditorPane {
         // ImeCommit); plain keydowns (Cause::Typing) and deletions re-filter.
         if matches!(cause, Cause::Typing | Cause::Delete | Cause::ImeCommit) {
             self.schedule_completion(cx);
+        }
+        // A paste is not typing: any open popup's filter is stale now.
+        if matches!(cause, Cause::Paste) {
+            self.close_completion(cx);
         }
         self.after_edits(&byte_edits, cx);
         self.clamp_scroll_to_primary();
@@ -797,17 +804,25 @@ impl EditorPane {
         cx.notify();
     }
 
-    /// Inserts `text` at every cursor (replacing each selection), bottom-up
-    /// in one `ChangeSet` so the backend sees a single version bump.
+    /// The replacement ranges a text insertion covers: every selection's
+    /// normalized range (a bare caret is an empty insert range), sorted and
+    /// deduplicated — the shape `insert_text` and paste both consume.
     fn insert_text(&mut self, text: &str, cx: &mut gpui::Context<Self>) {
-        let mut ranges: Vec<(usize, usize)> = self.selections.iter().map(|s| s.normalized()).collect();
-        ranges.sort_unstable();
-        ranges.dedup();
-        let changes: Vec<TextChange> = ranges
+        let changes: Vec<TextChange> = paste_ranges(&self.selections)
             .into_iter()
             .map(|(start, end)| TextChange { from: start as u32, to: end as u32, insert: text.to_owned() })
             .collect();
         self.apply_edits(changes, Cause::Typing, cx);
+    }
+
+    /// ⌘V: pastes `text` at every cursor (replacing each selection) as one
+    /// batch — its own undo step, and no completion follow-up.
+    fn paste(&mut self, text: &str, cx: &mut gpui::Context<Self>) {
+        let changes: Vec<TextChange> = paste_ranges(&self.selections)
+            .into_iter()
+            .map(|(start, end)| TextChange { from: start as u32, to: end as u32, insert: text.to_owned() })
+            .collect();
+        self.apply_edits(changes, Cause::Paste, cx);
     }
 
     /// Backspace / delete across cursors: a non-empty selection loses its
@@ -1549,7 +1564,7 @@ impl EditorPane {
                     self.rename_cancel_flow(window, cx);
                     return;
                 }
-                Command::Move(..) | Command::Delete { .. } | Command::ToggleHud => return,
+                Command::Move(..) | Command::Delete { .. } | Command::Paste | Command::ToggleHud => return,
             }
         }
         if matches!(self.rename, Some(RenameFlow::Preview { .. })) {
@@ -1624,6 +1639,12 @@ impl EditorPane {
             Command::Move(motion, extend) => self.move_cursors(motion, extend, cx),
             Command::Delete { forward, word } => self.delete(forward, word, cx),
             Command::Newline => self.insert_text("\n", cx),
+            Command::Paste => {
+                let text = cx.read_from_clipboard().and_then(|item| item.text());
+                if let Some(text) = text {
+                    self.paste(&text, cx);
+                }
+            }
             Command::Cancel => self.collapse_cursors(cx),
             Command::ToggleHud => unreachable!("handled above"),
         }
@@ -1997,6 +2018,17 @@ fn normalize_selections(mut selections: Vec<Selection>) -> Vec<Selection> {
     out
 }
 
+/// The replacement ranges a text insertion covers: every selection's
+/// normalized range (a bare caret is an empty insert range — the text lands
+/// there), sorted and deduplicated. Typing, newline and paste all replace
+/// these ranges in one batch.
+fn paste_ranges(selections: &[Selection]) -> Vec<(usize, usize)> {
+    let mut ranges: Vec<(usize, usize)> = selections.iter().map(|s| s.normalized()).collect();
+    ranges.sort_unstable();
+    ranges.dedup();
+    ranges
+}
+
 impl Render for EditorPane {
     fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
         if !self.focused_once.get() {
@@ -2022,6 +2054,7 @@ impl Render for EditorPane {
             )
             .on_action(cx.listener(|this, _: &acts::Cancel, window, cx| this.command(Command::Cancel, window, cx)))
             .on_action(cx.listener(|this, _: &acts::Newline, window, cx| this.command(Command::Newline, window, cx)))
+            .on_action(cx.listener(|this, _: &acts::Paste, window, cx| this.command(Command::Paste, window, cx)))
             .on_action(cx.listener(|this, _: &acts::DeleteBackward, window, cx| {
                 this.command(Command::Delete { forward: false, word: false }, window, cx)
             }))
@@ -3045,6 +3078,37 @@ mod tests {
         // Deletions collapse to the start of the deleted range.
         let after = Selection::after_inserts(&[tc(4, 8, "")]);
         assert_eq!(after[0].head, 4);
+    }
+
+    #[test]
+    fn paste_ranges_cover_carets_and_selections() {
+        // Paste ranges come from the selections: bare carets are empty insert
+        // ranges (the text lands there), selections are replaced wholesale.
+        // Three bare cursors: each becomes an insert point, ascending.
+        let ranges = paste_ranges(&[Selection::caret(8), Selection::caret(2), Selection::caret(5)]);
+        assert_eq!(ranges, vec![(2, 2), (5, 5), (8, 8)]);
+        // A selection replaces its whole range; a reversed one (caret before
+        // the anchor) normalizes to the same ascending range.
+        let ranges = paste_ranges(&[Selection { anchor: 4, head: 9, reversed: false, goal_col: None }]);
+        assert_eq!(ranges, vec![(4, 9)]);
+        let ranges = paste_ranges(&[Selection { anchor: 9, head: 4, reversed: true, goal_col: None }]);
+        assert_eq!(ranges, vec![(4, 9)]);
+        // Mixed: one selection plus one caret, sorted, no dedup needed.
+        let ranges =
+            paste_ranges(&[Selection::caret(12), Selection { anchor: 1, head: 3, reversed: false, goal_col: None }]);
+        assert_eq!(ranges, vec![(1, 3), (12, 12)]);
+        // Duplicate cursors collapse into one insertion.
+        let ranges = paste_ranges(&[Selection::caret(6), Selection::caret(6)]);
+        assert_eq!(ranges, vec![(6, 6)]);
+        // End-to-end: replacing each range with the pasted text moves cursors
+        // to the end of the inserted text (the same math apply_edits runs).
+        let changes: Vec<TextChange> =
+            paste_ranges(&[Selection::caret(2), Selection { anchor: 5, head: 7, reversed: false, goal_col: None }])
+                .into_iter()
+                .map(|(start, end)| tc(start as u32, end as u32, "XY"))
+                .collect();
+        let heads: Vec<usize> = Selection::after_inserts(&changes).iter().map(|s| s.head).collect();
+        assert_eq!(heads, vec![4, 9], "caret after insert; the selection's tail shifts by the delta");
     }
 
     #[test]

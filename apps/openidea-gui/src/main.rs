@@ -27,9 +27,9 @@ use gpui_kit_assets::AllAssets;
 use crate::actions::{
     Cancel, CloseTab, CursorDocEnd, CursorDocStart, CursorDown, CursorLeft, CursorLineEnd, CursorLineHome, CursorRight,
     CursorUp, CursorWordLeft, CursorWordRight, DeleteBackward, DeleteForward, DeleteWordBackward, DeleteWordForward,
-    FindUsages, GoToFile, GotoDefinition, Newline, OpenFile, Quit, Redo, Rename, Save, SelectDocEnd, SelectDocStart,
-    SelectDown, SelectLeft, SelectLineEnd, SelectLineHome, SelectRight, SelectUp, SelectWordLeft, SelectWordRight,
-    TogglePerfHud, Undo,
+    FindUsages, GoToFile, GotoDefinition, Newline, OpenFile, Paste, Quit, Redo, Rename, Save, SelectDocEnd,
+    SelectDocStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineHome, SelectRight, SelectUp, SelectWordLeft,
+    SelectWordRight, TogglePerfHud, Undo,
 };
 use crate::actions::{SelectNext, SelectPrev};
 use crate::bus::Bus;
@@ -117,6 +117,9 @@ fn main() {
                     KeyBinding::new("delete", DeleteForward, Some("Editor")),
                     KeyBinding::new("alt-backspace", DeleteWordBackward, Some("Editor")),
                     KeyBinding::new("alt-delete", DeleteWordForward, Some("Editor")),
+                    // Paste rides the editor context (the gpui-component inputs
+                    // keep their own clipboard handling).
+                    KeyBinding::new("cmd-v", Paste, Some("Editor")),
                     KeyBinding::new("left", CursorLeft, Some("Editor")),
                     KeyBinding::new("right", CursorRight, Some("Editor")),
                     KeyBinding::new("up", CursorUp, Some("Editor")),
