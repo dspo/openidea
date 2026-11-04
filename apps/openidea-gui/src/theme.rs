@@ -27,6 +27,38 @@ pub const TEXT_INSET: f32 = 16.0;
 pub const GUTTER_PAD_L: f32 = 12.0;
 pub const GUTTER_PAD_R: f32 = 14.0;
 
+// Syntax palette: dark, low-contrast greys, one cool accent (same family as
+// the chrome colors above); hardcoded like everything else in M2.
+const SYNTAX_KEYWORD: u32 = 0x7aa7f5;
+const SYNTAX_STRING: u32 = 0x8fbf7f;
+const SYNTAX_ESCAPE: u32 = 0xd6a55f;
+const SYNTAX_NUMBER: u32 = 0xd6a55f;
+const SYNTAX_CONSTANT: u32 = 0xd19a66;
+const SYNTAX_COMMENT: u32 = 0x6f7580;
+const SYNTAX_FUNCTION: u32 = 0x74b6df;
+const SYNTAX_TYPE: u32 = 0x5fbdb0;
+const SYNTAX_PROPERTY: u32 = 0xbfc7d5;
+const SYNTAX_MACRO: u32 = 0x8fb0d9;
+const SYNTAX_OPERATOR: u32 = 0xa6abb5;
+
+/// The color a highlight kind paints with.
+pub fn syntax_color(kind: crate::highlight::Kind) -> gpui::Hsla {
+    let c = match kind {
+        crate::highlight::Kind::Keyword => SYNTAX_KEYWORD,
+        crate::highlight::Kind::String => SYNTAX_STRING,
+        crate::highlight::Kind::Escape => SYNTAX_ESCAPE,
+        crate::highlight::Kind::Number => SYNTAX_NUMBER,
+        crate::highlight::Kind::Constant => SYNTAX_CONSTANT,
+        crate::highlight::Kind::Comment => SYNTAX_COMMENT,
+        crate::highlight::Kind::Function => SYNTAX_FUNCTION,
+        crate::highlight::Kind::Type => SYNTAX_TYPE,
+        crate::highlight::Kind::Property => SYNTAX_PROPERTY,
+        crate::highlight::Kind::Macro => SYNTAX_MACRO,
+        crate::highlight::Kind::Operator => SYNTAX_OPERATOR,
+    };
+    rgba((c << 8) | 0xff).into()
+}
+
 pub fn app_bg() -> gpui::Hsla {
     rgba((BG_APP << 8) | 0xff).into()
 }

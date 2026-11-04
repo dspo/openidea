@@ -9,6 +9,7 @@
 mod bus;
 mod editor;
 mod file_tree;
+mod highlight;
 mod host;
 mod strings;
 mod theme;
