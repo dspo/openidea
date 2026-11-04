@@ -55,6 +55,10 @@ pub enum BusMessage {
         title: String,
         result: IdeResult<Vec<crate::diff_view::DiffLine>>,
     },
+    /// The commit flow finished: the new HEAD commit id, or the failure.
+    CommitDone {
+        result: IdeResult<String>,
+    },
 }
 
 /// The UI end of the event bus. Cheap to clone; `send` never blocks

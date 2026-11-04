@@ -18,7 +18,8 @@ use gpui::{
     StatefulInteractiveElement as _, Styled, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::checkbox::Checkbox;
+use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::status_bar::StatusBar;
 use gpui_component::tab::{Tab as ComponentTab, TabBar};
 use gpui_component::{Icon, IconName, Selectable as _, Sizable as _};
@@ -119,6 +120,21 @@ struct DiffState {
     lines: Vec<DiffLine>,
 }
 
+/// One checkbox row of the commit overlay.
+struct CommitFile {
+    path: PathBuf,
+    name: String,
+    kind: ChangeKind,
+    selected: bool,
+}
+
+/// The commit overlay (M4): the changed files (checked = staged for this
+/// commit) and a multi-line message.
+struct CommitFlow {
+    input: Entity<TextareaState>,
+    files: Vec<CommitFile>,
+}
+
 pub struct Workbench {
     host: Option<Arc<Host>>,
     tabs: Vec<Tab>,
@@ -158,6 +174,11 @@ pub struct Workbench {
     diff: Option<DiffState>,
     diff_focus: FocusHandle,
     diff_focus_pending: Cell<bool>,
+    /// The open commit overlay (⌘K).
+    commit: Option<CommitFlow>,
+    /// Set when a bus message closed an overlay: the next render hands the
+    /// focus back to the editor (or the tree).
+    restore_focus_pending: Cell<bool>,
     /// The last bare ⇧ press, for the double-⇧ Search Everywhere gesture.
     last_shift: Cell<Option<Instant>>,
     /// Whether ⇧ was held at the last modifiers event (rising-edge detection).
@@ -194,6 +215,8 @@ impl Workbench {
             diff: None,
             diff_focus: cx.focus_handle(),
             diff_focus_pending: Cell::new(false),
+            commit: None,
+            restore_focus_pending: Cell::new(false),
             last_shift: Cell::new(None),
             shift_held: Cell::new(false),
         }
@@ -348,6 +371,87 @@ impl Workbench {
 
     fn close_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.diff.take().is_none() {
+            return;
+        }
+        if self.active.is_some() {
+            self.focus_active(window, cx);
+        } else {
+            window.focus(&self.tree_focus, cx);
+        }
+        cx.notify();
+    }
+
+    /// ⌘K: the commit overlay — every changed file checked, an empty
+    /// multi-line message.
+    fn on_commit(&mut self, _: &acts::Commit, window: &mut Window, cx: &mut Context<Self>) {
+        if self.commit.is_some() {
+            return;
+        }
+        let Some(host) = &self.host else {
+            self.message = Some((NotifyLevel::Warning, strings::NO_PROJECT.to_owned()));
+            cx.notify();
+            return;
+        };
+        if host.repo.is_none() {
+            self.message = Some((NotifyLevel::Warning, strings::GIT_NOT_A_REPO.to_owned()));
+            cx.notify();
+            return;
+        }
+        if self.git_status.is_empty() {
+            self.message = Some((NotifyLevel::Info, strings::COMMIT_NO_CHANGES.to_owned()));
+            cx.notify();
+            return;
+        }
+        let input = cx.new(|cx| TextareaState::new(window, cx).placeholder(strings::COMMIT_MESSAGE_PLACEHOLDER));
+        window.focus(&input.read(cx).focus_handle(cx), cx);
+        // Sorted by name, checked by default (the IDEA commit dialog's shape).
+        let mut files: Vec<CommitFile> = self
+            .git_status
+            .iter()
+            .map(|(path, kind)| CommitFile { path: path.clone(), name: file_name(path), kind: *kind, selected: true })
+            .collect();
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+        self.commit = Some(CommitFlow { input, files });
+        cx.notify();
+    }
+
+    /// ⌘Enter / the Commit button: stage the checked files (unchecked ones
+    /// leave the index, so the commit is exactly the dialog's checkmarks),
+    /// then commit the index.
+    fn commit_confirm(&mut self, cx: &mut Context<Self>) {
+        let Some(flow) = &self.commit else { return };
+        let message = flow.input.read(cx).value().to_string();
+        if message.trim().is_empty() {
+            self.message = Some((NotifyLevel::Warning, strings::COMMIT_EMPTY_MESSAGE.to_owned()));
+            cx.notify();
+            return;
+        }
+        let staged: Vec<PathBuf> =
+            flow.files.iter().filter(|file| file.selected).map(|file| file.path.clone()).collect();
+        let unstaged: Vec<PathBuf> =
+            flow.files.iter().filter(|file| !file.selected).map(|file| file.path.clone()).collect();
+        if staged.is_empty() {
+            self.message = Some((NotifyLevel::Warning, strings::COMMIT_NO_CHANGES.to_owned()));
+            cx.notify();
+            return;
+        }
+        let Some(host) = self.host.clone() else { return };
+        let bus = self.bus.clone();
+        cx.background_executor()
+            .spawn(async move {
+                // Unstage first so a previously staged-then-unchecked file
+                // does not ride along.
+                let result = host
+                    .git_unstage(&unstaged)
+                    .and_then(|()| host.git_stage(&staged))
+                    .and_then(|()| host.git_commit(&message));
+                bus.send(BusMessage::CommitDone { result });
+            })
+            .detach();
+    }
+
+    fn close_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.commit.take().is_none() {
             return;
         }
         if self.active.is_some() {
@@ -875,6 +979,22 @@ impl Workbench {
                 }
                 cx.notify();
             }
+            BusMessage::CommitDone { result } => {
+                match result {
+                    Ok(id) => {
+                        let short: String = id.chars().take(7).collect();
+                        self.commit = None;
+                        self.restore_focus_pending.set(true);
+                        self.message = Some((NotifyLevel::Info, format!("{} {short}", strings::COMMIT_TOAST)));
+                        eprintln!("[vcs] committed {id}");
+                        self.refresh_git(cx);
+                    }
+                    Err(e) => {
+                        self.message = Some((NotifyLevel::Error, format!("{}: {}", strings::COMMIT_FAILED, e.message)));
+                    }
+                }
+                cx.notify();
+            }
             BusMessage::Ide(IdeEvent::RunExited { run, code }) => {
                 eprintln!("[run] exited {run} code {code:?}");
                 let mine = self.run_panel.as_ref().is_some_and(|panel| panel.read(cx).run_id == Some(run));
@@ -1058,6 +1178,15 @@ impl Render for Workbench {
         if self.diff_focus_pending.replace(false) {
             window.focus(&self.diff_focus, cx);
         }
+        // A bus message closed an overlay (the commit landed): focus returns
+        // to where editing happens.
+        if self.restore_focus_pending.replace(false) {
+            if self.active.is_some() {
+                self.focus_active(window, cx);
+            } else {
+                window.focus(&self.tree_focus, cx);
+            }
+        }
         div()
             .size_full()
             .relative()
@@ -1074,6 +1203,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_search_everywhere))
             .on_action(cx.listener(Self::on_run))
             .on_action(cx.listener(Self::on_show_diff))
+            .on_action(cx.listener(Self::on_commit))
             // Double ⇧ gesture (modifier presses arrive as modifiers events).
             .on_modifiers_changed(cx.listener(Self::on_modifiers))
             .child(
@@ -1096,6 +1226,7 @@ impl Render for Workbench {
             .child(self.render_status())
             .children(self.render_picker(cx))
             .children(self.render_diff(cx))
+            .children(self.render_commit(cx))
     }
 }
 
@@ -1534,6 +1665,138 @@ impl Workbench {
                                 )),
                         )
                         .child(body),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
+// -- commit overlay -------------------------------------------------------------
+
+impl Workbench {
+    /// The commit overlay (⌘K): checked file list, multi-line message,
+    /// Commit / Cancel. ⌘Enter commits; Esc cancels.
+    fn render_commit(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let flow = self.commit.as_ref()?;
+        let workbench = cx.entity().downgrade();
+        let mut list = div().id("commit-files").flex_1().min_h_0().overflow_y_scroll().py_1();
+        for (index, file) in flow.files.iter().enumerate() {
+            let color = theme::git_status_color(file.kind);
+            list = list.child(
+                div()
+                    .id(("commit-file-row", index))
+                    .h(px(26.0))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.))
+                    .hover(|row| row.bg(theme::app_bg()))
+                    .child(Checkbox::new(("commit-check", index)).checked(file.selected).on_click({
+                        let workbench = workbench.clone();
+                        move |checked, _, cx| {
+                            workbench
+                                .update(cx, |this, cx| {
+                                    if let Some(file) = this.commit.as_mut().and_then(|flow| flow.files.get_mut(index))
+                                    {
+                                        file.selected = *checked;
+                                    }
+                                    cx.notify();
+                                })
+                                .ok();
+                        }
+                    }))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .when_some(color, |name, c| name.text_color(c))
+                            .child(SharedString::from(file.name.clone())),
+                    ),
+            );
+        }
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close_commit(window, cx)))
+                .child(
+                    div()
+                        .mt(px(72.0))
+                        .w(px(560.0))
+                        .h(px(480.0))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(theme::border())
+                        .bg(theme::raised_bg())
+                        .key_context("Commit")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            |_: &gpui::MouseDownEvent, _: &mut Window, cx: &mut gpui::App| cx.stop_propagation(),
+                        )
+                        .on_action(cx.listener(|this, _: &Cancel, window, cx| this.close_commit(window, cx)))
+                        .on_action(cx.listener(|this, _: &acts::CommitConfirm, _, cx| this.commit_confirm(cx)))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .h_8()
+                                .border_b_1()
+                                .border_color(theme::border())
+                                .text_size(px(12.))
+                                .child(
+                                    div()
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme::fg())
+                                        .child(SharedString::from(strings::COMMIT_TITLE)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_color(theme::fg_muted())
+                                        .child(SharedString::from(format!("{} files", flow.files.len()))),
+                                )
+                                .child(Button::new("commit-close").icon(IconName::Close).xsmall().ghost().on_click(
+                                    cx.listener(|this, _: &ClickEvent, window, cx| this.close_commit(window, cx)),
+                                )),
+                        )
+                        .child(list)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .border_t_1()
+                                .border_color(theme::border())
+                                .child(Textarea::new(&flow.input).h_full().bordered(false)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .py_2()
+                                .border_t_1()
+                                .border_color(theme::border())
+                                .child(Button::new("commit-cancel").label(strings::CANCEL).xsmall().ghost().on_click(
+                                    cx.listener(|this, _: &ClickEvent, window, cx| this.close_commit(window, cx)),
+                                ))
+                                .child(
+                                    Button::new("commit-submit")
+                                        .label(strings::COMMIT_BUTTON)
+                                        .xsmall()
+                                        .secondary()
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.commit_confirm(cx))),
+                                ),
+                        ),
                 )
                 .into_any_element(),
         )

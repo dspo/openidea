@@ -255,6 +255,24 @@ impl Host {
         let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
         repo.line_hunks(path, current_text, false, encoding_rs::UTF_8)
     }
+
+    /// Stages `paths` (git add semantics) — the commit flow's first half.
+    pub fn git_stage(&self, paths: &[PathBuf]) -> IdeResult<()> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        repo.stage(paths)
+    }
+
+    /// Unstages `paths` — the commit dialog's unchecked files leave the index.
+    pub fn git_unstage(&self, paths: &[PathBuf]) -> IdeResult<()> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        repo.unstage(paths)
+    }
+
+    /// Commits the index; returns the new HEAD commit id.
+    pub fn git_commit(&self, message: &str) -> IdeResult<String> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        repo.commit(message, false, false)
+    }
 }
 
 /// Stable per-project cache-directory name (FNV-1a of the root), the same
