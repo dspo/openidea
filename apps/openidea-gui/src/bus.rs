@@ -42,6 +42,12 @@ pub enum BusMessage {
     RunOutput {
         chunk: OutputChunk,
     },
+    /// A git status + branch refresh finished (M4; the reads ran on the
+    /// background executor).
+    GitStatus {
+        statuses: Vec<ide_vcs::FileStatus>,
+        branch: Option<String>,
+    },
 }
 
 /// The UI end of the event bus. Cheap to clone; `send` never blocks

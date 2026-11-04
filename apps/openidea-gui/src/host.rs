@@ -34,6 +34,7 @@ use ide_language::{LanguageRegistry, Syntax};
 use ide_lsp::LspManager;
 use ide_run::{OutputChunk, ProcessManager, RunConfig, RunInfo, StartOptions};
 use ide_text::AppliedChange;
+use ide_vcs::{FileStatus, Repo};
 use ide_vfs::{FileEntry, Watcher};
 use ide_workspace::documents::DocumentObserver;
 use ide_workspace::{DocumentInfo, Documents};
@@ -68,6 +69,10 @@ pub struct Host {
     /// host's Run tool window drives. Output streams through a plain callback;
     /// exits arrive as `IdeEvent::RunExited` on the sink.
     pub run: ProcessManager,
+    /// The project's git repository (M4), `None` outside a repo. Reads are
+    /// gitoxide in-process and re-check on-disk state per call, so the handle
+    /// never goes stale.
+    pub repo: Option<Arc<Repo>>,
     /// The app-owned tokio runtime's handle: LSP feature requests
     /// (`completion`, `goto`, …) must spawn onto it, and it drives the
     /// servers' IO. Kept alongside the host so callers share one runtime.
@@ -132,7 +137,20 @@ impl Host {
             )?
         };
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        Ok(Self { root, name, documents, sink, lsp, index, run: ProcessManager::new(), runtime, _watcher: watcher })
+        let repo = Repo::discover(&root).ok().flatten().map(Arc::new);
+        eprintln!("[vcs] {} repository at {}", if repo.is_some() { "found" } else { "no" }, root.display());
+        Ok(Self {
+            root,
+            name,
+            documents,
+            sink,
+            lsp,
+            index,
+            run: ProcessManager::new(),
+            repo,
+            runtime,
+            _watcher: watcher,
+        })
     }
 
     /// Lists `dir` (VFS entries with ignore flags applied).
@@ -218,6 +236,17 @@ impl Host {
     /// period) — ide-run's own cancellation path.
     pub fn stop_run(&self, id: RunId) -> IdeResult<()> {
         self.run.stop(id)
+    }
+
+    // -- git (M4) -----------------------------------------------------------
+
+    /// Working-tree status plus the current branch (reads are gitoxide;
+    /// call on a background thread).
+    pub fn git_status(&self) -> IdeResult<(Vec<FileStatus>, Option<String>)> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        let statuses = repo.status()?;
+        let branch = repo.head()?.0;
+        Ok((statuses, branch))
     }
 }
 

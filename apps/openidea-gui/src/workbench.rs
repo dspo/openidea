@@ -27,6 +27,7 @@ use ide_core::event::ServerStatus;
 use ide_core::{Diagnostic, DocId, IdeEvent, ServerId};
 use ide_index::{FileMatch, SymbolFilter, SymbolMatch};
 use ide_run::RunConfig;
+use ide_vcs::ChangeKind;
 use ide_vfs::EntryKind;
 
 use crate::actions as acts;
@@ -134,6 +135,17 @@ pub struct Workbench {
     /// The Run dock (M4), from the first run until the project closes: one
     /// run at a time, output streaming through the bus.
     run_panel: Option<Entity<RunPanel>>,
+    /// Git working-tree kind per absolute path (working-tree kind wins, the
+    /// staged one when the tree is clean), and the current branch. Refreshed
+    /// on the background executor (M4).
+    git_status: HashMap<PathBuf, ChangeKind>,
+    git_branch: Option<String>,
+    /// Coalescing for the git refreshes a burst of `FsChanged` batches would
+    /// otherwise serialize: one in flight, re-run when it lands if more came.
+    git_refreshing: Cell<bool>,
+    git_refresh_queued: Cell<bool>,
+    /// Seeded from the first render (a view render cannot act earlier).
+    git_initialized: Cell<bool>,
     /// The last bare ⇧ press, for the double-⇧ Search Everywhere gesture.
     last_shift: Cell<Option<Instant>>,
     /// Whether ⇧ was held at the last modifiers event (rising-edge detection).
@@ -162,9 +174,32 @@ impl Workbench {
             picker: None,
             picker_sub: None,
             run_panel: None,
+            git_status: HashMap::new(),
+            git_branch: None,
+            git_refreshing: Cell::new(false),
+            git_refresh_queued: Cell::new(false),
+            git_initialized: Cell::new(false),
             last_shift: Cell::new(None),
             shift_held: Cell::new(false),
         }
+    }
+
+    /// Kicks a git status + branch refresh (coalesced; no-op without a repo
+    /// or while one is already in flight).
+    fn refresh_git(&mut self, cx: &mut Context<Self>) {
+        let Some(host) = self.host.as_ref().filter(|host| host.repo.is_some()) else { return };
+        if self.git_refreshing.replace(true) {
+            self.git_refresh_queued.set(true);
+            return;
+        }
+        let bus = self.bus.clone();
+        let host = host.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let (statuses, branch) = host.git_status().unwrap_or((Vec::new(), None));
+                bus.send(BusMessage::GitStatus { statuses, branch });
+            })
+            .detach();
     }
 
     // -- actions ----------------------------------------------------------
@@ -629,6 +664,8 @@ impl Workbench {
                         }
                     }
                 }
+                // The tree just re-listed; the git coloring follows.
+                self.refresh_git(cx);
                 cx.notify();
             }
             BusMessage::Ide(IdeEvent::DocPatched { doc, base_version, changes, .. }) => {
@@ -735,6 +772,24 @@ impl Workbench {
                         cx.notify();
                     });
                 }
+            }
+            BusMessage::GitStatus { statuses, branch } => {
+                self.git_refreshing.set(false);
+                self.git_branch = branch;
+                self.git_status = statuses
+                    .into_iter()
+                    .map(|file| {
+                        // Working-tree state is what the tree shows; a file
+                        // with only a staged change still colors by it.
+                        let kind = file.unstaged.or(file.staged).unwrap_or(ChangeKind::Modified);
+                        (file.path.0, kind)
+                    })
+                    .collect();
+                // Changes landed while the read was out: one more pass.
+                if self.git_refresh_queued.replace(false) {
+                    self.refresh_git(cx);
+                }
+                cx.notify();
             }
             BusMessage::Ide(IdeEvent::RunExited { run, code }) => {
                 eprintln!("[run] exited {run} code {code:?}");
@@ -903,12 +958,16 @@ impl Render for Workbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Seed the initial focus once (a view render cannot focus earlier):
         // the tree when no tab is active, so ⌘O and the tree keys work
-        // immediately after launch.
+        // immediately after launch. The first render also kicks the git
+        // status refresh.
         if !self.tree_focused_once.get() {
             self.tree_focused_once.set(true);
             if self.active.is_none() {
                 window.focus(&self.tree_focus, cx);
             }
+        }
+        if !self.git_initialized.replace(true) {
+            self.refresh_git(cx);
         }
         div()
             .size_full()
@@ -983,6 +1042,8 @@ impl Workbench {
                 rows.into_iter().enumerate().map(|(index, row)| {
                     let is_selected = selected.as_ref() == Some(&row.path);
                     let indent = px(8.0 + 14.0 * row.depth as f32);
+                    // A changed file's name carries its git kind's color.
+                    let git_color = self.git_status.get(&row.path).and_then(|kind| theme::git_status_color(*kind));
                     div()
                         .id(("tree-row", index))
                         .h(px(24.0))
@@ -1001,7 +1062,11 @@ impl Workbench {
                             }
                         }))
                         .child(row_icon(&row))
-                        .child(SharedString::from(row.name))
+                        .child(
+                            div()
+                                .when_some(git_color, |name, color| name.text_color(color))
+                                .child(SharedString::from(row.name)),
+                        )
                 }),
             ))
     }

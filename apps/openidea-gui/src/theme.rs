@@ -43,6 +43,14 @@ const SYNTAX_PROPERTY: u32 = 0xbfc7d5;
 const SYNTAX_MACRO: u32 = 0x8fb0d9;
 const SYNTAX_OPERATOR: u32 = 0xa6abb5;
 
+// Git status palette (M4): the IDE convention (modified blue, added green,
+// untracked olive, deleted red), tuned to the low-contrast dark. Hardcoded
+// like the syntax palette.
+const GIT_MODIFIED: u32 = 0x74a3f0;
+const GIT_ADDED: u32 = 0x6fbf7f;
+const GIT_UNTRACKED: u32 = 0xc2a25f;
+const GIT_DELETED: u32 = 0xd16b55;
+
 /// The color a highlight kind paints with.
 pub fn syntax_color(kind: crate::highlight::Kind) -> gpui::Hsla {
     let c = match kind {
@@ -116,4 +124,17 @@ pub fn severity_color_rgba(severity: ide_core::Severity) -> gpui::Rgba {
 
 pub fn severity_color(severity: ide_core::Severity) -> gpui::Hsla {
     severity_color_rgba(severity).into()
+}
+
+/// The color a changed file's name paints with in the tree; `None` leaves the
+/// default (unchanged files).
+pub fn git_status_color(kind: ide_vcs::ChangeKind) -> Option<gpui::Hsla> {
+    let c = match kind {
+        ide_vcs::ChangeKind::Modified => GIT_MODIFIED,
+        ide_vcs::ChangeKind::Added | ide_vcs::ChangeKind::Renamed => GIT_ADDED,
+        ide_vcs::ChangeKind::Untracked => GIT_UNTRACKED,
+        ide_vcs::ChangeKind::Deleted | ide_vcs::ChangeKind::Conflicted => GIT_DELETED,
+        ide_vcs::ChangeKind::Ignored => return None,
+    };
+    Some(rgba((c << 8) | 0xff).into())
 }
