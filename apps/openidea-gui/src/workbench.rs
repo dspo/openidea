@@ -1223,7 +1223,7 @@ impl Render for Workbench {
                     div().h(px(240.0)).flex_none().min_h_0().border_t_1().border_color(theme::border()).child(panel),
                 )
             })
-            .child(self.render_status())
+            .child(self.render_status(cx))
             .children(self.render_picker(cx))
             .children(self.render_diff(cx))
             .children(self.render_commit(cx))
@@ -1354,7 +1354,7 @@ impl Workbench {
 
     // -- status bar ----------------------------------------------------------------
 
-    fn render_status(&self) -> impl IntoElement {
+    fn render_status(&self, cx: &Context<Self>) -> impl IntoElement {
         let (project, file, state) = match (&self.host, self.active) {
             (Some(host), Some(index)) => {
                 let tab = &self.tabs[index];
@@ -1381,10 +1381,23 @@ impl Workbench {
 
         let mut left = div().flex().items_center().gap_2().text_size(px(12.));
         left = left.child(div().text_color(theme::fg_muted()).child(SharedString::from(project)));
+        if let Some(branch) = &self.git_branch {
+            left = left
+                .child(
+                    div().text_color(theme::fg_muted()).child(SharedString::from(strings::GIT_BRANCH_LABEL.to_owned())),
+                )
+                .child(div().text_color(theme::fg()).child(SharedString::from(branch.clone())));
+        }
         if let Some(file) = file {
             left = left.child(div().text_color(theme::fg()).child(SharedString::from(file)));
         }
         let mut right = div().flex().items_center().gap_3().text_size(px(12.));
+        // The run indicator (running · elapsed, or the exit code), from the
+        // dock's own status.
+        if let Some(panel) = &self.run_panel {
+            let (text, color) = panel.read(cx).status();
+            right = right.child(div().truncate().text_color(color).child(SharedString::from(text)));
+        }
         // Language-server rows: name + status, colored by health.
         for row in &self.servers {
             let (text, color) = match row.status {
