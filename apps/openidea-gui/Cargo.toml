@@ -42,6 +42,9 @@ ide-workspace = { path = "../../crates/ide-workspace" }
 # Editor syntax highlighting: the repo's bundled tree-sitter grammars via the
 # public `Syntax::ts_language` seam ("for engines that parse on their own").
 ide-language = { path = "../../crates/ide-language" }
+# M3: language servers (rust-analyzer & co.) driven through the same
+# LspManager the Tauri and headless hosts use.
+ide-lsp = { path = "../../crates/ide-lsp" }
 # The grammar Language values come from ide-language; this must resolve to the
 # same tree-sitter the main workspace pins (0.25.10) so the types unify.
 tree-sitter = "=0.25.10"
@@ -50,8 +53,12 @@ streaming-iterator = "0.1"
 # Windows-friendly path canonicalization, the repo-wide convention.
 dunce = "1"
 # bus.rs: the backend → UI event channel (the task pins tokio channels).
-# `sync` only — no runtime, the watcher threads just try_send.
-tokio = { version = "1", default-features = false, features = ["sync"] }
+# The sync channels feed the watcher threads; M3 adds the app-owned runtime
+# (rt-multi-thread + time) the LspManager captures and requests spawn onto.
+tokio = { version = "1", default-features = false, features = ["sync", "rt-multi-thread", "time", "process"] }
+# The backend crates log through `tracing` (launch failures, crashes); the
+# app prints those to stderr, RUST_LOG filters.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 # ⌘O file dialog, invoked on a plain thread like Steer does (the sync rfd
 # API must not run on gpui's main thread).
 rfd = "0.15"

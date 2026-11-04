@@ -19,7 +19,8 @@ use gpui_component::status_bar::StatusBar;
 use gpui_component::tab::{Tab as ComponentTab, TabBar};
 use gpui_component::{Icon, IconName, Selectable as _, Sizable as _};
 use ide_core::event::NotifyLevel;
-use ide_core::{DocId, IdeEvent};
+use ide_core::event::ServerStatus;
+use ide_core::{DocId, IdeEvent, ServerId};
 use ide_vfs::EntryKind;
 
 use crate::actions::{CloseTab, OpenFile, Redo, Save, Undo};
@@ -44,6 +45,15 @@ struct Tab {
 /// What the status bar shows on the right, until the next message.
 type Message = (NotifyLevel, String);
 
+/// One language server's live status (from `LanguageServer` events), keyed by
+/// server id so restarted instances replace their row.
+struct ServerRow {
+    id: ServerId,
+    name: String,
+    status: ServerStatus,
+    message: Option<String>,
+}
+
 pub struct Workbench {
     host: Option<Arc<Host>>,
     tabs: Vec<Tab>,
@@ -54,6 +64,7 @@ pub struct Workbench {
     /// window-level actions (⌘O) and the tree keys work immediately.
     tree_focused_once: Cell<bool>,
     message: Option<Message>,
+    servers: Vec<ServerRow>,
     bus: Bus,
 }
 
@@ -73,6 +84,7 @@ impl Workbench {
             tree_focus: cx.focus_handle(),
             tree_focused_once: Cell::new(false),
             message: None,
+            servers: Vec::new(),
             bus,
         }
     }
@@ -176,7 +188,7 @@ impl Workbench {
     }
 
     /// Opens `path` in a tab (activating the existing one when already open).
-    fn open_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+    pub fn open_path(&mut self, path: &Path, cx: &mut Context<Self>) {
         let Some(host) = self.host.clone() else {
             self.message = Some((NotifyLevel::Warning, strings::NO_PROJECT.to_owned()));
             cx.notify();
@@ -212,6 +224,9 @@ impl Workbench {
 
     /// The bus pump's landing zone: backend events and the file-dialog result.
     pub fn handle_bus(&mut self, message: BusMessage, cx: &mut Context<Self>) {
+        if let BusMessage::Ide(IdeEvent::Diagnostics { path, items, .. }) = &message {
+            eprintln!("[bus] diagnostics {} x{}", path.0.display(), items.len());
+        }
         match message {
             BusMessage::Picked(path) => {
                 if let Some(path) = path {
@@ -252,6 +267,29 @@ impl Workbench {
             }
             BusMessage::Ide(IdeEvent::Notify { level, title, .. }) => {
                 self.message = Some((level, title));
+                cx.notify();
+            }
+            BusMessage::Ide(IdeEvent::LanguageServer { server, name, status, message }) => {
+                eprintln!("[lsp] {name} -> {status:?} {message:?}");
+                // The status line shows one row per server; a missing binary
+                // also surfaces as a message (its text carries the install
+                // hint; downloading is out of M3 scope).
+                if let Some(row) = self.servers.iter_mut().find(|row| row.id == server) {
+                    row.status = status;
+                    row.message = message.clone();
+                } else {
+                    self.servers.push(ServerRow { id: server, name: name.clone(), status, message: message.clone() });
+                }
+                if matches!(status, ServerStatus::Missing | ServerStatus::Crashed | ServerStatus::Misconfigured) {
+                    self.message = Some((
+                        NotifyLevel::Warning,
+                        message.clone().unwrap_or_else(|| format!("{name} is not running")),
+                    ));
+                }
+                cx.notify();
+            }
+            BusMessage::Ide(IdeEvent::LanguageServerRemoved { server }) => {
+                self.servers.retain(|row| row.id != server);
                 cx.notify();
             }
             BusMessage::Ide(_) => {}
@@ -505,6 +543,25 @@ impl Workbench {
             left = left.child(div().text_color(theme::fg()).child(SharedString::from(file)));
         }
         let mut right = div().flex().items_center().gap_3().text_size(px(12.));
+        // Language-server rows: name + status, colored by health.
+        for row in &self.servers {
+            let (text, color) = match row.status {
+                ServerStatus::Ready | ServerStatus::Busy => (strings::LS_READY.to_owned(), theme::fg_muted()),
+                ServerStatus::Starting => (strings::LS_STARTING.to_owned(), theme::warning()),
+                ServerStatus::Missing | ServerStatus::Crashed | ServerStatus::Misconfigured => {
+                    (strings::LS_DOWN.to_owned(), theme::error())
+                }
+                ServerStatus::Stopped => (strings::LS_STOPPED.to_owned(), theme::fg_muted()),
+            };
+            right = right.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(div().text_color(theme::fg()).child(SharedString::from(row.name.clone())))
+                    .child(div().text_color(color).child(SharedString::from(text))),
+            );
+        }
         right = right.child(div().text_color(state.1).child(SharedString::from(state.0)));
         if let Some((text, color)) = message {
             right = right.child(div().max_w_96().truncate().text_color(color).child(SharedString::from(text)));
