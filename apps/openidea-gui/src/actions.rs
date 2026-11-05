@@ -28,6 +28,7 @@ actions!(
         ToggleTree,
         ToggleDock,
         ReopenClosedTab,
+        OpenSettings,
     ]
 );
 
@@ -120,6 +121,7 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("workbench::Redo", "Redo", "Edit", "⇧⌘Z"),
     action_info!("workbench::ToggleTree", "Toggle Project Tree", "View", "⌘1"),
     action_info!("workbench::ToggleDock", "Toggle Dock", "View", "⌘4"),
+    action_info!("workbench::OpenSettings", "Settings…", "View", "⌘,"),
     action_info!("editor::Paste", "Paste", "Edit", "⌘V"),
     action_info!("editor::TabIndent", "Indent / Expand Template", "Edit", "⇥"),
     action_info!("editor::OutdentLine", "Outdent Line", "Edit", "⇧⇥"),

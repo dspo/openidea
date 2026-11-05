@@ -35,8 +35,8 @@ use crate::actions::{
     Cancel, CloseTab, CodeActions, Commit, CursorDocEnd, CursorDocStart, CursorDown, CursorLeft, CursorLineEnd,
     CursorLineHome, CursorRight, CursorUp, CursorWordLeft, CursorWordRight, DeleteBackward, DeleteForward,
     DeleteWordBackward, DeleteWordForward, Find, FindInFiles, FindUsages, FormatDocument, GoToFile, GotoDefinition,
-    Newline, OpenFile, OrganizeImports, OutdentLine, Paste, Quit, Redo, Rename, ReopenClosedTab, Run, Save,
-    SelectDocEnd, SelectDocStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineHome, SelectRight, SelectUp,
+    Newline, OpenFile, OpenSettings, OrganizeImports, OutdentLine, Paste, Quit, Redo, Rename, ReopenClosedTab, Run,
+    Save, SelectDocEnd, SelectDocStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineHome, SelectRight, SelectUp,
     SelectWordLeft, SelectWordRight, ShowDiff, StopRun, TabIndent, ToggleDock, ToggleInlayHints, TogglePerfHud,
     ToggleReplace, ToggleTree, Undo,
 };
@@ -136,6 +136,8 @@ fn main() {
                     KeyBinding::new("cmd-4", ToggleDock, None),
                     // M7: tab management.
                     KeyBinding::new("shift-cmd-t", ReopenClosedTab, None),
+                    // M7: the minimal settings overlay.
+                    KeyBinding::new("cmd-,", OpenSettings, None),
                     // Escape cancels panels/popups first (whatever has focus),
                     // then collapses the editor's own state.
                     KeyBinding::new("escape", Cancel, None),
