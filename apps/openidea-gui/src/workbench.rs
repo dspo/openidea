@@ -106,6 +106,9 @@ struct Picker {
     query: String,
     files: Vec<FileMatch>,
     symbols: Vec<SymbolMatch>,
+    /// The language server's own `workspace/symbol` answer (M6), kept apart
+    /// from the index rows so neither landing overwrites the other.
+    lsp_symbols: Vec<SymbolMatch>,
     actions: Vec<RankedAction>,
     /// Run mode: the configurations offered, cached at open.
     configs: Vec<RunConfig>,
@@ -650,6 +653,7 @@ impl Workbench {
             query: String::new(),
             files: Vec::new(),
             symbols: Vec::new(),
+            lsp_symbols: Vec::new(),
             actions: Vec::new(),
             configs,
             selected: 0,
@@ -708,6 +712,61 @@ impl Workbench {
         let generation = self.picker_gen;
         let Some(host) = self.host.clone() else { return };
         let everywhere = mode == PickerMode::Everywhere;
+        // The language server's symbol index answers alongside the text
+        // index (M6): same generation guard, its own landing slot.
+        if everywhere && !query.is_empty() {
+            let lsp_host = host.clone();
+            let runtime = lsp_host.runtime.clone();
+            let lsp_query = query.clone();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            runtime.spawn(async move {
+                let result = lsp_host.lsp.workspace_symbols(&lsp_query, ide_core::CancellationToken::new()).await;
+                let _ = tx.send(result);
+            });
+            cx.spawn(async move |this, cx| {
+                if let Ok(result) = rx.await {
+                    this.update(cx, |workbench, cx| {
+                        if workbench.picker_gen != generation {
+                            return;
+                        }
+                        let Ok(symbols) = result else { return };
+                        let Some(picker) = workbench.picker.as_mut() else { return };
+                        let Some(host) = workbench.host.as_ref() else { return };
+                        let root = host.root.clone();
+                        picker.lsp_symbols = symbols
+                            .into_iter()
+                            .map(|symbol| SymbolMatch {
+                                rel_path: symbol
+                                    .location
+                                    .path
+                                    .0
+                                    .strip_prefix(&root)
+                                    .unwrap_or(&symbol.location.path.0)
+                                    .display()
+                                    .to_string(),
+                                name: symbol.name,
+                                kind: symbol.kind,
+                                container: symbol.container,
+                                path: symbol.location.path,
+                                range: symbol.location.range,
+                                score: 0,
+                                indices: Vec::new(),
+                            })
+                            .filter(|match_| {
+                                !picker
+                                    .symbols
+                                    .iter()
+                                    .any(|known| known.path == match_.path && known.range.start == match_.range.start)
+                            })
+                            .take(8)
+                            .collect();
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            })
+            .detach();
+        }
         cx.spawn(async move |this, cx| {
             let answer = cx
                 .background_executor()
@@ -786,6 +845,7 @@ impl Workbench {
                 .cloned()
                 .map(PickerRow::File)
                 .chain(picker.symbols.iter().cloned().map(PickerRow::Symbol))
+                .chain(picker.lsp_symbols.iter().cloned().map(PickerRow::Symbol))
                 .chain(picker.actions.iter().cloned().map(PickerRow::Action))
                 .collect(),
         }
@@ -1749,8 +1809,8 @@ impl Workbench {
             PickerMode::Files => vec![("Files", 0..rows.len())],
             PickerMode::Everywhere => vec![
                 ("Files", 0..picker.files.len()),
-                ("Symbols", picker.files.len()..picker.files.len() + picker.symbols.len()),
-                ("Actions", picker.files.len() + picker.symbols.len()..rows.len()),
+                ("Symbols", picker.files.len()..picker.files.len() + picker.symbols.len() + picker.lsp_symbols.len()),
+                ("Actions", picker.files.len() + picker.symbols.len() + picker.lsp_symbols.len()..rows.len()),
             ],
         };
         let mut list = div().id("picker-list").max_h(px(420.0)).overflow_y_scroll().py_1();
