@@ -21,7 +21,7 @@ use gpui_component::WindowExt as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
-use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
 use gpui_component::status_bar::StatusBar;
 use gpui_component::tab::{Tab as ComponentTab, TabBar};
@@ -230,6 +230,9 @@ pub struct Workbench {
     /// Toasts queued for the window's notification stack (M7): the bus pump
     /// has no window, so every toast lands here and the next render flushes.
     toasts: std::cell::RefCell<Vec<Toast>>,
+    /// Dedupe memory (M8): the last flush time per identical (level, text)
+    /// toast, pruned as the window passes.
+    toast_seen: HashMap<u64, Instant>,
     servers: Vec<ServerRow>,
     /// Diagnostics per file, per producer (`Diagnostics` events replace one
     /// producer's list; the merged view reaches the pane). Sorted by position
@@ -310,6 +313,16 @@ pub struct Workbench {
     /// Live `$/progress` tasks (M6): the servers' indexing / load bursts, so
     /// a big first index reads as work in progress, not a hang.
     tasks: Vec<(ide_core::TaskId, String, Option<String>, Option<f32>)>,
+    /// The open floating context menu (M8): a right-click menu is
+    /// element-scoped gpui-component state, invisible to the Esc chain —
+    /// when anything steals its focus, Esc lands here as a bare Cancel and
+    /// the menu stays up (the M7 leftover). The workbench dismisses it in
+    /// that case, so Esc always closes the topmost surface. `None` when no
+    /// menu (or a stale one) is tracked.
+    open_menu: Option<gpui::WeakEntity<PopupMenu>>,
+    /// The open-menu tracking's own subscription (M8): alive while the menu
+    /// is, cleared when the menu dismisses itself.
+    menu_sub: Option<gpui::Subscription>,
 }
 
 impl Workbench {
@@ -330,6 +343,7 @@ impl Workbench {
             tree_focused_once: Cell::new(false),
             tree_focus_pending: Cell::new(false),
             toasts: std::cell::RefCell::new(Vec::new()),
+            toast_seen: HashMap::new(),
             servers: Vec::new(),
             diagnostics: HashMap::new(),
             bus,
@@ -364,7 +378,41 @@ impl Workbench {
             save_flow: Cell::new(None),
             closed_tabs: Vec::new(),
             tasks: Vec::new(),
+            open_menu: None,
+            menu_sub: None,
         }
+    }
+
+    /// Registers the just-built floating menu (M8): called from every
+    /// `context_menu` builder (tree, tab bar — and the editor's, through the
+    /// bus, since the pane does not know the workbench). The subscription
+    /// clears the tracking when the menu closes by itself (item click,
+    /// click-outside, its own focused Esc), so the chain never sees a ghost.
+    fn menu_opened(&mut self, menu: gpui::Entity<PopupMenu>, cx: &mut Context<Self>) {
+        self.open_menu = Some(menu.downgrade());
+        self.menu_sub = Some(cx.subscribe(&menu, |this, _, _: &gpui::DismissEvent, _| {
+            this.open_menu = None;
+        }));
+    }
+
+    /// Esc's last resort: a floating menu lost its focus (so the menu's own
+    /// Esc binding never fired). Dismissing emits `DismissEvent` — the
+    /// component's own subscription hides it — and focus falls through to
+    /// [`Self::restore_focus`]. A stale handle (the menu already went away
+    /// via click-outside / an item click) just clears.
+    fn dismiss_open_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(menu) = self.open_menu.take() else {
+            eprintln!("[esc] no open menu tracked");
+            return false;
+        };
+        let Some(menu) = menu.upgrade() else {
+            eprintln!("[esc] open menu handle stale");
+            return false;
+        };
+        eprintln!("[esc] dismissing a focus-orphaned floating menu");
+        menu.update(cx, |_, cx| cx.emit(gpui::DismissEvent));
+        self.restore_focus(window, cx);
+        true
     }
 
     /// Kicks a git status + branch refresh (coalesced; no-op without a repo
@@ -406,9 +454,12 @@ impl Workbench {
         self.toasts.borrow_mut().push(Toast { level, text: text.into(), click: Some(click) });
     }
 
-    /// Drains the queue into the window's notifications.
-    fn flush_toasts(&self, window: &mut Window, cx: &mut Context<Self>) {
-        for toast in self.toasts.borrow_mut().drain(..) {
+    /// Drains the queue into the window's notifications. Identical toasts
+    /// inside [`TOAST_DEDUPE_WINDOW`] are suppressed (M8): a burst of saves
+    /// shows one toast instead of stacking five look-alikes.
+    fn flush_toasts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let drained = std::mem::take(&mut *self.toasts.borrow_mut());
+        for toast in dedupe_toasts(drained, &mut self.toast_seen, Instant::now()) {
             let mut note = match toast.level {
                 NotifyLevel::Error => Notification::error(toast.text.clone()),
                 NotifyLevel::Warning => Notification::warning(toast.text.clone()),
@@ -894,6 +945,25 @@ impl Workbench {
     /// pane's own Esc chain never sees it, and ⌘F — an Editor-context action
     /// — is out of reach).
     fn on_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        // The Esc-chain trace (M8): which surface is topmost and who holds the
+        // focus — the soak's diagnostic for "an Esc did nothing".
+        let pane_focused = self
+            .active
+            .and_then(|index| self.tabs.get(index))
+            .is_some_and(|tab| tab.pane.read(cx).focus_handle(cx).contains_focused(window, cx));
+        eprintln!(
+            "[esc] cancel: prompt={} confirm={} commit={} diff={} settings={} picker={} editor={} tree={} root={} focused_id={:?}",
+            self.tree_prompt.is_some(),
+            self.tree_confirm.is_some(),
+            self.commit.is_some(),
+            self.diff.is_some(),
+            self.settings_overlay.is_some(),
+            self.picker.is_some(),
+            pane_focused,
+            self.tree_focus.contains_focused(window, cx),
+            self.root_focus.contains_focused(window, cx),
+            window.focused(cx)
+        );
         if self.settings_overlay.is_some() {
             self.close_settings(window, cx);
         } else if self.tree_confirm.is_some() {
@@ -906,6 +976,9 @@ impl Workbench {
             self.close_diff(window, cx);
         } else if self.picker.is_some() {
             self.close_picker(window, cx);
+        } else if self.dismiss_open_menu(window, cx) {
+            // A floating menu the Esc chain cannot see: dismissed, focus
+            // re-landed by dismiss_open_menu.
         } else {
             self.restore_focus(window, cx);
         }
@@ -1722,6 +1795,11 @@ impl Workbench {
                 self.refresh_git(cx);
                 cx.notify();
             }
+            BusMessage::MenuOpened { menu } => {
+                if let Some(menu) = menu.upgrade() {
+                    self.menu_opened(menu, cx);
+                }
+            }
             BusMessage::Ide(IdeEvent::RunExited { run, code }) => {
                 eprintln!("[run] exited {run} code {code:?}");
                 let mine = self.runs.iter().find(|panel| panel.read(cx).run_id == Some(run)).cloned();
@@ -1879,10 +1957,15 @@ impl Workbench {
             return;
         }
         let input = cx.new(|cx| InputState::new(window, cx));
-        // Rename prefills the current name (typing replaces it).
+        // Rename prefills the current name, pre-selected (M8): typing
+        // replaces it, IDEA-style, instead of appending after it.
         if matches!(kind, TreePromptKind::Rename) {
             let name = target.file_name().unwrap_or_default().to_string_lossy().into_owned();
-            input.update(cx, |state, cx| state.set_value(name, window, cx));
+            let len = name.len();
+            input.update(cx, |state, cx| {
+                state.set_value(name, window, cx);
+                state.set_selected_range(0..len, cx);
+            });
         }
         self.tree_prompt = Some(TreePrompt { kind, target, input: input.clone() });
         self.tree_prompt_sub = Some(cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
@@ -2276,6 +2359,37 @@ fn push_closed(stack: &mut Vec<PathBuf>, path: PathBuf) {
 /// How many closed tabs ⌘⇧T remembers.
 const CLOSED_TAB_CAP: usize = 20;
 
+/// The toast dedupe window (M8): an identical (level, text) toast inside it
+/// is suppressed. Matches the notification stack's auto-hide, so the window
+/// covers exactly "the look-alike toast is still on screen".
+const TOAST_DEDUPE_WINDOW: Duration = Duration::from_secs(5);
+
+/// The dedupe key: severity plus the full text.
+fn toast_key(level: NotifyLevel, text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (level as u8).hash(&mut hasher);
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The flush filter (pure for the unit test): drops toasts identical to one
+/// already shown inside the window, records the survivors, and prunes the
+/// memory of entries whose window has passed.
+fn dedupe_toasts(toasts: Vec<Toast>, seen: &mut HashMap<u64, Instant>, now: Instant) -> Vec<Toast> {
+    seen.retain(|_, at| now.duration_since(*at) < TOAST_DEDUPE_WINDOW);
+    let mut kept = Vec::with_capacity(toasts.len());
+    for toast in toasts {
+        let key = toast_key(toast.level, &toast.text);
+        if seen.get(&key).is_some_and(|at| now.duration_since(*at) < TOAST_DEDUPE_WINDOW) {
+            continue;
+        }
+        seen.insert(key, now);
+        kept.push(toast);
+    }
+    kept
+}
+
 /// A one-off shell command line from the Run palette, as a configuration
 /// (ide-run runs a command with shell characters through the platform shell).
 fn shell_config(line: String) -> RunConfig {
@@ -2607,7 +2721,17 @@ impl Workbench {
                                         this.on_tree_row(path.clone(), kind, event, window, cx)
                                     }
                                 }))
-                                .context_menu(move |menu, _, _| {
+                                .context_menu(move |menu, window, cx| {
+                                    eprintln!(
+                                        "[menu] tree build: focused_present={} menu_focus={:?}",
+                                        window.focused(cx).is_some(),
+                                        menu.focus_handle(cx)
+                                    );
+                                    // Track the menu for the Esc chain (M8): when
+                                    // something steals its focus, Esc lands on the
+                                    // workbench as a bare Cancel and dismisses it.
+                                    let built = cx.entity();
+                                    workbench.update(cx, |this, cx| this.menu_opened(built, cx)).ok();
                                     let menu = menu
                                         .item(PopupMenuItem::new(strings::TREE_NEW_FILE).on_click({
                                             let workbench = workbench.clone();
@@ -2805,7 +2929,10 @@ impl Workbench {
             }));
         div()
             .w_full()
-            .context_menu(move |menu, _, _| {
+            .context_menu(move |menu, _, cx| {
+                // Track the menu for the Esc chain (M8) — same as the tree's.
+                let built = cx.entity();
+                workbench.update(cx, |this, cx| this.menu_opened(built, cx)).ok();
                 menu.item(
                     PopupMenuItem::new(if active_pinned { strings::TAB_UNPIN } else { strings::TAB_PIN }).on_click({
                         let workbench = workbench.clone();
@@ -3623,6 +3750,39 @@ mod closed_tab_tests {
         // No policy in the registry: the editor's default (4 spaces).
         assert_eq!(indent_label(None), "4-space indent (default)");
     }
+
+    #[test]
+    fn toast_bursts_dedupe_inside_the_window() {
+        let toast = |text: &str| Toast { level: NotifyLevel::Info, text: text.to_owned(), click: None };
+        let mut seen = HashMap::new();
+        let t0 = Instant::now();
+
+        // A burst of identical saves flushes exactly one toast.
+        let kept =
+            dedupe_toasts(vec![toast("Saved main.go"), toast("Saved main.go"), toast("Saved main.go")], &mut seen, t0);
+        assert_eq!(kept.len(), 1);
+
+        // A different text inside the window still lands.
+        let kept = dedupe_toasts(vec![toast("Saved store.go")], &mut seen, t0 + Duration::from_millis(100));
+        assert_eq!(kept.len(), 1);
+
+        // The same text inside the window is suppressed.
+        let kept = dedupe_toasts(vec![toast("Saved main.go")], &mut seen, t0 + Duration::from_secs(4));
+        assert_eq!(kept.len(), 0);
+
+        // After the window it lands again (and the memory was pruned).
+        let kept = dedupe_toasts(vec![toast("Saved main.go")], &mut seen, t0 + Duration::from_secs(7));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(seen.len(), 1, "pruned entries must not linger");
+
+        // Severity is part of the identity: an error with the same text shows.
+        let kept = dedupe_toasts(
+            vec![Toast { level: NotifyLevel::Error, text: "Saved main.go".to_owned(), click: None }],
+            &mut seen,
+            t0 + Duration::from_secs(8),
+        );
+        assert_eq!(kept.len(), 1);
+    }
 }
 
 /// The focus / Esc-chain regression (M7). The M3 failure class: a focus left
@@ -3806,5 +3966,46 @@ mod focus_chain_tests {
             // No host → the tree is not rendered → the root sink takes it.
             assert!(this.root_focus.is_focused(window), "focus_active with no tabs stranded the focus");
         });
+    }
+
+    /// The floating-menu face (M8): the M7 leftover — a right-click menu
+    /// that lost its focus never sees the menu's own Esc binding, so Esc
+    /// landed as a bare Cancel and the menu stayed up (mouse-only UX). The
+    /// workbench tracks the open menu and dismisses it as the Esc chain's
+    /// last resort, focus re-landing on a live surface. The menu here is
+    /// the real component entity, registered the way every builder does;
+    /// its focus is deliberately never taken — the focus-orphaned shape.
+    #[gpui::test]
+    fn esc_dismisses_a_focus_orphaned_floating_menu(cx: &mut TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+        bind_keys(cx);
+        let (workbench, mut cx) = mount(cx);
+
+        let dismissed = Rc::new(Cell::new(false));
+        let flag = dismissed.clone();
+        let menu = cx.update(|window, cx| {
+            let menu = gpui_component::menu::PopupMenu::build(window, cx, |menu, _, _| {
+                menu.menu("Close", Box::new(acts::GoToFile))
+            });
+            // Held to the end: a dropped Subscription detaches its callback.
+            let sub = cx.subscribe(&menu, move |_, _: &gpui::DismissEvent, _| flag.set(true));
+            (menu, sub)
+        });
+        let (menu, _dismiss_sub) = menu;
+        // The strong handle stands in for the component's element state (the
+        // real menu's holder); the tracking itself only keeps a weak one.
+        let holder = menu.clone();
+        workbench.update(&mut cx, |this, cx| this.menu_opened(menu, cx));
+        cx.run_until_parked();
+
+        // Esc lands on the workbench chain (the menu holds no focus): it
+        // must dismiss the orphaned menu, clear the tracking and keep the
+        // window dispatching.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(dismissed.get(), "the orphaned menu must receive the dismissal");
+        assert!(cx.read_entity(&workbench, |state, _| state.open_menu.is_none()), "the tracking must clear");
+        assert!(action_lands(&workbench, &mut cx), "actions died after dismissing the menu");
+        drop(holder);
     }
 }

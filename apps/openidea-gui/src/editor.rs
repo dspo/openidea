@@ -1848,7 +1848,12 @@ impl EditorPane {
         }
         let current = self.buf.slice_utf16(start..end);
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("new name"));
-        input.update(cx, |state, cx| state.set_value(current.clone(), window, cx));
+        // Pre-selected (M8): typing replaces the old name, IDEA-style.
+        let len = current.len();
+        input.update(cx, |state, cx| {
+            state.set_value(current.clone(), window, cx);
+            state.set_selected_range(0..len, cx);
+        });
         self.rename = Some(RenameFlow::Input { input, confirmed: false });
         cx.notify();
     }
@@ -3938,6 +3943,9 @@ impl Render for EditorPane {
             window.focus(&self.focus, cx);
         }
         let focus = self.focus.clone();
+        // The Esc-chain registration (M8) sends the opened menu to the
+        // workbench; the pane never holds a workbench handle.
+        let menu_bus = self.bus.clone();
         // Every editor behaviour is an action (bindings in `main.rs`); the
         // handlers funnel through `command`. Verbose on purpose: gpui's
         // `on_action` is typed per action, and macros cannot sit mid-chain.
@@ -4062,7 +4070,10 @@ impl Render for EditorPane {
             // The right-click menu (M7): the existing actions as entries,
             // dispatched into this pane's own handlers through its focus —
             // one source of truth, no second implementation.
-            .context_menu(move |menu, _, _| {
+            .context_menu(move |menu, _, cx| {
+                // Register for the workbench's Esc chain (M8): the pane does
+                // not know the workbench, so the menu rides the bus.
+                menu_bus.send(crate::bus::BusMessage::MenuOpened { menu: cx.entity().downgrade() });
                 menu.action_context(focus.clone())
                     .menu("Go to Definition", Box::new(acts::GotoDefinition))
                     .menu("Find Usages", Box::new(acts::FindUsages))

@@ -79,10 +79,13 @@ impl FindPanel {
     }
 
     /// Enter: hand the query to the workbench through the bus. Cancellation
-    /// is implicit — a newer request drops the older answer.
+    /// is implicit — a newer request drops the older answer. An empty query
+    /// no longer dead-ends (M8): it clears the finished results, so the
+    /// page always has a way back to its pristine state.
     pub fn start_search(&mut self, cx: &mut gpui::Context<Self>) {
         let query = self.query.trim().to_string();
         if query.is_empty() {
+            self.clear_results(cx);
             return;
         }
         self.request += 1;
@@ -91,6 +94,22 @@ impl FindPanel {
         self.last_query = query.clone();
         eprintln!("[find] searching {query:?}");
         self.bus.send(BusMessage::FindInFilesStart { request: self.request, query });
+        cx.notify();
+    }
+
+    /// Drops the finished results and any in-flight answer (a bumped
+    /// request id makes the late answer stale).
+    fn clear_results(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.files.is_empty() && self.summary.is_none() && !self.searching {
+            return;
+        }
+        self.request += 1;
+        self.searching = false;
+        self.files.clear();
+        self.summary = None;
+        self.last_query.clear();
+        self.selected = 0;
+        eprintln!("[find] results cleared");
         cx.notify();
     }
 
@@ -279,5 +298,72 @@ impl Render for FindPanel {
             .h_full(),
         );
         div().flex().flex_col().size_full().bg(theme::surface_bg()).child(header).child(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M8: Enter with an empty query clears the finished results (the page
+    /// held them forever before); a second empty Enter is a no-op; and a
+    /// stale in-flight answer cannot repopulate the cleared page.
+    #[gpui::test]
+    fn empty_enter_clears_results_and_stays_pristine(cx: &mut gpui::TestAppContext) {
+        // The panel's paint reads the component Theme global (main.rs sets
+        // it at startup; tests must seed it themselves).
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+        });
+        let (bus, _rx) = Bus::channel();
+        let (panel, cx) = cx.add_window_view(|window, cx| FindPanel::new(bus, window, cx));
+
+        panel.update(cx, |panel, cx| {
+            // A finished run: the answer's request id matches the current one.
+            panel.finished(
+                panel.request,
+                vec![FileMatches {
+                    path: ide_core::IpcPath::from("/tmp/m8-find/a.rs"),
+                    rel_path: "a.rs".to_owned(),
+                    matches: vec![ide_search::LineMatch {
+                        line: 3,
+                        text: "let find = 1;".to_owned(),
+                        ranges: vec![(4, 8)],
+                        text_offset: 0,
+                    }],
+                }],
+                SearchSummary { files: 1, matches: 1, limit_hit: false, cancelled: false, elapsed_ms: 2 },
+                cx,
+            );
+            assert_eq!(panel.files.len(), 1);
+            // Empty query → clear.
+            panel.start_search(cx);
+            assert!(panel.files.is_empty() && panel.summary.is_none());
+            assert!(!panel.searching);
+        });
+        cx.run_until_parked();
+
+        // Already pristine: another empty Enter changes nothing.
+        panel.update(cx, |panel, cx| {
+            let before = panel.request;
+            panel.start_search(cx);
+            assert_eq!(panel.request, before);
+        });
+
+        // A stale answer (from before the clear) cannot repopulate.
+        panel.update(cx, |panel, cx| {
+            panel.finished(
+                0,
+                vec![FileMatches {
+                    path: ide_core::IpcPath::from("/tmp/m8-find/stale.rs"),
+                    rel_path: "stale.rs".to_owned(),
+                    matches: Vec::new(),
+                }],
+                SearchSummary::default(),
+                cx,
+            );
+            assert!(panel.files.is_empty(), "a stale answer repopulated the cleared page");
+        });
     }
 }

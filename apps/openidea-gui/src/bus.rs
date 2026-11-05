@@ -114,6 +114,12 @@ pub enum BusMessage {
     FsDeleted {
         error: Option<String>,
     },
+    /// The editor's floating context menu just opened (M8): the pane does
+    /// not know the workbench, so the menu's entity rides the bus for the
+    /// Esc chain (a focus-orphaned menu must still close on Esc).
+    MenuOpened {
+        menu: gpui::WeakEntity<gpui_component::menu::PopupMenu>,
+    },
 }
 
 /// The UI end of the event bus. Cheap to clone; `send` never blocks
