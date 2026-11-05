@@ -121,6 +121,11 @@ impl Host {
             )?
         };
         documents.add_observer(Arc::new(LspObserver(lsp.clone())));
+        // Server-initiated edits (`workspace/applyEdit`, the answer channel of
+        // gopls commands) land through Documents like every other workspace
+        // edit, so open tabs reconcile via DocPatched (the Tauri host's hook).
+        let hook_documents = documents.clone();
+        lsp.set_apply_edit_hook(Box::new(move |edit| hook_documents.apply_workspace_edit(&edit).is_ok()));
         let watcher_index = index.clone();
         let watcher = {
             let documents = documents.clone();

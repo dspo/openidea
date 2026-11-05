@@ -41,6 +41,7 @@ use crate::actions as acts;
 use crate::bus::{Bus, BusMessage};
 use crate::highlight::{Highlighter, Kind, ParseResult, input_edit};
 use crate::host::Host;
+use crate::strings;
 use crate::theme;
 
 fn rgba_of(c: u32) -> gpui::Rgba {
@@ -264,6 +265,9 @@ enum Cause {
     /// Tab/Shift-Tab line indentation: its own undo step, selections kept
     /// (indentation happens at line starts, the selection rides along).
     Indent,
+    /// A document format (⌘⌥L): its own undo step (a whole-file rewrite must
+    /// not merge into typing), selections kept (clamped).
+    Format,
     /// Undo/redo/IME marked-text application: no undo entry, selections are
     /// managed by the caller.
     Mechanical,
@@ -663,6 +667,8 @@ pub struct EditorPane {
     // usages) and the rename flow, if one is under way.
     jump: Option<(Vec<Location>, usize)>,
     rename: Option<RenameFlow>,
+    // Code actions (M5 phase 3): the open quick-fix menu and its selection.
+    code_actions: Option<(Vec<ide_lsp::types::CodeAction>, usize)>,
     bus: Bus,
     /// F12 perf overlay counters (phase 7).
     hud: Hud,
@@ -723,6 +729,7 @@ impl EditorPane {
             completion_cancel: None,
             jump: None,
             rename: None,
+            code_actions: None,
             bus,
             hud: Hud::default(),
             created_at: std::time::Instant::now(),
@@ -1004,10 +1011,10 @@ impl EditorPane {
         let selections_before = std::mem::take(&mut self.selections);
         let selections_after = match cause {
             Cause::Typing | Cause::Delete | Cause::Paste => Selection::after_inserts(&changes),
-            // Mechanical/indent batches keep the caller's cursors: they are
-            // restored (undo/redo), ride along (indentation at line starts)
-            // or clamped (IME, patches) afterwards.
-            Cause::ImeCommit | Cause::Mechanical | Cause::Indent => selections_before.clone(),
+            // Mechanical/indent/format batches keep the caller's cursors:
+            // they are restored (undo/redo), ride along (indentation at line
+            // starts), stay put (format) or clamp (IME, patches) afterwards.
+            Cause::ImeCommit | Cause::Mechanical | Cause::Indent | Cause::Format => selections_before.clone(),
         };
         self.selections = normalize_selections(
             selections_after.into_iter().map(|s| clamp_selection(s, self.buf.utf16_len())).collect(),
@@ -1018,6 +1025,10 @@ impl EditorPane {
         self.last_edit =
             Some((std::time::Instant::now(), matches!(cause, Cause::Typing | Cause::Delete | Cause::ImeCommit)));
         self.hover.set(None);
+        // A menu parked over stale offsets is gone once the text moves.
+        if matches!(cause, Cause::Typing | Cause::Delete | Cause::Paste) {
+            self.close_code_actions(cx);
+        }
         // The macOS IME commits printable input per character (Cause::
         // ImeCommit); plain keydowns (Cause::Typing) and deletions re-filter.
         if matches!(cause, Cause::Typing | Cause::Delete | Cause::ImeCommit) {
@@ -1217,6 +1228,7 @@ impl EditorPane {
     /// Moves every cursor (`extend` keeps the anchors). Vertical moves keep
     /// each cursor's goal column; other motions drop it.
     fn move_cursors(&mut self, motion: Motion, extend: bool, cx: &mut gpui::Context<Self>) {
+        self.close_code_actions(cx);
         let vertical = matches!(motion, Motion::Up | Motion::Down);
         let targets: Vec<usize> = self.selections.iter().map(|s| self.motion_target(motion, s)).collect();
         for (index, selection) in self.selections.iter_mut().enumerate() {
@@ -1585,6 +1597,172 @@ impl EditorPane {
         self.rename = None;
         window.focus(&self.focus, cx);
         cx.notify();
+    }
+
+    // -- code actions & format (M5 phase 3) ----------------------------------
+    //
+    // ⌥⏎ asks the server for quick fixes at the caret and opens a menu; the
+    // chosen action applies its workspace edit through Documents (the M3
+    // rename path), resolving first when the server deferred it, or executes
+    // the command for command-only actions. ⌘⌥L formats through the server
+    // and applies the returned edits as one undoable batch.
+
+    /// The caret as an empty LSP range (what quick-fix requests want).
+    fn caret_range(&self) -> ide_core::Range {
+        let pos = self.caret_pos();
+        ide_core::Range::point(pos)
+    }
+
+    pub fn request_code_actions(&mut self, cx: &mut gpui::Context<Self>) {
+        self.close_code_actions(cx);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let lsp = self.host.lsp.clone();
+        let doc = self.doc_id;
+        let range = self.caret_range();
+        self.host.runtime.spawn(async move {
+            let result = lsp.code_actions(doc, range, Vec::new()).await;
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.await {
+                this.update(cx, |pane, cx| pane.code_actions_ready(result, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    fn code_actions_ready(&mut self, result: IdeResult<Vec<ide_lsp::types::CodeAction>>, cx: &mut gpui::Context<Self>) {
+        match result {
+            Ok(actions) if !actions.is_empty() => {
+                eprintln!("[lsp] code actions {}", actions.len());
+                self.code_actions = Some((actions, 0));
+            }
+            Ok(_) => {
+                self.host.sink.emit(ide_core::IdeEvent::Notify {
+                    level: ide_core::event::NotifyLevel::Info,
+                    title: strings::NO_CODE_ACTIONS.into(),
+                    body: None,
+                });
+            }
+            Err(e) => {
+                self.host.sink.emit(ide_core::IdeEvent::Notify {
+                    level: ide_core::event::NotifyLevel::Warning,
+                    title: format!("{}: {}", strings::CODE_ACTIONS_UNAVAILABLE, e.message),
+                    body: None,
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Enter on the menu: edit-bearing actions apply right away; the rest
+    /// resolve first (the edit may arrive), then either apply or execute.
+    fn apply_code_action(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some((actions, selected)) = self.code_actions.take() else { return };
+        let Some(action) = actions.into_iter().nth(selected) else { return };
+        cx.notify();
+        if action.edit.is_some() {
+            self.finish_code_action(action, cx);
+            return;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let lsp = self.host.lsp.clone();
+        let doc = self.doc_id;
+        self.host.runtime.spawn(async move {
+            let resolved = lsp.resolve_code_action(doc, action).await;
+            let _ = tx.send(resolved);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(resolved)) = rx.await {
+                this.update(cx, |pane, cx| pane.finish_code_action(resolved, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Applies a resolved action: its edit (if any) through Documents, then
+    /// any leftover command (`workspace/executeCommand`; the server's edit
+    /// answers ride the apply-edit hook installed at open).
+    fn finish_code_action(&mut self, action: ide_lsp::types::CodeAction, cx: &mut gpui::Context<Self>) {
+        if let Some(edit) = &action.edit
+            && let Err(e) = self.host.apply_workspace_edit(edit)
+        {
+            self.host.sink.emit(ide_core::IdeEvent::Notify {
+                level: ide_core::event::NotifyLevel::Error,
+                title: format!("{}: {}", strings::CODE_ACTION_FAILED, e.message),
+                body: None,
+            });
+        }
+        let Some(command) = action.command else { return };
+        let lsp = self.host.lsp.clone();
+        let doc = self.doc_id;
+        eprintln!("[lsp] execute command {}", command.command);
+        self.host.runtime.spawn(async move {
+            let _ = lsp.execute_command(doc, command).await;
+        });
+        cx.notify();
+    }
+
+    fn close_code_actions(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.code_actions.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn code_actions_move(&mut self, delta: isize, cx: &mut gpui::Context<Self>) {
+        if let Some((actions, selected)) = &mut self.code_actions {
+            let count = actions.len().max(1) as isize;
+            *selected = ((*selected as isize + delta).rem_euclid(count)) as usize;
+            cx.notify();
+        }
+    }
+
+    /// ⌘⌥L: the server's formatting edits as one batch (Cause::Format keeps
+    /// the selection; undo reverts the whole rewrite).
+    pub fn format_document(&mut self, cx: &mut gpui::Context<Self>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let lsp = self.host.lsp.clone();
+        let doc = self.doc_id;
+        let options = ide_lsp::types::FormatOptions {
+            tab_size: self.indent.tab_size,
+            insert_spaces: self.indent.insert_spaces,
+            on_save: false,
+            tool: None,
+        };
+        self.host.runtime.spawn(async move {
+            let result = lsp.format(doc, None, options).await;
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.await {
+                this.update(cx, |pane, cx| pane.format_ready(result, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    fn format_ready(&mut self, result: IdeResult<Vec<ide_core::TextEdit>>, cx: &mut gpui::Context<Self>) {
+        match result {
+            Ok(edits) if !edits.is_empty() => {
+                let changes = text_edits_to_changes(&edits, &self.buf);
+                eprintln!("[lsp] format {} edits", changes.len());
+                self.apply_edits(changes, Cause::Format, cx);
+            }
+            Ok(_) => {
+                self.host.sink.emit(ide_core::IdeEvent::Notify {
+                    level: ide_core::event::NotifyLevel::Info,
+                    title: strings::ALREADY_FORMATTED.into(),
+                    body: None,
+                });
+            }
+            Err(e) => {
+                self.host.sink.emit(ide_core::IdeEvent::Notify {
+                    level: ide_core::event::NotifyLevel::Warning,
+                    title: format!("{}: {}", strings::FORMAT_UNAVAILABLE, e.message),
+                    body: None,
+                });
+            }
+        }
     }
 
     // -- completion (M3 phase 4) ---------------------------------------------
@@ -1963,6 +2141,28 @@ impl EditorPane {
                 Command::Cancel => {
                     self.jump = None;
                     cx.notify();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // The quick-fix menu owns navigation and confirm like the jump list.
+        if self.code_actions.is_some() {
+            match cmd {
+                Command::Move(Motion::Up, false) => {
+                    self.code_actions_move(-1, cx);
+                    return;
+                }
+                Command::Move(Motion::Down, false) => {
+                    self.code_actions_move(1, cx);
+                    return;
+                }
+                Command::Newline => {
+                    self.apply_code_action(cx);
+                    return;
+                }
+                Command::Cancel => {
+                    self.close_code_actions(cx);
                     return;
                 }
                 _ => {}
@@ -2473,6 +2673,22 @@ fn paste_ranges(selections: &[Selection]) -> Vec<(usize, usize)> {
     ranges
 }
 
+/// Server `TextEdit`s (IDE positions, UTF-16) as ascending non-overlapping
+/// buffer changes — the shape one `apply_edits` batch needs (formatting).
+fn text_edits_to_changes(edits: &[ide_core::TextEdit], buf: &Buffer) -> Vec<TextChange> {
+    let mut changes: Vec<TextChange> = edits
+        .iter()
+        .map(|edit| {
+            let from = buf.line_start(edit.range.start.line).min(buf.utf16_len()) + edit.range.start.col as usize;
+            let to = buf.line_start(edit.range.end.line).min(buf.utf16_len()) + edit.range.end.col as usize;
+            TextChange { from: from.min(to) as u32, to: to.max(from) as u32, insert: edit.new_text.clone() }
+        })
+        .filter(|change| change.from < change.to || !change.insert.is_empty())
+        .collect();
+    changes.sort_by_key(|change| (change.from, change.to));
+    changes
+}
+
 impl Render for EditorPane {
     fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
         if !self.focused_once.get() {
@@ -2581,11 +2797,15 @@ impl Render for EditorPane {
             .children(self.render_completion_popup(window, cx))
             // Jump list: definitions / usages across files.
             .children(self.render_jump_list(cx))
+            // Quick-fix menu (⌥⏎).
+            .children(self.render_code_actions(cx))
             // Rename: input overlay, then the workspace-edit preview.
             .children(self.render_rename(window, cx))
             .on_action(cx.listener(|this, _: &acts::GotoDefinition, _, cx| this.goto_definition(cx)))
             .on_action(cx.listener(|this, _: &acts::FindUsages, _, cx| this.find_usages(cx)))
             .on_action(cx.listener(|this, _: &acts::Rename, window, cx| this.start_rename(window, cx)))
+            .on_action(cx.listener(|this, _: &acts::CodeActions, _, cx| this.request_code_actions(cx)))
+            .on_action(cx.listener(|this, _: &acts::FormatDocument, _, cx| this.format_document(cx)))
             // Navigation/refactoring handlers arrive in later M3 phases.
             .child(EditorElement { view: cx.entity() })
     }
@@ -2731,6 +2951,58 @@ impl EditorPane {
             None => None,
         }
     }
+    /// The quick-fix menu (⌥⏎): the server's actions for the caret, parked
+    /// near the top of the text area like the jump list. ↑/↓ move, Enter
+    /// applies, Esc closes (all through [`EditorPane::command`]).
+    fn render_code_actions(&self, _cx: &mut gpui::Context<Self>) -> Option<gpui::AnyElement> {
+        let (actions, selected) = self.code_actions.as_ref()?;
+        let geometry = self.geometry.get()?;
+        let x = geometry.origin.x + px(80.0) - px(geometry.scroll_x);
+        let y = geometry.origin.y + px(40.0);
+        let mut list = gpui::div().flex().flex_col();
+        for (index, action) in actions.iter().enumerate().take(14) {
+            let is_selected = index == *selected;
+            let mut row = gpui::div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .h(px(22.0))
+                .text_size(px(12.))
+                .child(gpui::div().text_color(theme::fg()).child(SharedString::from(action.title.clone())));
+            if let Some(kind) = &action.kind {
+                row = row.child(
+                    gpui::div()
+                        .text_color(theme::fg_muted())
+                        .text_size(px(10.))
+                        .child(SharedString::from(kind.clone())),
+                );
+            }
+            if action.is_preferred {
+                row = row.child(
+                    gpui::div().text_color(theme::accent()).text_size(px(10.)).child(strings::CODE_ACTION_PREFERRED),
+                );
+            }
+            if is_selected {
+                row = row.bg(theme::selected_bg());
+            }
+            list = list.child(row);
+        }
+        Some(
+            gpui::div()
+                .absolute()
+                .left(x)
+                .top(y)
+                .w(px(520.0))
+                .border_1()
+                .border_color(theme::border())
+                .bg(theme::raised_bg())
+                .py_1()
+                .child(list)
+                .into_any_element(),
+        )
+    }
+
     /// The completion popup, anchored at the primary caret from the last
     /// frame's geometry. The typed word filters server order; ↑/↓ move, Enter
     /// accepts, Esc closes (all through [`EditorPane::command`]).
@@ -3781,6 +4053,34 @@ mod tests {
         assert_eq!(buf.line_span(0), 0..3);
         assert_eq!(buf.line_span(1), 4..7);
         assert_eq!(buf.slice_utf16(0..buf.utf16_len()), "abc\ndef");
+    }
+
+    #[test]
+    fn text_edits_become_sorted_changes() {
+        let buf = Buffer::new("hello world\nsecond line\n");
+        // Out-of-order, clamped and duplicate edits normalize into one batch.
+        let edits = vec![
+            ide_core::TextEdit {
+                range: ide_core::Range::new(ide_core::Pos::new(1, 0), ide_core::Pos::new(1, 6)),
+                new_text: "SECOND".into(),
+            },
+            ide_core::TextEdit {
+                range: ide_core::Range::new(ide_core::Pos::new(0, 6), ide_core::Pos::new(0, 11)),
+                new_text: "there".into(),
+            },
+        ];
+        let changes = text_edits_to_changes(&edits, &buf);
+        assert_eq!(
+            changes,
+            vec![tc(6, 11, "there"), tc(12, 18, "SECOND")],
+            "ascending, non-overlapping, line starts resolved"
+        );
+        // A no-op edit (empty range, empty insert) drops.
+        let edits = vec![ide_core::TextEdit {
+            range: ide_core::Range::new(ide_core::Pos::new(0, 0), ide_core::Pos::new(0, 0)),
+            new_text: String::new(),
+        }];
+        assert!(text_edits_to_changes(&edits, &buf).is_empty());
     }
 
     #[test]
