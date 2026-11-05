@@ -1347,6 +1347,11 @@ impl Workbench {
             && let Some(pane) = self.tabs.get(index).map(|tab| tab.pane.clone())
         {
             window.focus(&pane.read(cx).focus_handle(cx), cx);
+        } else {
+            // No active pane (the last tab just closed): fall back through
+            // the chain — a focus left on the unmounted pane silences every
+            // action (the M3 death class; caught live in M7).
+            self.restore_focus(window, cx);
         }
     }
 
@@ -3779,5 +3784,21 @@ mod focus_chain_tests {
         cx.simulate_keystrokes("shift-cmd-o");
         cx.run_until_parked();
         assert!(overlay_open(&workbench, &cx, "picker"));
+    }
+
+    /// `focus_active` with NO active pane (⌘W closed the last tab — caught
+    /// live in the M7 scratch session) must fall back through the chain, not
+    /// strand the focus on the unmounted pane.
+    #[gpui::test]
+    fn focus_active_without_a_tab_still_lands_on_a_live_surface(cx: &mut TestAppContext) {
+        bind_keys(cx);
+        let (workbench, mut cx) = mount(cx);
+
+        workbench.update_in(&mut cx, |this, window, cx| {
+            assert!(this.active.is_none());
+            this.focus_active(window, cx);
+            // No host → the tree is not rendered → the root sink takes it.
+            assert!(this.root_focus.is_focused(window), "focus_active with no tabs stranded the focus");
+        });
     }
 }
