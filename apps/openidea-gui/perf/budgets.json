@@ -1,0 +1,49 @@
+{
+  "metrics": [
+    {
+      "id": "key_to_px",
+      "label": "keystroke to pixel (gopls + inlay hints on)",
+      "budget_ms": 16.0,
+      "budget_release_ms": 8.0,
+      "baseline_debug_ms": 5.18,
+      "baseline_release_ms": 6.4,
+      "source": "M2 budget 16 ms; M2 release baseline 6.4 ms; M6 debug with hints 5.18 ms"
+    },
+    {
+      "id": "completion_first_frame",
+      "label": "completion popup request to first paint",
+      "budget_ms": 500.0,
+      "budget_release_ms": 300.0,
+      "baseline_debug_ms": null,
+      "baseline_release_ms": null,
+      "source": "no prior instrument; includes the 140 ms debounce by design — calibrated in M8"
+    },
+    {
+      "id": "find_in_files_first_response",
+      "label": "Find in Files Enter to results (multi-language repo)",
+      "budget_ms": 1500.0,
+      "budget_release_ms": 800.0,
+      "baseline_debug_ms": 4.0,
+      "baseline_release_ms": null,
+      "source": "M5 measured 4 ms on the small go-app fixture; budget set for the repository-scale scenario"
+    },
+    {
+      "id": "scroll_frame_during_index",
+      "label": "frame cost while scrolling during gopls's first index",
+      "budget_ms": 50.0,
+      "budget_release_ms": 25.0,
+      "baseline_debug_ms": null,
+      "baseline_release_ms": null,
+      "source": "no prior instrument — calibrated in M8"
+    },
+    {
+      "id": "open_first_paint",
+      "label": "editor open to first paint",
+      "budget_ms": 400.0,
+      "budget_release_ms": 200.0,
+      "baseline_debug_ms": null,
+      "baseline_release_ms": null,
+      "source": "the [perf] first paint line existed since M2; budget set in M8"
+    }
+  ]
+}

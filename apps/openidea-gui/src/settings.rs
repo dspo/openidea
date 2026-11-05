@@ -479,7 +479,9 @@ mod tests {
 
         // Reading the store prunes entries whose project directory is gone
         // (nothing here exists on the test machine).
-        let store = parse(r#"{"session": { "/tmp/m8-gone": { "tabs": [{"path": "/tmp/m8-gone/a.go"}], "active": 0 } } }"#).unwrap();
+        let store =
+            parse(r#"{"session": { "/tmp/m8-gone": { "tabs": [{"path": "/tmp/m8-gone/a.go"}], "active": 0 } } }"#)
+                .unwrap();
         assert!(from_store(store).session.is_empty());
     }
 

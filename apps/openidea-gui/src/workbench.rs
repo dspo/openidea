@@ -313,6 +313,9 @@ pub struct Workbench {
     /// Live `$/progress` tasks (M6): the servers' indexing / load bursts, so
     /// a big first index reads as work in progress, not a hang.
     tasks: Vec<(ide_core::TaskId, String, Option<String>, Option<f32>)>,
+    /// Whether any live task exists (M8): its edges trace
+    /// `[perf] indexing on/off` for the budget scenario's correlation.
+    indexing: Cell<bool>,
     /// The open floating context menu (M8): a right-click menu is
     /// element-scoped gpui-component state, invisible to the Esc chain —
     /// when anything steals its focus, Esc lands here as a bare Cancel and
@@ -378,6 +381,7 @@ impl Workbench {
             save_flow: Cell::new(None),
             closed_tabs: Vec::new(),
             tasks: Vec::new(),
+            indexing: Cell::new(false),
             open_menu: None,
             menu_sub: None,
         }
@@ -1918,7 +1922,9 @@ impl Workbench {
             }
             BusMessage::Ide(IdeEvent::Task { id, title, message, fraction, done, .. }) => {
                 // gopls announces its load/index bursts here; the status bar
-                // shows the live ones until their `end`.
+                // shows the live ones until their `end`. The indexing window
+                // is traced (M8) so the budget scenario can correlate the
+                // scroll-frame samples with the first big index.
                 if done {
                     self.tasks.retain(|(live, ..)| *live != id);
                 } else {
@@ -1930,6 +1936,10 @@ impl Workbench {
                         }
                         None => self.tasks.push((id, title, message, fraction)),
                     }
+                }
+                let indexing = !self.tasks.is_empty();
+                if indexing != self.indexing.replace(indexing) {
+                    eprintln!("[perf] indexing {}", if indexing { "on" } else { "off" });
                 }
                 cx.notify();
             }
