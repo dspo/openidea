@@ -25,7 +25,7 @@ use gpui_component::tab::{Tab as ComponentTab, TabBar};
 use gpui_component::{Icon, IconName, Selectable as _, Sizable as _};
 use ide_core::event::NotifyLevel;
 use ide_core::event::ServerStatus;
-use ide_core::{Diagnostic, DocId, IdeEvent, ServerId};
+use ide_core::{Diagnostic, DocId, IdeError, IdeEvent, ServerId};
 use ide_index::{FileMatch, SymbolFilter, SymbolMatch};
 use ide_run::RunConfig;
 use ide_vcs::ChangeKind;
@@ -205,6 +205,9 @@ pub struct Workbench {
     last_shift: Cell<Option<Instant>>,
     /// Whether ⇧ was held at the last modifiers event (rising-edge detection).
     shift_held: Cell<bool>,
+    /// ⌘S's organize-imports-then-save flow in flight (M6), if any: the doc
+    /// it organizes. A second ⌘S on it saves plainly instead of queueing.
+    save_flow: Cell<Option<DocId>>,
 }
 
 impl Workbench {
@@ -245,6 +248,7 @@ impl Workbench {
             restore_focus_pending: Cell::new(false),
             last_shift: Cell::new(None),
             shift_held: Cell::new(false),
+            save_flow: Cell::new(None),
         }
     }
 
@@ -299,13 +303,54 @@ impl Workbench {
     /// ⌘S: writes the document to disk through the VFS. The pane's edits
     /// already reached the backend document model (every keystroke goes
     /// through `Documents::edit`), so there is nothing to push.
+    /// M6: a dirty Go document gets the Go DX save first —
+    /// `source.organizeImports` (unused imports dropped, the block sorted —
+    /// gopls's own behavior) applied through Documents, then the write. Any
+    /// failure falls back to the plain save, so saving is never blocked by
+    /// the organizer; one flow at a time, a second ⌘S on the same doc while
+    /// one runs saves plainly.
     fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.active else { return };
         let Some(host) = self.host.clone() else { return };
-        let (doc, name) = {
+        let (doc, path, name) = {
             let tab = &self.tabs[index];
-            (tab.doc, file_name(&tab.path))
+            (tab.doc, tab.path.clone(), file_name(&tab.path))
         };
+        let organizable = self.tabs[index].dirty
+            && host.languages.detect(&path, None).as_str() == "go"
+            && self.save_flow.get().is_none_or(|busy| busy != doc);
+        if organizable {
+            self.save_flow.set(Some(doc));
+            let bus = self.bus.clone();
+            let runtime = host.runtime.clone();
+            runtime.spawn(async move {
+                let organized = async {
+                    let info = host.snapshot(doc)?;
+                    let last = info.text.lines().count().saturating_sub(1) as u32;
+                    let range = ide_core::Range::new(ide_core::Pos::new(0, 0), ide_core::Pos::new(last, 0));
+                    match crate::editor::organize_imports_action(&host.lsp, doc, range).await {
+                        Ok(Some(action)) => {
+                            eprintln!("[lsp] organize imports on save");
+                            if let Some(edit) = &action.edit {
+                                host.apply_workspace_edit(edit)?;
+                            }
+                            Ok::<bool, IdeError>(true)
+                        }
+                        Ok(None) => Ok(false),
+                        Err(e) => {
+                            eprintln!("[lsp] organize imports on save skipped: {}", e.message);
+                            Ok(false)
+                        }
+                    }
+                }
+                .await
+                .unwrap_or(false);
+                let error = host.save_document(doc).err().map(|e| e.message);
+                bus.send(BusMessage::SaveFinished { doc, name, organized, error });
+            });
+            cx.notify();
+            return;
+        }
         let tab = &mut self.tabs[index];
         match host.save_document(doc) {
             Ok(()) => {
@@ -1203,6 +1248,37 @@ impl Workbench {
                     });
                     self.message = Some((NotifyLevel::Info, format!("{} {code:?}", strings::RUN_EXITED)));
                 }
+                cx.notify();
+            }
+            BusMessage::SaveFinished { doc, name, organized, error } => {
+                // ⌘S's async organize-then-write round trip landed. Clear the
+                // flow guard, mirror the flags the synchronous path used to
+                // set, and surface what happened (an organizer change is part
+                // of the toast so the import cleanup is visible).
+                if self.save_flow.get() == Some(doc) {
+                    self.save_flow.set(None);
+                }
+                if error.is_none()
+                    && let Some(tab) = self.tabs.iter_mut().find(|tab| tab.doc == doc)
+                {
+                    tab.dirty = false;
+                    tab.stale = false;
+                }
+                match &error {
+                    None => {
+                        let note = if organized {
+                            format!("{} · {}", strings::SAVED_TOAST, strings::ORGANIZED_IMPORTS)
+                        } else {
+                            strings::SAVED_TOAST.to_owned()
+                        };
+                        self.message = Some((NotifyLevel::Info, format!("{note} {name}")));
+                    }
+                    Some(message) => {
+                        self.message =
+                            Some((NotifyLevel::Error, format!("{} {name}: {}", strings::SAVE_FAILED, message)));
+                    }
+                }
+                eprintln!("[save] {name} organized={organized} error={error:?}");
                 cx.notify();
             }
             BusMessage::Ide(_) => {}

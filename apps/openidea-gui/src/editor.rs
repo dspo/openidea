@@ -1901,6 +1901,55 @@ impl EditorPane {
         .detach();
     }
 
+    /// The whole document as an LSP range (source actions want everything).
+    fn document_range(&self) -> ide_core::Range {
+        let last = self.buf.line_count().saturating_sub(1);
+        ide_core::Range::new(ide_core::Pos::new(0, 0), ide_core::Pos::new(last, 0))
+    }
+
+    /// ⌃⌥O: the server's `source.organizeImports` action applied directly —
+    /// no menu; unused imports dropped and the import block sorted are gopls's
+    /// own behavior. Edit-bearing after resolve; the applied workspace edit
+    /// lands through Documents like every rename/quick-fix (⌘S runs the same
+    /// shape on the workbench side before writing the file).
+    pub fn organize_imports(&mut self, cx: &mut gpui::Context<Self>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let lsp = self.host.lsp.clone();
+        let doc = self.doc_id;
+        let range = self.document_range();
+        self.host.runtime.spawn(async move {
+            let result = organize_imports_action(&lsp, doc, range).await;
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.await {
+                this.update(cx, |pane, cx| pane.organize_ready(result, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    fn organize_ready(&mut self, result: IdeResult<Option<ide_lsp::types::CodeAction>>, cx: &mut gpui::Context<Self>) {
+        match result {
+            Ok(Some(action)) => self.finish_code_action(action, cx),
+            Ok(None) => {
+                self.host.sink.emit(ide_core::IdeEvent::Notify {
+                    level: ide_core::event::NotifyLevel::Info,
+                    title: strings::ORGANIZE_NO_ACTIONS.into(),
+                    body: None,
+                });
+            }
+            Err(e) => {
+                self.host.sink.emit(ide_core::IdeEvent::Notify {
+                    level: ide_core::event::NotifyLevel::Warning,
+                    title: format!("{}: {}", strings::CODE_ACTIONS_UNAVAILABLE, e.message),
+                    body: None,
+                });
+            }
+        }
+        cx.notify();
+    }
+
     fn format_ready(&mut self, result: IdeResult<Vec<ide_core::TextEdit>>, cx: &mut gpui::Context<Self>) {
         match result {
             Ok(edits) if !edits.is_empty() => {
@@ -3447,6 +3496,25 @@ fn text_edits_to_changes(edits: &[ide_core::TextEdit], buf: &Buffer) -> Vec<Text
     changes
 }
 
+/// Fetches the server's `source.organizeImports` action over `range` (⌘S's
+/// pre-save step and ⌃⌥O): the first action of that kind, resolved when the
+/// server deferred its edit. `None` when the server offers none (nothing to
+/// organize, or not a language it serves).
+pub async fn organize_imports_action(
+    lsp: &ide_lsp::LspManager,
+    doc: DocId,
+    range: ide_core::Range,
+) -> IdeResult<Option<ide_lsp::types::CodeAction>> {
+    const SOURCE_ORGANIZE: &str = "source.organizeImports";
+    let mut actions = lsp.code_actions(doc, range, vec![SOURCE_ORGANIZE.to_owned()]).await?;
+    actions.retain(|action| action.kind.as_deref() == Some(SOURCE_ORGANIZE) && action.disabled_reason.is_none());
+    let Some(action) = actions.into_iter().next() else { return Ok(None) };
+    if action.edit.is_some() {
+        return Ok(Some(action));
+    }
+    Ok(Some(lsp.resolve_code_action(doc, action).await?))
+}
+
 /// Shifts one UTF-16 range through an ascending change batch (pre-batch
 /// coordinates, the same convention `after_edits` uses for the syntax tree);
 /// a batch that ran through the range drops it.
@@ -3591,6 +3659,7 @@ impl Render for EditorPane {
             .on_action(cx.listener(|this, _: &acts::Rename, window, cx| this.start_rename(window, cx)))
             .on_action(cx.listener(|this, _: &acts::CodeActions, _, cx| this.request_code_actions(cx)))
             .on_action(cx.listener(|this, _: &acts::FormatDocument, _, cx| this.format_document(cx)))
+            .on_action(cx.listener(|this, _: &acts::OrganizeImports, _, cx| this.organize_imports(cx)))
             .on_action(cx.listener(|this, _: &acts::Find, window, cx| this.open_find(window, cx)))
             .on_action(cx.listener(|this, _: &acts::ToggleReplace, _, cx| this.find_toggle_replace(cx)))
             // Navigation/refactoring handlers arrive in later M3 phases.

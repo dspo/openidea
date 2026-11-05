@@ -81,6 +81,16 @@ pub enum BusMessage {
         pos: Pos,
         query: String,
     },
+    /// ⌘S's organize-imports-then-save round trip finished (M6; the code
+    /// action + write ran on the app runtime). `organized` says whether the
+    /// server actually changed the imports; the error text (when set) failed
+    /// the plain save.
+    SaveFinished {
+        doc: ide_core::DocId,
+        name: String,
+        organized: bool,
+        error: Option<String>,
+    },
 }
 
 /// The UI end of the event bus. Cheap to clone; `send` never blocks
