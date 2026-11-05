@@ -2639,10 +2639,26 @@ impl EditorPane {
         if let Some(ranges) = linked
             && ranges.iter().any(|(start, end)| base.start >= *start && base.end <= *end)
         {
+            // Plain per-character commits arrive as an empty range at the
+            // caret: mirror the insert at the same occurrence-relative
+            // offset into every linked occurrence (a whole-occurrence
+            // replace here ate the other occurrences' typed text — found
+            // driving the M5 exit loop). A non-empty base (a composition,
+            // or a replaced selection) replaces each whole occurrence: the
+            // other cursors froze during composition, so their full text is
+            // what the commit means to replace.
+            let matched = ranges
+                .iter()
+                .find(|(start, end)| base.start >= *start && base.end <= *end)
+                .map(|(start, _)| base.start - *start)
+                .unwrap_or(0);
             let mut changes = Vec::with_capacity(ranges.len());
             for (start, end) in ranges {
                 if base.start >= start && base.end <= end {
                     changes.push(TextChange { from: base.start as u32, to: base.end as u32, insert: text.to_owned() });
+                } else if base.start == base.end {
+                    let at = start + matched.min(end - start);
+                    changes.push(TextChange { from: at as u32, to: at as u32, insert: text.to_owned() });
                 } else {
                     changes.push(TextChange { from: start as u32, to: end as u32, insert: text.to_owned() });
                 }
