@@ -96,3 +96,9 @@ pub const FS_DELETE_FAILED: &str = "Delete failed";
 pub const DELETE_FILE_MESSAGE: &str = "Delete";
 pub const DELETE_FOLDER_MESSAGE: &str = "Delete";
 pub const DELETE_AND_CONTENTS: &str = "and everything inside it? The folder moves to the Trash.";
+// Settings overlay (M7).
+pub const SETTINGS_TITLE: &str = "Settings";
+pub const SETTINGS_FONT: &str = "Editor font size";
+pub const SETTINGS_INDENT: &str = "Indent";
+pub const SETTINGS_INDENT_DEFAULT: &str = "Follows the language defaults";
+pub const SETTINGS_KEYMAP: &str = "Keymap";

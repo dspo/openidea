@@ -186,6 +186,11 @@ struct TreeConfirm {
     name: String,
 }
 
+/// The settings overlay (⌘,): font size steppers, the active tab's indent
+/// policy (read-only), the keymap table (read-only, from the action
+/// registry). The values live in `self.settings`; the flag only paints.
+struct SettingsOverlay;
+
 /// What a toast click does (M7): a toast is a notification, but some carry
 /// a jump — the failed save's editor, the failed run's dock.
 #[derive(Clone, Copy)]
@@ -284,6 +289,9 @@ pub struct Workbench {
     tree_prompt_focus_pending: Cell<bool>,
     /// The delete confirmation overlay (M7).
     tree_confirm: Option<TreeConfirm>,
+    /// The settings overlay (⌘,) and its focus handle (Esc closes it).
+    settings_overlay: Option<SettingsOverlay>,
+    settings_focus: FocusHandle,
     /// Set when a bus message closed an overlay: the next render hands the
     /// focus back to the editor (or the tree).
     restore_focus_pending: Cell<bool>,
@@ -342,6 +350,8 @@ impl Workbench {
             tree_prompt_sub: None,
             tree_prompt_focus_pending: Cell::new(false),
             tree_confirm: None,
+            settings_overlay: None,
+            settings_focus: cx.focus_handle(),
             restore_focus_pending: Cell::new(false),
             last_shift: Cell::new(None),
             shift_held: Cell::new(false),
@@ -1988,6 +1998,214 @@ impl Workbench {
             .detach();
         cx.notify();
     }
+
+    // -- settings overlay (M7) ---------------------------------------------
+
+    /// ⌘,: the settings overlay. One at a time; the panel takes the focus so
+    /// Esc lands on its Cancel handler.
+    fn on_open_settings(&mut self, _: &acts::OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_overlay.is_some() {
+            return;
+        }
+        self.settings_overlay = Some(SettingsOverlay);
+        window.focus(&self.settings_focus, cx);
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_overlay.take().is_none() {
+            return;
+        }
+        self.restore_focus(window, cx);
+        cx.notify();
+    }
+
+    /// The font-size steppers: clamp, persist, re-metric. The panes re-read
+    /// `theme::px_font_size` on their next render, so each is notified here.
+    fn step_font(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let next = step_font_size(self.settings.font_size, delta);
+        if next == self.settings.font_size {
+            return;
+        }
+        self.settings.font_size = next;
+        theme::set_font_size(next);
+        settings::save(&self.settings);
+        for tab in &self.tabs {
+            tab.pane.update(cx, |_, cx| cx.notify());
+        }
+        cx.notify();
+    }
+
+    /// The settings overlay's indent row: the active tab's language policy
+    /// from the registry (a read-only display; the pane's editorconfig
+    /// override still wins at edit time), or the default note without a file.
+    fn indent_row_text(&self) -> String {
+        let Some(index) = self.active else { return strings::SETTINGS_INDENT_DEFAULT.to_owned() };
+        let Some(host) = &self.host else { return strings::SETTINGS_INDENT_DEFAULT.to_owned() };
+        let path = &self.tabs[index].path;
+        let id = host.languages.detect(path, None);
+        host.languages.get(&id).map_or_else(
+            || strings::SETTINGS_INDENT_DEFAULT.to_owned(),
+            |config| format!("{} — {}", config.name, indent_label(config.indent)),
+        )
+    }
+
+    /// The settings panel (⌘,): Esc or a click outside closes; changes
+    /// persist immediately.
+    fn render_settings(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        self.settings_overlay.as_ref()?;
+        let font = self.settings.font_size;
+        let indent = self.indent_row_text();
+        let mut table = div().id("settings-keymap").flex_1().min_h_0().overflow_y_scroll().pb_2();
+        for row in acts::REGISTRY {
+            table = table.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_3()
+                    .h(px(26.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .min_w_0()
+                            .child(
+                                div().text_size(px(12.)).text_color(theme::fg()).child(SharedString::from(row.title)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme::fg_muted())
+                                    .child(SharedString::from(row.category)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(theme::FONT_FAMILY)
+                            .text_size(px(11.))
+                            .text_color(theme::fg_muted())
+                            .child(SharedString::from(row.keys)),
+                    ),
+            );
+        }
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close_settings(window, cx)))
+                .child(
+                    div()
+                        .mt(px(48.0))
+                        .w(px(560.0))
+                        .h(px(560.0))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(theme::border())
+                        .bg(theme::raised_bg())
+                        .key_context("Settings")
+                        .track_focus(&self.settings_focus)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            |_: &gpui::MouseDownEvent, _: &mut Window, cx: &mut gpui::App| cx.stop_propagation(),
+                        )
+                        .on_action(cx.listener(|this, _: &Cancel, window, cx| this.close_settings(window, cx)))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .px_3()
+                                .h_8()
+                                .border_b_1()
+                                .border_color(theme::border())
+                                .text_size(px(12.))
+                                .child(
+                                    div()
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme::fg())
+                                        .child(SharedString::from(strings::SETTINGS_TITLE)),
+                                ),
+                        )
+                        // Font size: steppers around the live value; a change
+                        // re-metrics the panes on their next render.
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px_3()
+                                .h_9()
+                                .border_b_1()
+                                .border_color(theme::border())
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(theme::fg())
+                                        .child(SharedString::from(strings::SETTINGS_FONT)),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("font-minus").icon(IconName::Minus).xsmall().ghost().on_click(
+                                                cx.listener(|this, _: &ClickEvent, _, cx| this.step_font(-1.0, cx)),
+                                            ),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(36.0))
+                                                .flex()
+                                                .justify_center()
+                                                .font_family(theme::FONT_FAMILY)
+                                                .text_size(px(12.))
+                                                .text_color(theme::fg())
+                                                .child(SharedString::from(format!("{font:.0}"))),
+                                        )
+                                        .child(
+                                            Button::new("font-plus").icon(IconName::Plus).xsmall().ghost().on_click(
+                                                cx.listener(|this, _: &ClickEvent, _, cx| this.step_font(1.0, cx)),
+                                            ),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px_3()
+                                .h_9()
+                                .border_b_1()
+                                .border_color(theme::border())
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(theme::fg())
+                                        .child(SharedString::from(strings::SETTINGS_INDENT)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(theme::fg_muted())
+                                        .child(SharedString::from(indent)),
+                                ),
+                        )
+                        .child(section_header(strings::SETTINGS_KEYMAP))
+                        .child(table),
+                )
+                .into_any_element(),
+        )
+    }
 }
 
 /// The display-quoted name the dialogs show.
@@ -1997,6 +2215,22 @@ fn quoted(name: &str) -> String {
 
 fn file_name(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
+}
+
+/// One font-size step, clamped to the settings' range.
+fn step_font_size(current: f32, delta: f32) -> f32 {
+    let (min, max) = (*settings::FONT_SIZE_RANGE.start(), *settings::FONT_SIZE_RANGE.end());
+    (current + delta).clamp(min, max)
+}
+
+/// The settings overlay's indent label for a language's policy (read-only;
+/// the editor's editorconfig override still wins at edit time).
+fn indent_label(indent: Option<ide_language::IndentConfig>) -> String {
+    match indent {
+        Some(config) if config.insert_spaces => format!("{}-space indent", config.tab_size),
+        Some(config) => format!("tabs, width {}", config.tab_size),
+        None => "4-space indent (default)".to_owned(),
+    }
 }
 
 /// Records a closed tab's path for ⌘⇧T — most recent first, deduplicated,
@@ -2164,6 +2398,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_toggle_tree))
             .on_action(cx.listener(Self::on_toggle_dock))
             .on_action(cx.listener(Self::on_reopen_closed_tab))
+            .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_cancel))
             // Double ⇧ gesture (modifier presses arrive as modifiers events).
             .on_modifiers_changed(cx.listener(Self::on_modifiers))
@@ -2190,6 +2425,7 @@ impl Render for Workbench {
             .children(self.render_commit(cx))
             .children(self.render_tree_prompt(cx))
             .children(self.render_tree_confirm(cx))
+            .children(self.render_settings(cx))
     }
 }
 
@@ -3329,5 +3565,25 @@ mod closed_tab_tests {
         // does. A parentless row falls back to its own (relative) path.
         assert_eq!(Workbench::target_dir(Path::new("/p/internal"), true), PathBuf::from("/p/internal"));
         assert_eq!(Workbench::target_dir(Path::new("/p/internal/store.go"), false), PathBuf::from("/p/internal"));
+    }
+
+    #[test]
+    fn font_steps_clamp_to_the_range() {
+        let min = *settings::FONT_SIZE_RANGE.start();
+        let max = *settings::FONT_SIZE_RANGE.end();
+        assert_eq!(step_font_size(14.0, 1.0), 15.0);
+        assert_eq!(step_font_size(14.0, -1.0), 13.0);
+        assert_eq!(step_font_size(min, -1.0), min);
+        assert_eq!(step_font_size(max, 1.0), max);
+    }
+
+    #[test]
+    fn indent_label_reads_the_language_policy() {
+        use ide_language::IndentConfig;
+        assert_eq!(indent_label(Some(IndentConfig { tab_size: 4, insert_spaces: true })), "4-space indent");
+        assert_eq!(indent_label(Some(IndentConfig { tab_size: 2, insert_spaces: true })), "2-space indent");
+        assert_eq!(indent_label(Some(IndentConfig { tab_size: 4, insert_spaces: false })), "tabs, width 4");
+        // No policy in the registry: the editor's default (4 spaces).
+        assert_eq!(indent_label(None), "4-space indent (default)");
     }
 }
