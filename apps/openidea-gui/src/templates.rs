@@ -388,11 +388,14 @@ pub fn expand(template: &LiveTemplate, unit: &str, base_indent: &str) -> Expansi
                         utf16 += 1;
                     }
                     // Leading body tabs are indent units relative to the
-                    // expansion line.
+                    // expansion line; every continuation line carries the
+                    // expansion line's own indentation too (zero body tabs
+                    // keeps the base indent — the closing brace of a block
+                    // body aligns with its opener).
                     let tabs = piece.chars().take_while(|c| *c == '\t').count();
                     let rest = &piece[tabs..];
-                    if tabs > 0 {
-                        let indent = format!("{base_indent}{}", unit.repeat(tabs));
+                    let indent = format!("{base_indent}{}", unit.repeat(tabs));
+                    if piece_index > 0 && !indent.is_empty() {
                         text.push_str(&indent);
                         utf16 += utf16_of(&indent);
                     }
@@ -470,7 +473,7 @@ mod tests {
     fn expand_indents_with_tab_unit_and_base() {
         let t = template("go-func", "func $NAME$($PARAMS$) $RET$ {\n\t$END$\n}");
         let got = expand(&t, "\t", "\t");
-        assert_eq!(got.text, "func ()  {\n\t\t\n}", "empty defaults leave both parameter gaps");
+        assert_eq!(got.text, "func ()  {\n\t\t\n\t}", "empty defaults leave both parameter gaps");
         // The placeholder line carries the base indent plus one unit.
         assert_eq!(got.stops.last().unwrap().ranges, vec![(13, 13)]);
     }
