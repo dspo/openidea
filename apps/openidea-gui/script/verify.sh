@@ -33,8 +33,9 @@ if [ -n "${CGSSessionScreenIsLocked:-}" ]; then
 fi
 
 echo "== stage 2: screenshot smoke"
+# The smoke drives this crate's own source (a real, self-contained project).
 python3 script/verify.py smoke --binary target/debug/openidea-gui \
-  --project "$(mktemp -d /tmp/m8-smoke-XXXXXX)" --open src/main.rs \
+  --project . --open src/main.rs \
   --outdir "$OUT" --name smoke >/dev/null
 
 echo "== stage 3: budget gate (Go module scenario, debug + release)"
@@ -44,7 +45,7 @@ cargo build --quiet
 cargo build --release --quiet
 python3 script/verify.py perf --binary target/debug/openidea-gui \
   --project "$SCRATCH" --open pkg001/api.go --outdir "$OUT" --name gate-debug >/dev/null
-python3 script/verify.py perf --binary target/release/openidea-gui \
+python3 script/verify.py perf --release --binary target/release/openidea-gui \
   --project "$SCRATCH" --open pkg001/api.go --outdir "$OUT" --name gate-release >/dev/null
 python3 script/budget_gate.py "$OUT/gate-debug-measured.json" "$OUT/gate-release-measured.json"
 

@@ -428,7 +428,7 @@ def run_smoke(binary, project, open_file, outdir, name):
         capture("04-settings", None, keys=[("comma", FLAG_CMD)])
         s.post_key("escape")
         time.sleep(0.4)
-        capture("05-welcome-projectless", None, keys=[("w", FLAG_CMD)])
+        capture("05-no-file-open", None, keys=[("w", FLAG_CMD)])
     finally:
         s.stop()
     return states
