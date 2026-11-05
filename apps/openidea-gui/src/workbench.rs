@@ -20,6 +20,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_component::status_bar::StatusBar;
 use gpui_component::tab::{Tab as ComponentTab, TabBar};
 use gpui_component::{Icon, IconName, Selectable as _, Sizable as _};
@@ -65,13 +66,15 @@ enum Drag {
 /// One open file: the editor pane, its document in the backend, and the two
 /// flags the chrome shows. The pane pushes its edits to the backend live, so
 /// `dirty` simply mirrors the backend's `DocDirty` events; `stale` means the
-/// file changed on disk while the buffer had unsaved edits.
+/// file changed on disk while the buffer had unsaved edits. `pinned` (M7)
+/// protects the tab: ⌘W and the close button skip it.
 struct Tab {
     path: PathBuf,
     doc: DocId,
     pane: Entity<EditorPane>,
     dirty: bool,
     stale: bool,
+    pinned: bool,
 }
 
 /// What the status bar shows on the right, until the next message.
@@ -204,6 +207,9 @@ pub struct Workbench {
     dock_page: DockPage,
     /// An in-flight tree/dock resize drag (M7), if any.
     drag: Cell<Option<Drag>>,
+    /// Closed tab paths, most recent first (M7): ⌘⇧T pops one back open.
+    /// Cleared when the project changes (paths belong to a project).
+    closed_tabs: Vec<PathBuf>,
     /// Git working-tree kind per absolute path (working-tree kind wins, the
     /// staged one when the tree is clean), and the current branch. Refreshed
     /// on the background executor (M4).
@@ -282,6 +288,7 @@ impl Workbench {
             last_shift: Cell::new(None),
             shift_held: Cell::new(false),
             save_flow: Cell::new(None),
+            closed_tabs: Vec::new(),
             tasks: Vec::new(),
         }
     }
@@ -377,6 +384,7 @@ impl Workbench {
         self.runs.clear();
         self.find_panel = None;
         self.dock_page = DockPage::Run(0);
+        self.closed_tabs.clear();
         if let Err(e) = self.tree.open(&host) {
             eprintln!("[workbench] tree open: {}", e.message);
         }
@@ -453,13 +461,6 @@ impl Workbench {
             }
         }
         cx.notify();
-    }
-
-    /// ⌘W: closes the active tab and detaches its document.
-    fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(index) = self.active else { return };
-        self.close_tab(index, cx);
-        self.focus_active(window, cx);
     }
 
     /// ⌘Z / ⌘⇧Z on the active editor pane (one undo timeline per pane).
@@ -1155,11 +1156,39 @@ impl Workbench {
         if let Some(host) = &self.host {
             host.close_document(tab.doc);
         }
+        push_closed(&mut self.closed_tabs, tab.path);
         self.active = match self.tabs.len() {
             0 => None,
             len => Some(self.active.map_or(len - 1, |active| active.min(len - 1))),
         };
         cx.notify();
+    }
+
+    /// ⌘W: closes the active tab — never a pinned one (the tab's own close
+    /// button is hidden for pinned tabs too).
+    fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.active else { return };
+        if self.tabs[index].pinned {
+            return;
+        }
+        self.close_tab(index, cx);
+        self.focus_active(window, cx);
+    }
+
+    /// ⌘⇧T: reopens the most recently closed tab (per-project stack).
+    fn on_reopen_closed_tab(&mut self, _: &acts::ReopenClosedTab, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.closed_tabs.pop() else { return };
+        self.open_path(&path, cx);
+        self.focus_active(window, cx);
+    }
+
+    /// The tab's context menu: pin / unpin (M7). Pinned tabs skip ⌘W and the
+    /// close button, so a misclick cannot lose them.
+    fn toggle_pin(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.pinned = !tab.pinned;
+            cx.notify();
+        }
     }
 
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1212,7 +1241,14 @@ impl Workbench {
             pane.update(cx, |pane, cx| pane.set_diagnostics(merged, cx));
         }
         let path = path.to_path_buf();
-        self.tabs.push(Tab { path: path.clone(), doc: doc_id, pane: pane.clone(), dirty: false, stale: false });
+        self.tabs.push(Tab {
+            path: path.clone(),
+            doc: doc_id,
+            pane: pane.clone(),
+            dirty: false,
+            stale: false,
+            pinned: false,
+        });
         self.active = Some(self.tabs.len() - 1);
         // Every open feeds the index's recency (the empty palette query lists
         // recent files).
@@ -1615,6 +1651,17 @@ fn file_name(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
 }
 
+/// Records a closed tab's path for ⌘⇧T — most recent first, deduplicated,
+/// capped (`CLOSED_TAB_CAP`).
+fn push_closed(stack: &mut Vec<PathBuf>, path: PathBuf) {
+    stack.retain(|p| p != &path);
+    stack.insert(0, path);
+    stack.truncate(CLOSED_TAB_CAP);
+}
+
+/// How many closed tabs ⌘⇧T remembers.
+const CLOSED_TAB_CAP: usize = 20;
+
 /// A one-off shell command line from the Run palette, as a configuration
 /// (ide-run runs a command with shell characters through the platform shell).
 fn shell_config(line: String) -> RunConfig {
@@ -1760,6 +1807,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_commit))
             .on_action(cx.listener(Self::on_toggle_tree))
             .on_action(cx.listener(Self::on_toggle_dock))
+            .on_action(cx.listener(Self::on_reopen_closed_tab))
             .on_action(cx.listener(Self::on_cancel))
             // Double ⇧ gesture (modifier presses arrive as modifiers events).
             .on_modifiers_changed(cx.listener(Self::on_modifiers))
@@ -2024,8 +2072,16 @@ impl Workbench {
 
     fn render_tab_bar(&mut self, active: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let workbench = cx.entity().downgrade();
-        TabBar::new("editor-tabs")
+        let active_pinned = self.tabs[active].pinned;
+        // The tab bar's right-click menu targets the active tab (click a tab,
+        // right-click, pin): the same face as the IDE convention without a
+        // per-tab menu (TabBar takes `Tab` children only). Reopen closed and
+        // close live here too.
+        let bar = TabBar::new("editor-tabs")
             .selected_index(active)
+            // Overflow: the tabs strip wheel-scrolls; the menu button lists
+            // every tab so none is out of reach (M7).
+            .menu(true)
             .on_click(cx.listener(|this, index: &usize, window, cx| this.activate(*index, window, cx)))
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
                 let mut label = file_name(&tab.path);
@@ -2036,22 +2092,80 @@ impl Workbench {
                 if tab.stale {
                     label.push_str(strings::STALE_MARK);
                 }
-                ComponentTab::new().label(label).selected(index == active).suffix(
-                    Button::new(("tab-close", index)).icon(IconName::Close).xsmall().ghost().on_click({
-                        let workbench = workbench.clone();
-                        move |_, window, cx| {
-                            cx.stop_propagation();
-                            let focused = workbench.update(cx, |this, cx| {
-                                this.close_tab(index, cx);
-                                this.active.and_then(|active| this.tabs.get(active).map(|tab| tab.pane.clone()))
-                            });
-                            if let Ok(Some(pane)) = focused {
-                                window.focus(&pane.read(cx).focus_handle(cx), cx);
+                let mut tab_item = ComponentTab::new()
+                    .label(label)
+                    .selected(index == active)
+                    // Pin marker (M7): a small accent dot; pinned tabs also
+                    // lose their close button, so ⌘W stays the only way to
+                    // close them — and ⌘W skips pinned.
+                    .when(tab.pinned, |item| {
+                        item.prefix(div().size(px(6.0)).flex_none().rounded_full().bg(theme::accent()))
+                    });
+                if !tab.pinned {
+                    tab_item = tab_item.suffix(
+                        Button::new(("tab-close", index)).icon(IconName::Close).xsmall().ghost().on_click({
+                            let workbench = workbench.clone();
+                            move |_, window, cx| {
+                                cx.stop_propagation();
+                                let focused = workbench.update(cx, |this, cx| {
+                                    this.close_tab(index, cx);
+                                    this.active.and_then(|active| this.tabs.get(active).map(|tab| tab.pane.clone()))
+                                });
+                                if let Ok(Some(pane)) = focused {
+                                    window.focus(&pane.read(cx).focus_handle(cx), cx);
+                                }
                             }
+                        }),
+                    );
+                }
+                tab_item
+            }));
+        div()
+            .w_full()
+            .context_menu(move |menu, _, _| {
+                menu.item(
+                    PopupMenuItem::new(if active_pinned { strings::TAB_UNPIN } else { strings::TAB_PIN }).on_click({
+                        let workbench = workbench.clone();
+                        move |_, _, cx| {
+                            workbench
+                                .update(cx, |this, cx| {
+                                    if let Some(active) = this.active {
+                                        this.toggle_pin(active, cx);
+                                    }
+                                })
+                                .ok();
                         }
                     }),
                 )
-            }))
+                .item(PopupMenuItem::new(strings::TAB_CLOSE).on_click({
+                    let workbench = workbench.clone();
+                    move |_, _, cx| {
+                        workbench
+                            .update(cx, |this, cx| {
+                                if let Some(active) = this.active
+                                    && !this.tabs[active].pinned
+                                {
+                                    this.close_tab(active, cx);
+                                }
+                            })
+                            .ok();
+                    }
+                }))
+                .separator()
+                .item(PopupMenuItem::new(strings::TAB_REOPEN).on_click({
+                    let workbench = workbench.clone();
+                    move |_, _, cx| {
+                        workbench
+                            .update(cx, |this, cx| {
+                                if let Some(path) = this.closed_tabs.pop() {
+                                    this.open_path(&path, cx);
+                                }
+                            })
+                            .ok();
+                    }
+                }))
+            })
+            .child(bar)
     }
 
     // -- bottom dock ---------------------------------------------------------------
@@ -2616,5 +2730,24 @@ fn row_icon(row: &Row) -> gpui::AnyElement {
             Icon::new(name).text_color(theme::accent()).into_any_element()
         }
         _ => Icon::new(IconName::File).text_color(theme::fg_muted()).into_any_element(),
+    }
+}
+
+#[cfg(test)]
+mod closed_tab_tests {
+    use super::*;
+
+    #[test]
+    fn closed_stack_is_most_recent_first_deduped_and_capped() {
+        let mut stack = Vec::new();
+        for i in 0..(CLOSED_TAB_CAP + 5) {
+            push_closed(&mut stack, PathBuf::from(format!("/tmp/m7-tab-{i}")));
+        }
+        assert_eq!(stack.len(), CLOSED_TAB_CAP);
+        assert_eq!(stack[0], PathBuf::from(format!("/tmp/m7-tab-{}", CLOSED_TAB_CAP + 4)));
+        // Re-closing a path moves it back to the top.
+        push_closed(&mut stack, PathBuf::from("/tmp/m7-tab-0"));
+        assert_eq!(stack[0], PathBuf::from("/tmp/m7-tab-0"));
+        assert_eq!(stack.len(), CLOSED_TAB_CAP);
     }
 }

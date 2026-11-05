@@ -27,6 +27,7 @@ actions!(
         FindInFiles,
         ToggleTree,
         ToggleDock,
+        ReopenClosedTab,
     ]
 );
 
@@ -107,6 +108,7 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("workbench::OpenFile", "Open File…", "File", "⌘O"),
     action_info!("workbench::Save", "Save", "File", "⌘S"),
     action_info!("workbench::CloseTab", "Close Tab", "File", "⌘W"),
+    action_info!("workbench::ReopenClosedTab", "Reopen Closed Tab", "File", "⇧⌘T"),
     action_info!("workbench::GoToFile", "Go to File", "Navigate", "⇧⌘O"),
     action_info!("workbench::SearchEverywhere", "Search Everywhere", "Navigate", "Double ⇧"),
     action_info!("workbench::FindInFiles", "Find in Files", "Edit", "⇧⌘F"),

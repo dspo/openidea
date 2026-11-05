@@ -77,3 +77,8 @@ pub const WELCOME_SUBTITLE: &str = "Open a folder to start editing";
 pub const OPEN_FOLDER: &str = "Open Folder…";
 pub const WELCOME_RECENTS: &str = "Recent projects";
 pub const OPEN_PROJECT_FAILED: &str = "Cannot open";
+// Tab management (M7).
+pub const TAB_PIN: &str = "Pin Tab";
+pub const TAB_UNPIN: &str = "Unpin Tab";
+pub const TAB_CLOSE: &str = "Close Tab";
+pub const TAB_REOPEN: &str = "Reopen Closed Tab";
