@@ -1022,10 +1022,12 @@ impl EditorPane {
             && lo <= first
             && last <= hi
         {
+            eprintln!("[lsp] inlay request skipped (covered {}..{})", lo, hi);
             return;
         }
         self.inlay_gen += 1;
         let req = self.inlay_gen;
+        let version = self.buf.doc.version();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let lsp = self.host.lsp.clone();
         let doc = self.doc_id;
@@ -1038,7 +1040,7 @@ impl EditorPane {
         });
         cx.spawn(async move |this, cx| {
             if let Ok((range, result)) = rx.await {
-                this.update(cx, |pane, cx| pane.inlays_ready(req, range, result, cx)).ok();
+                this.update(cx, |pane, cx| pane.inlays_ready(req, version, range, result, cx)).ok();
             }
         })
         .detach();
@@ -1050,6 +1052,7 @@ impl EditorPane {
     fn inlays_ready(
         &mut self,
         req: u32,
+        version: u32,
         range: ide_core::Range,
         result: IdeResult<Vec<ide_lsp::types::InlayHint>>,
         cx: &mut gpui::Context<Self>,
@@ -1058,11 +1061,21 @@ impl EditorPane {
             return;
         }
         match result {
-            Ok(hints) => {
+            // Only an answer for the current text is accepted: the server
+            // computed it against its own document state, which can lag the
+            // pane's edits — a stale answer paints labels at wrong offsets.
+            Ok(hints) if version == self.buf.doc.version() => {
                 let count = self.buf.line_count();
                 self.inlays = hints.into_iter().filter(|hint| hint.position.line < count).collect();
                 self.inlay_cover = Some((range.start.line, range.end.line));
+                eprintln!("[lsp] inlay hints {} for lines {}..{}", self.inlays.len(), range.start.line, range.end.line);
                 cx.notify();
+            }
+            // The text moved on mid-request: ask again (the debounce has
+            // settled by now, so this converges).
+            Ok(_) => {
+                self.inlay_cover = None;
+                self.schedule_inlays(cx);
             }
             Err(e) => {
                 eprintln!("[lsp] inlay hints: {}", e.message);
@@ -1669,6 +1682,13 @@ impl EditorPane {
             self.template = None;
             self.fold_candidates.clear();
             self.folds.clear();
+            // Hints answer for the replaced text's positions (a server patch
+            // landing while another was in flight resyncs here): drop them or
+            // the labels paint into the new text at old columns.
+            self.inlays.clear();
+            self.inlay_cover = None;
+            self.hints_by_line.borrow_mut().clear();
+            self.schedule_inlays(cx);
             if let Some(highlighter) = self.highlighter.clone() {
                 self.schedule_parse(highlighter, cx);
             }
@@ -1934,7 +1954,17 @@ impl EditorPane {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let lsp = self.host.lsp.clone();
         let doc = self.doc_id;
-        let range = self.caret_range();
+        // A diagnostic on the caret's line anchors the request (the lightbulb
+        // shape): the server's answer keys its quickfixes on the diagnostics
+        // that overlap the requested range, and a bare caret at the line end
+        // overlaps nothing.
+        let line = self.buf.line_of(self.selections.first().map_or(0, |s| s.head));
+        let range = self
+            .diagnostics
+            .iter()
+            .find(|d| d.range.start.line == line || d.range.end.line == line)
+            .map(|d| d.range)
+            .unwrap_or_else(|| self.caret_range());
         self.host.runtime.spawn(async move {
             let result = lsp.code_actions(doc, range, Vec::new()).await;
             let _ = tx.send(result);
