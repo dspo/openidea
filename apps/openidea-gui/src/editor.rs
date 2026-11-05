@@ -171,6 +171,12 @@ fn enter_indent(
     out
 }
 
+/// A budget in ms, shown integral when whole ("16"), one decimal otherwise
+/// ("5.2") — the HUD and transcript stay readable.
+fn format_budget(ms: f32) -> String {
+    if ms.fract() == 0.0 { format!("{ms:.0}") } else { format!("{ms:.1}") }
+}
+
 fn plain_run(len: usize, color: gpui::Hsla) -> TextRun {
     TextRun { len, font: theme::font(), color, background_color: None, underline: None, strikethrough: None }
 }
@@ -679,6 +685,14 @@ struct Hud {
     parse_started: Cell<Option<std::time::Instant>>,
     parse_ms: Cell<Option<f32>>,
     parse_version: Cell<u32>,
+    /// The in-flight completion request (M8): armed when the request fires,
+    /// consumed at the first prepaint that shows the popup — the
+    /// request→first-paint number.
+    completion_started: Cell<Option<std::time::Instant>>,
+    /// The last completed request→paint number (the HUD line).
+    completion_paint_ms: Cell<Option<f32>>,
+    /// The budget table logs once per pane (the transcript carries it).
+    table_logged: Cell<bool>,
 }
 
 impl Hud {
@@ -2704,6 +2718,7 @@ impl EditorPane {
     fn request_completion(&mut self, trigger: Option<String>, cx: &mut gpui::Context<Self>) {
         self.completion_gen += 1;
         let req = self.completion_gen;
+        self.hud.completion_started.set(Some(std::time::Instant::now()));
         let cancel = CancellationToken::new();
         self.completion_cancel = Some(cancel.clone());
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2795,6 +2810,7 @@ impl EditorPane {
             if let Some(token) = self.completion_cancel.take() {
                 token.cancel();
             }
+            self.hud.completion_started.set(None);
             cx.notify();
         }
     }
@@ -3027,7 +3043,7 @@ impl EditorPane {
             let on = !self.hud.visible.get();
             self.hud.visible.set(on);
             eprintln!(
-                "[perf] hud {} — rows {} spans {}/{} parse {:?} ms@v{} input {:?} ms frame {:.1} ms",
+                "[perf] hud {} — rows {} spans {}/{} parse {:?} ms@v{} input {:?} ms frame {:.1} ms completion {:?} ms budget {} ms",
                 if on { "on" } else { "off" },
                 self.hud.rows_laid_out.get(),
                 self.hud.spans_painted.get(),
@@ -3035,8 +3051,27 @@ impl EditorPane {
                 self.hud.parse_ms.get(),
                 self.hud.parse_version.get(),
                 self.hud.input_latency_ms.get(),
-                self.hud.last_frame_ms.get()
+                self.hud.last_frame_ms.get(),
+                self.hud.completion_paint_ms.get().map(|ms| (ms * 10.0).round() / 10.0),
+                crate::perf::budgets().budget_for("key_to_px").map_or("-".to_owned(), |ms| format!("{ms:.0}"))
             );
+            // The budget contract, into the transcript (M8): the harness and
+            // the report quote this line's shape for every metric.
+            if on && !self.hud.table_logged.get() {
+                self.hud.table_logged.set(true);
+                for metric in &crate::perf::budgets().metrics {
+                    eprintln!(
+                        "[perf] budget {}: {} — debug {} ms, release {} ms; baselines debug {:?} / release {:?} ms ({})",
+                        metric.id,
+                        metric.label,
+                        format_budget(metric.budget_ms),
+                        format_budget(metric.budget_release_ms),
+                        metric.baseline_debug_ms,
+                        metric.baseline_release_ms,
+                        metric.source
+                    );
+                }
+            }
             cx.notify();
             return;
         }
@@ -5202,6 +5237,18 @@ impl Element for EditorElement {
             eprintln!("[perf] first paint {:.0} ms after open", pane.created_at.elapsed().as_secs_f32() * 1000.0);
         }
 
+        // The completion popup's first paint (M8): the request instant is
+        // consumed here, where pixels actually exist — the transcript line
+        // feeds the budget scenario, the cell feeds the HUD line.
+        if let Some(started) = pane.hud.completion_started.get()
+            && pane.completion.is_some()
+        {
+            let ms = started.elapsed().as_secs_f32() * 1000.0;
+            pane.hud.completion_started.set(None);
+            pane.hud.completion_paint_ms.set(Some(ms));
+            eprintln!("[perf] completion painted after {ms:.1} ms");
+        }
+
         // HUD counters: input→pixel latency lands at the first prepaint after
         // an input; row/span counts describe this frame.
         if let Some(input) = pane.hud.last_input.get() {
@@ -5339,12 +5386,22 @@ impl Element for EditorElement {
             window.paint_quad(fill(geometry.hscroll.track, theme::scrollbar_track()));
             window.paint_quad(fill(geometry.hscroll.thumb, theme::scrollbar_thumb()));
 
-            // F12 perf HUD, top right, above everything.
+            // F12 perf HUD, top right, above everything. The key→px line
+            // carries its budget (M8) and the last line is the live verdict.
             let hud = &self.view.read(cx).hud;
             if hud.visible.get() {
                 let (fps, frame_ms) = hud.frame();
                 let latency = hud.input_latency_ms.get().map_or("-".to_owned(), |ms| format!("{ms:.1}"));
                 let parse = hud.parse_ms.get().map_or("-".to_owned(), |ms| format!("{ms:.1}"));
+                let completion = hud.completion_paint_ms.get().map_or("-".to_owned(), |ms| format!("{ms:.0}"));
+                let budget = crate::perf::budgets()
+                    .budget_for("key_to_px")
+                    .map_or_else(|| "-".to_owned(), |ms| format!("{ms:.0}"));
+                let verdict = match (hud.input_latency_ms.get(), crate::perf::budgets().budget_for("key_to_px")) {
+                    (Some(ms), Some(budget)) if ms > budget => format!("budget ✗ (key→px {ms:.1} > {budget})"),
+                    (Some(_), Some(_)) => "budget ✓".to_owned(),
+                    _ => "budget –".to_owned(),
+                };
                 let lines = [
                     format!("{fps:.0} fps · frame {frame_ms:.1} ms"),
                     format!(
@@ -5353,13 +5410,14 @@ impl Element for EditorElement {
                         hud.spans_painted.get(),
                         hud.spans_total.get()
                     ),
-                    format!("key→px {latency} ms · parse {parse} ms @v{}", hud.parse_version.get()),
+                    format!("key→px {latency} ms · budget {budget} · parse {parse} ms @v{}", hud.parse_version.get()),
                     format!(
                         "cursors {} · folds {} · hints {}",
                         self.view.read(cx).selections.len(),
                         self.view.read(cx).folds.len(),
                         hud.hints_rows.get()
                     ),
+                    format!("completion first frame {completion} ms · {verdict}"),
                 ];
                 let font_size = theme::px_font_size();
                 for (index, line) in lines.iter().enumerate() {

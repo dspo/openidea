@@ -16,6 +16,7 @@ mod fuzzy;
 mod highlight;
 mod host;
 mod markdown;
+mod perf;
 mod run_panel;
 mod semantic;
 mod settings;
