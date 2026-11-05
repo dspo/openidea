@@ -848,14 +848,19 @@ impl EditorPane {
     }
 
     /// Starts syntax highlighting when the language has a bundled grammar and
-    /// the file is not flagged large.
+    /// the file is not flagged large. Languages whose grammar has no bundled
+    /// highlights query (Go at M5) skip the parse entirely — the semantic
+    /// overlay is then the only paint source, requested on open.
     fn start_syntax(&mut self, cx: &mut gpui::Context<Self>) {
         if self.large {
             return;
         }
-        let Some(highlighter) = Highlighter::for_language(&self.language) else { return };
-        self.highlighter = Some(highlighter.clone());
-        self.schedule_parse(highlighter, cx);
+        if let Some(highlighter) = Highlighter::for_language(&self.language) {
+            self.highlighter = Some(highlighter.clone());
+            self.schedule_parse(highlighter, cx);
+        } else {
+            self.schedule_semantic(cx);
+        }
     }
 
     // -- semantic tokens (M5 phase 2) ----------------------------------------
@@ -1077,6 +1082,10 @@ impl EditorPane {
         }
         if let Some(highlighter) = self.highlighter.clone() {
             self.schedule_parse(highlighter, cx);
+        } else {
+            // Semantic-only paint (no bundled query): the overlay refreshes
+            // per settled edit round, exactly like the parse-driven path.
+            self.schedule_semantic(cx);
         }
     }
 
