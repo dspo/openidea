@@ -24,6 +24,9 @@ use crate::workbench::Workbench;
 pub enum BusMessage {
     Ide(IdeEvent),
     Picked(Option<PathBuf>),
+    /// The welcome view's (or projectless ⌘O's) folder pick: the project to
+    /// open. `None` = the user cancelled.
+    PickedFolder(Option<PathBuf>),
     /// The editor asks the workbench to open (or activate) a file and place
     /// the caret at `pos` (goto definition / find usages across files).
     OpenLocation {

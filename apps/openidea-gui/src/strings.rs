@@ -1,7 +1,7 @@
 //! User-visible text as plain constants (M1 has no text catalog / i18n; the
 //! Tauri frontend's `text/en.json` + `zh.json` discipline starts with M2+).
 
-pub const APP_TITLE: &str = "OpenIDEA — GPUI M1 workbench";
+pub const APP_TITLE: &str = "OpenIDEA";
 pub const TREE_HEADER: &str = "Project";
 pub const NO_PROJECT: &str = "No project open";
 pub const NO_FILE: &str = "Open a file to start editing (⌘O)";
@@ -72,3 +72,9 @@ pub const REPLACE_ALL_BUTTON: &str = "All";
 pub const FIND_FILES_TITLE: &str = "Find in Files";
 pub const FIND_FILES_PLACEHOLDER: &str = "Search project (⏎)";
 pub const FIND_SEARCHING: &str = "searching…";
+// Welcome / project picker (M7).
+pub const WELCOME_TITLE: &str = "OpenIDEA";
+pub const WELCOME_SUBTITLE: &str = "Open a folder to start editing";
+pub const OPEN_FOLDER: &str = "Open Folder…";
+pub const WELCOME_RECENTS: &str = "Recent projects";
+pub const OPEN_PROJECT_FAILED: &str = "Cannot open";

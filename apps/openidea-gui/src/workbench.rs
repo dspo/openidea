@@ -43,7 +43,7 @@ use crate::find_panel::FindPanel;
 use crate::fuzzy;
 use crate::host::Host;
 use crate::run_panel::{RunPanel, stream_of};
-use crate::{strings, theme};
+use crate::{ProjectHost, settings, strings, theme};
 
 /// The bottom dock's active page when both panels exist (M5).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -150,6 +150,8 @@ struct CommitFlow {
 
 pub struct Workbench {
     host: Option<Arc<Host>>,
+    /// The persisted settings (recents, layout, font size) — saved on change.
+    settings: settings::Settings,
     tabs: Vec<Tab>,
     active: Option<usize>,
     tree: FileTree,
@@ -157,6 +159,9 @@ pub struct Workbench {
     /// Startup focus seed: with no tab open the tree takes focus so the
     /// window-level actions (⌘O) and the tree keys work immediately.
     tree_focused_once: Cell<bool>,
+    /// A bus-side project open has no window; the next render hands the tree
+    /// the focus.
+    tree_focus_pending: Cell<bool>,
     message: Option<Message>,
     servers: Vec<ServerRow>,
     /// Diagnostics per file, per producer (`Diagnostics` events replace one
@@ -217,7 +222,7 @@ pub struct Workbench {
 }
 
 impl Workbench {
-    pub fn new(host: Option<Arc<Host>>, bus: Bus, cx: &mut Context<Self>) -> Self {
+    pub fn new(host: Option<Arc<Host>>, bus: Bus, settings: settings::Settings, cx: &mut Context<Self>) -> Self {
         let mut tree = FileTree::new();
         if let Some(host) = &host
             && let Err(e) = tree.open(host)
@@ -226,11 +231,13 @@ impl Workbench {
         }
         Self {
             host,
+            settings,
             tabs: Vec::new(),
             active: None,
             tree,
             tree_focus: cx.focus_handle(),
             tree_focused_once: Cell::new(false),
+            tree_focus_pending: Cell::new(false),
             message: None,
             servers: Vec::new(),
             diagnostics: HashMap::new(),
@@ -286,24 +293,80 @@ impl Workbench {
 
     // -- actions ----------------------------------------------------------
 
-    /// ⌘O: the native open dialog. rfd's dialog future must be *created* on
-    /// the main thread (NSOpenPanel is main-thread-only; the future's own
+    /// ⌘O: the native dialog. Context-sensitive (M7): with a project open it
+    /// picks a file to edit; with none it picks a project folder (the one
+    /// decision the welcome view needs). rfd's dialog future must be *created*
+    /// on the main thread (NSOpenPanel is main-thread-only; the future's own
     /// constructor asserts it) but may be awaited from the background
     /// executor; the pick comes back through the bus.
     fn on_open_file(&mut self, _: &OpenFile, _window: &mut Window, cx: &mut Context<Self>) {
         let bus = self.bus.clone();
-        let initial = self.host.as_ref().map(|host| host.root.clone());
+        let projectless = self.host.is_none();
+        let initial =
+            self.host.as_ref().map(|host| host.root.clone()).or_else(|| self.settings.recent_projects.first().cloned());
         let mut dialog = rfd::AsyncFileDialog::new();
         if let Some(dir) = initial {
             dialog = dialog.set_directory(&dir);
         }
-        let picked = dialog.pick_file();
         cx.background_executor()
             .spawn(async move {
-                let picked = picked.await.map(|handle| handle.path().to_path_buf());
-                bus.send(BusMessage::Picked(picked));
+                let picked = if projectless {
+                    dialog.pick_folder().await.map(|handle| handle.path().to_path_buf())
+                } else {
+                    dialog.pick_file().await.map(|handle| handle.path().to_path_buf())
+                };
+                if projectless {
+                    bus.send(BusMessage::PickedFolder(picked));
+                } else {
+                    bus.send(BusMessage::Picked(picked));
+                }
             })
             .detach();
+        cx.notify();
+    }
+
+    /// Opens `root` as the project: constructs the Host inside the app
+    /// runtime's enter context (the bus pump runs on the main thread, which
+    /// `block_on` keeps in the runtime), replaces the `ProjectHost` global,
+    /// reseeds the tree and git, and records the recent. The welcome view's
+    /// open-folder answer and future multi-project faces all land here.
+    fn open_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        let host = {
+            let _runtime = tokio::runtime::Handle::current().enter();
+            Host::open(&root, self.bus.sink(), tokio::runtime::Handle::current())
+        };
+        let host = match host {
+            Ok(host) => Arc::new(host),
+            Err(e) => {
+                eprintln!("[workbench] opening {}: {}", root.display(), e.message);
+                self.message = Some((
+                    NotifyLevel::Error,
+                    format!("{} {}: {}", strings::OPEN_PROJECT_FAILED, file_name(&root), e.message),
+                ));
+                cx.notify();
+                return;
+            }
+        };
+        cx.set_global(ProjectHost(host.clone()));
+        self.host = Some(host.clone());
+        self.tabs.clear();
+        self.active = None;
+        self.diagnostics.clear();
+        self.git_status.clear();
+        self.git_branch = None;
+        self.run_panel = None;
+        self.find_panel = None;
+        self.dock_page = DockPage::Run;
+        if let Err(e) = self.tree.open(&host) {
+            eprintln!("[workbench] tree open: {}", e.message);
+        }
+        // The next render kicks the git refresh and hands the tree the focus
+        // (the bus pump has no window).
+        self.git_initialized.set(false);
+        self.tree_focus_pending.set(true);
+        settings::push_recent(&mut self.settings.recent_projects, &host.root);
+        settings::save(&self.settings);
+        eprintln!("[workbench] project opened {}", host.root.display());
         cx.notify();
     }
 
@@ -1059,6 +1122,11 @@ impl Workbench {
                     self.open_path(&path, cx);
                 }
             }
+            BusMessage::PickedFolder(root) => {
+                if let Some(root) = root {
+                    self.open_project(root, cx);
+                }
+            }
             BusMessage::Ide(IdeEvent::FsChanged { created, modified, removed, .. }) => {
                 if let Some(host) = &self.host {
                     self.tree.refresh(host);
@@ -1528,6 +1596,11 @@ impl Render for Workbench {
         if !self.git_initialized.replace(true) {
             self.refresh_git(cx);
         }
+        // A bus-side project open has no window: hand the tree the focus on
+        // the next render (⌘O and the tree keys work right after opening).
+        if self.tree_focus_pending.replace(false) {
+            window.focus(&self.tree_focus, cx);
+        }
         // The diff overlay opens from the bus (no window there); take the
         // focus on the next render so Esc lands on its Cancel handler.
         if self.diff_focus_pending.replace(false) {
@@ -1564,18 +1637,22 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_cancel))
             // Double ⇧ gesture (modifier presses arrive as modifiers events).
             .on_modifiers_changed(cx.listener(Self::on_modifiers))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .flex_row()
-                    .child(self.render_tree(cx))
-                    .child(self.render_editor_area(cx)),
-            )
-            // The bottom dock: Run (M4) and Find in Files (M5) as pages —
-            // the M4 single-panel look when only one exists.
-            .children(self.render_dock(cx))
+            .children(self.host.is_none().then(|| self.render_welcome(cx)))
+            .when(self.host.is_some(), |shell| {
+                shell
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .flex_row()
+                            .child(self.render_tree(cx))
+                            .child(self.render_editor_area(cx)),
+                    )
+                    // The bottom dock: Run (M4) and Find in Files (M5) as pages —
+                    // the M4 single-panel look when only one exists.
+                    .children(self.render_dock(cx))
+            })
             .child(self.render_status(cx))
             .children(self.render_picker(cx))
             .children(self.render_diff(cx))
@@ -1584,6 +1661,81 @@ impl Render for Workbench {
 }
 
 // -- left dock -----------------------------------------------------------------
+
+impl Workbench {
+    /// The no-project view (M7): title, the open-folder button, and the
+    /// recent-projects list — the whole "open a project" flow without docs.
+    fn render_welcome(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut welcome = div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(96.0))
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(28.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme::fg())
+                    .child(SharedString::from(strings::WELCOME_TITLE)),
+            )
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(theme::fg_muted())
+                    .child(SharedString::from(strings::WELCOME_SUBTITLE)),
+            )
+            .child(Button::new("welcome-open").label(strings::OPEN_FOLDER).secondary().on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| {
+                    this.open_folder_dialog(cx);
+                },
+            )));
+        let recents: Vec<PathBuf> = self.settings.recent_projects.clone();
+        if !recents.is_empty() {
+            let mut list = div().mt(px(24.0)).w(px(420.0)).flex().flex_col();
+            list = list.child(section_header(strings::WELCOME_RECENTS));
+            for (index, path) in recents.iter().enumerate() {
+                list = list.child(
+                    row_shell(
+                        div()
+                            .truncate()
+                            .text_color(theme::fg())
+                            .child(SharedString::from(path.display().to_string()))
+                            .into_any_element(),
+                        None,
+                    )
+                    .id(("welcome-recent", index))
+                    .hover(|row| row.bg(theme::raised_bg()))
+                    .on_click(cx.listener({
+                        let path = path.clone();
+                        move |this, _: &ClickEvent, _, cx| this.open_project(path.clone(), cx)
+                    })),
+                );
+            }
+            welcome = welcome.child(list);
+        }
+        welcome.into_any_element()
+    }
+
+    /// The open-folder dialog (the welcome button; ⌘O routes here too while
+    /// no project is open). Same background-executor shape as the file dialog.
+    fn open_folder_dialog(&mut self, cx: &mut Context<Self>) {
+        let bus = self.bus.clone();
+        let mut dialog = rfd::AsyncFileDialog::new();
+        if let Some(recent) = self.settings.recent_projects.first() {
+            dialog = dialog.set_directory(recent);
+        }
+        cx.background_executor()
+            .spawn(async move {
+                let picked = dialog.pick_folder().await.map(|handle| handle.path().to_path_buf());
+                bus.send(BusMessage::PickedFolder(picked));
+            })
+            .detach();
+        cx.notify();
+    }
+}
 
 impl Workbench {
     fn render_tree(&mut self, cx: &mut Context<Self>) -> impl IntoElement {

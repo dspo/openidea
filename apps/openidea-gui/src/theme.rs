@@ -30,6 +30,21 @@ const HINT_TEXT: u32 = 0x9dabbf;
 pub const FONT_FAMILY: &str = "Menlo";
 pub const FONT_SIZE: f32 = 14.0;
 pub const LINE_HEIGHT: f32 = 1.5;
+
+/// The live editor font size (the M7 setting): stored in 0.1 px units in an
+/// atomic, so every per-frame reader (`px_font_size` call sites in the
+/// editor/chrome) picks a change up on the next render without threading a
+/// settings value through them.
+static FONT_SIZE_CELL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new((FONT_SIZE * 10.0) as usize);
+
+pub fn set_font_size(size: f32) {
+    FONT_SIZE_CELL.store((size * 10.0).round() as usize, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn font_size() -> f32 {
+    FONT_SIZE_CELL.load(std::sync::atomic::Ordering::Relaxed) as f32 / 10.0
+}
 /// Inset between the editor element bounds and the text.
 pub const TEXT_INSET: f32 = 16.0;
 /// Gutter paddings: element edge to line numbers, numbers to the text area.
@@ -135,11 +150,11 @@ pub fn font() -> gpui::Font {
 }
 
 pub fn px_font_size() -> Pixels {
-    px(FONT_SIZE)
+    px(font_size())
 }
 
 pub fn px_line_height() -> Pixels {
-    px(FONT_SIZE * LINE_HEIGHT)
+    px(font_size() * LINE_HEIGHT)
 }
 
 /// Squiggle / gutter / tooltip color for a diagnostic severity.

@@ -5693,6 +5693,8 @@ dependencies = [
  "ide-workspace",
  "rfd",
  "ropey 1.6.1",
+ "serde",
+ "serde_json",
  "streaming-iterator",
  "tokio",
  "tracing-subscriber",

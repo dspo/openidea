@@ -82,6 +82,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # ⌘O file dialog, invoked on a plain thread like Steer does (the sync rfd
 # API must not run on gpui's main thread).
 rfd = "0.15"
+# M7 settings (recents, layout, font size): one JSON file, serde-shaped.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.dev.package]
 # gpui needs opt-level 3 even in debug, or rendering crawls. Keys use the
