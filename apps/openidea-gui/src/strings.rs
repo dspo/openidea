@@ -50,3 +50,10 @@ pub const COMMIT_EMPTY_MESSAGE: &str = "Enter a commit message first";
 pub const COMMIT_NO_CHANGES: &str = "No changes to commit";
 pub const COMMIT_TOAST: &str = "Committed";
 pub const COMMIT_FAILED: &str = "Commit failed";
+// Quick fixes / format (M5).
+pub const CODE_ACTION_PREFERRED: &str = "preferred";
+pub const NO_CODE_ACTIONS: &str = "No code actions here";
+pub const CODE_ACTIONS_UNAVAILABLE: &str = "Code actions unavailable";
+pub const CODE_ACTION_FAILED: &str = "Code action failed";
+pub const FORMAT_UNAVAILABLE: &str = "Format unavailable";
+pub const ALREADY_FORMATTED: &str = "Already formatted";
