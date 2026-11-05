@@ -25,6 +25,8 @@ actions!(
         ShowDiff,
         Commit,
         FindInFiles,
+        ToggleTree,
+        ToggleDock,
     ]
 );
 
@@ -114,6 +116,8 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("workbench::Commit", "Commit…", "Git", "⌘K"),
     action_info!("workbench::Undo", "Undo", "Edit", "⌘Z"),
     action_info!("workbench::Redo", "Redo", "Edit", "⇧⌘Z"),
+    action_info!("workbench::ToggleTree", "Toggle Project Tree", "View", "⌘1"),
+    action_info!("workbench::ToggleDock", "Toggle Dock", "View", "⌘4"),
     action_info!("editor::Paste", "Paste", "Edit", "⌘V"),
     action_info!("editor::TabIndent", "Indent / Expand Template", "Edit", "⇥"),
     action_info!("editor::OutdentLine", "Outdent Line", "Edit", "⇧⇥"),

@@ -37,7 +37,8 @@ use crate::actions::{
     DeleteWordBackward, DeleteWordForward, Find, FindInFiles, FindUsages, FormatDocument, GoToFile, GotoDefinition,
     Newline, OpenFile, OrganizeImports, OutdentLine, Paste, Quit, Redo, Rename, Run, Save, SelectDocEnd,
     SelectDocStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineHome, SelectRight, SelectUp, SelectWordLeft,
-    SelectWordRight, ShowDiff, StopRun, TabIndent, ToggleInlayHints, TogglePerfHud, ToggleReplace, Undo,
+    SelectWordRight, ShowDiff, StopRun, TabIndent, ToggleDock, ToggleInlayHints, TogglePerfHud, ToggleReplace,
+    ToggleTree, Undo,
 };
 use crate::actions::{SelectNext, SelectPrev};
 use crate::bus::Bus;
@@ -129,6 +130,10 @@ fn main() {
                     KeyBinding::new("cmd-f", Find, Some("Editor")),
                     KeyBinding::new("alt-cmd-f", ToggleReplace, Some("Editor")),
                     KeyBinding::new("shift-cmd-f", FindInFiles, None),
+                    // M7: dock panel visibility (the IDEA gestures: ⌘1 Project,
+                    // ⌘4 Run/output).
+                    KeyBinding::new("cmd-1", ToggleTree, None),
+                    KeyBinding::new("cmd-4", ToggleDock, None),
                     // Escape cancels panels/popups first (whatever has focus),
                     // then collapses the editor's own state.
                     KeyBinding::new("escape", Cancel, None),

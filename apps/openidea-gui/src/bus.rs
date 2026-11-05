@@ -34,15 +34,18 @@ pub enum BusMessage {
         pos: Pos,
     },
     /// A run configuration start attempt finished (M4; spawned onto the
-    /// background executor).
+    /// background executor). `index` is the dock tab the start created, so
+    /// concurrent starts route to their own panels.
     RunStarted {
+        index: usize,
         name: String,
         result: IdeResult<RunInfo>,
     },
-    /// One output chunk of the run (ide-run batches at ~8 ms). The dock is
-    /// single-run, so the chunk routes to the current panel; exits carry the
-    /// run id through `IdeEvent::RunExited`.
+    /// One output chunk of a run (ide-run batches at ~8 ms), routed to the
+    /// tab that started it; exits carry the run id through
+    /// `IdeEvent::RunExited`.
     RunOutput {
+        index: usize,
         chunk: OutputChunk,
     },
     /// A git status + branch refresh finished (M4; the reads ran on the
