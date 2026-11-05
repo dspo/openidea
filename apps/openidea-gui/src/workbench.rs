@@ -394,8 +394,10 @@ impl Workbench {
 
     /// Queues a toast (M7): flushed at the next render into the window's
     /// notification stack — auto-hide, stacked, replaceable by id. This is
-    /// the M1 debt paid: the status message used to sit forever.
-    fn toast(&self, level: NotifyLevel, text: impl Into<String>) {
+    /// the M1 debt paid: the status message used to sit forever. `pub(crate)`
+    /// so `main.rs` can seed the crash toast of the previous unclean run (M8)
+    /// before the first render flushes it.
+    pub(crate) fn toast(&self, level: NotifyLevel, text: impl Into<String>) {
         self.toasts.borrow_mut().push(Toast { level, text: text.into(), click: None });
     }
 
@@ -1640,7 +1642,10 @@ impl Workbench {
                             context: Default::default(),
                         };
                         let summary = ide_search::search(&host.root, &search, &overlay, &cancel, &|file| {
-                            files.lock().expect("find files lock").push(file)
+                            // Poison recovery: a panic mid-search must not turn
+                            // every later search into a panic; the partial list
+                            // is still usable data.
+                            files.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(file)
                         });
                         let summary = summary.unwrap_or_default();
                         eprintln!(
@@ -1650,7 +1655,7 @@ impl Workbench {
                             summary.elapsed_ms,
                             if summary.limit_hit { " (limit)" } else { "" }
                         );
-                        let files = files.into_inner().expect("find files lock");
+                        let files = files.into_inner().unwrap_or_default();
                         bus.send(BusMessage::FindInFilesDone { request, files, summary });
                     })
                     .detach();
@@ -2861,8 +2866,9 @@ impl Workbench {
         let pages = self.runs.len() + usize::from(find.is_some());
         let body = match self.dock_page {
             DockPage::Run(index) if self.runs.get(index).is_some() => self.runs[index].clone().into_any_element(),
-            _ if find.is_some() => find.clone().unwrap().into_any_element(),
-            _ => return None,
+            // `find` (cloned above) stays owned for the tab-switch row after
+            // this; the `?` returns None when the Find page was never created.
+            _ => self.find_panel.clone()?.into_any_element(),
         };
         if pages <= 1 {
             return Some(self.dock_shell(cx, None, body));

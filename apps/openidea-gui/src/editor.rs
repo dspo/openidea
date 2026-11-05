@@ -1771,8 +1771,9 @@ impl EditorPane {
     ) {
         match result {
             Ok(locations) if locations.len() == 1 => {
-                let only = locations.into_iter().next().expect("checked above");
-                self.jump_to(&only, cx);
+                if let Some(only) = locations.into_iter().next() {
+                    self.jump_to(&only, cx);
+                }
             }
             Ok(locations) if !locations.is_empty() => {
                 self.jump = Some((locations, 0));
@@ -3780,11 +3781,13 @@ fn normalize_selections(mut selections: Vec<Selection>) -> Vec<Selection> {
             None => false,
         };
         if overlapping {
-            // Overlapping: keep the union as a plain selection.
-            let last = out.last_mut().expect("checked above");
-            let (last_start, _) = last.normalized();
-            let (_, end) = selection.normalized();
-            *last = Selection { anchor: last_start, head: end, reversed: false, goal_col: None };
+            // Overlapping: keep the union as a plain selection. `overlapping`
+            // is only reachable with `out` non-empty (its guard reads `last`).
+            if let Some(last) = out.last_mut() {
+                let (last_start, _) = last.normalized();
+                let (_, end) = selection.normalized();
+                *last = Selection { anchor: last_start, head: end, reversed: false, goal_col: None };
+            }
         } else if out.last() != Some(&selection) {
             out.push(selection);
         }

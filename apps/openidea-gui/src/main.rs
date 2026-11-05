@@ -79,7 +79,40 @@ fn initial_project(settings: &settings::Settings) -> Option<PathBuf> {
     }
 }
 
+/// The panic face of "crashes are never silent" (M8): append a crash.log
+/// entry, mark the run unclean (the next launch toasts it), echo to stderr,
+/// then chain into the default hook so the OS-side report behavior is
+/// unchanged. Everything here is best-effort — this runs while unwinding.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic payload".to_owned());
+        let location = info.location().map_or_else(|| "?".to_owned(), |l| format!("{}:{}", l.file(), l.line()));
+        let thread = std::thread::current().name().unwrap_or("<unnamed>").to_owned();
+        let utc = settings::format_utc(
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+        );
+        let entry = settings::crash_entry(&utc, &thread, &payload, &location);
+        eprintln!("[crash] {entry}crash log: <data dir>/openidea-gui/crash.log");
+        settings::append_crash_log(&entry);
+        settings::mark_unclean_exit(Some(&payload));
+        default_hook(info);
+    }));
+}
+
 fn main() {
+    install_panic_hook();
+    // Crash drill (M8): `OPENIDEA_GUI_TEST_PANIC=1` exercises the hook — the
+    // entry lands in crash.log, the run is marked unclean, and the next
+    // launch toasts it. The soak harness and the one-week guide use it.
+    if std::env::var_os("OPENIDEA_GUI_TEST_PANIC").is_some() {
+        panic!("crash-hook drill (OPENIDEA_GUI_TEST_PANIC)");
+    }
     // Backend crates (ide-lsp, ide-vfs) log through tracing; surface it on
     // stderr so scripted sessions carry the servers' side of the story.
     tracing_subscriber::fmt()
@@ -194,6 +227,9 @@ fn main() {
                     if let Some(host) = cx.try_global::<ProjectHost>() {
                         host.0.shutdown_lsp();
                     }
+                    // A graceful exit is a clean exit (M8): the marker keeps the
+                    // crash toast honest on the next launch.
+                    settings::mark_clean_exit();
                     cx.quit();
                 });
                 let (bus, rx) = Bus::channel();
@@ -221,6 +257,22 @@ fn main() {
                     })
                 };
                 let workbench = cx.new(|cx| Workbench::new(host.clone(), bus.clone(), app_settings, cx));
+                // An unclean previous run surfaces as the first toast (M8): the
+                // crash itself could not show one, so the next launch does. The
+                // marker flips to "clean (running)" only after the read, so this
+                // session's own crash still records.
+                if let Some(exit) = settings::read_last_exit()
+                    && !exit.clean
+                {
+                    let reason = exit.reason.as_deref().unwrap_or("unknown cause");
+                    workbench.update(cx, |workbench, _| {
+                        workbench.toast(
+                            ide_core::event::NotifyLevel::Warning,
+                            format!("{}: {reason} (crash log in the app data dir)", strings::LAST_RUN_UNCLEAN),
+                        );
+                    });
+                }
+                settings::mark_clean_exit();
                 // Startup document for scripted verification sessions: the env
                 // names a file inside the project (opened like a tree double-click).
                 if let (Some(host), Some(open)) = (&host, std::env::var_os("OPENIDEA_GUI_OPEN")) {

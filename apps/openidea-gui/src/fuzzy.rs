@@ -145,10 +145,10 @@ fn score_indices(text: &[char], query: &str, indices: &[usize]) -> i32 {
 }
 
 fn spread(indices: &[usize]) -> i32 {
-    if indices.len() < 2 {
-        return 0;
-    }
-    ((indices.last().unwrap() - indices.first().unwrap() + 1 - indices.len()) as i32).min(150)
+    let (Some(first), Some(last)) = (indices.first(), indices.last()) else { return 0 };
+    // Sorted distinct indices span at least their count; saturating keeps a
+    // broken invariant from wrapping in release.
+    ((last - first + 1).saturating_sub(indices.len()) as i32).min(150)
 }
 
 #[cfg(test)]

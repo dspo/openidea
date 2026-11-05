@@ -68,8 +68,133 @@ struct StoreLayout {
 }
 
 /// The settings file path (`None` keeps everything in memory — the defaults).
+/// `OPENIDEA_GUI_SETTINGS_DIR` overrides the directory (scripted sessions and
+/// the soak harness isolate their store from the user's real one).
 fn settings_file() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("OPENIDEA_GUI_SETTINGS_DIR")
+        && !dir.is_empty()
+    {
+        return Some(PathBuf::from(dir).join("settings.json"));
+    }
     dirs::data_dir().map(|dir| dir.join("openidea-gui").join("settings.json"))
+}
+
+/// The app's data directory (the settings dir unless overridden).
+fn data_dir() -> Option<PathBuf> {
+    settings_file()?.parent().map(|parent| parent.to_path_buf())
+}
+
+// -- last-exit sidecar + crash log (M8 stability) --------------------------
+//
+// The crash face of "the app must not die silently": a panic hook appends a
+// crash.log entry and marks the run unclean; a graceful Quit marks it clean.
+// The next launch reads the marker and surfaces a toast, so a crash is always
+// seen by the user even when the process died before any UI could react. A
+// signal kill leaves the stale marker — "ended unexpectedly" stays true, and
+// the hook-annotated crash.log disambiguates panics from kills.
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastExit {
+    pub clean: bool,
+    pub reason: Option<String>,
+}
+
+/// The sidecar path, next to the settings file.
+fn last_exit_file() -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join("last_exit.json"))
+}
+
+/// The crash log path.
+fn crash_log_file() -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join("crash.log"))
+}
+
+/// One crash.log line: `[<utc>] thread <name> panicked: <payload> at <location>`.
+pub fn crash_entry(utc: &str, thread: &str, payload: &str, location: &str) -> String {
+    format!("[{utc}] thread {thread} panicked: {payload} at {location}\n")
+}
+
+/// Seconds-since-epoch to `YYYY-MM-DD HH:MM:SS` UTC (civil-from-days; no
+/// date dependency).
+pub fn format_utc(epoch_secs: u64) -> String {
+    let days = epoch_secs / 86_400;
+    let rem = epoch_secs % 86_400;
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
+    }
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// Parses the sidecar's shape (a missing `clean` falls back to true — an
+/// unknown state never reads as a crash).
+fn parse_last_exit(raw: &str) -> Option<LastExit> {
+    #[derive(Deserialize)]
+    struct Store {
+        #[serde(default = "default_true")]
+        clean: bool,
+        #[serde(default)]
+        reason: Option<String>,
+    }
+    fn default_true() -> bool {
+        true
+    }
+    let store: Store = serde_json::from_str(raw).ok()?;
+    Some(LastExit { clean: store.clean, reason: store.reason })
+}
+
+/// Reads the marker; `None` = absent (first run) or unreadable — never reads
+/// as a crash claim.
+pub fn read_last_exit() -> Option<LastExit> {
+    let raw = std::fs::read_to_string(last_exit_file()?).ok()?;
+    parse_last_exit(&raw)
+}
+
+/// Writes the marker; failures only log (the app keeps running).
+fn write_last_exit(exit: &LastExit) {
+    let Some(path) = last_exit_file() else { return };
+    let Ok(json) = serde_json::to_string(exit) else { return };
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("[settings] last-exit dir failed: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::write(&path, json) {
+        eprintln!("[settings] last-exit write failed: {e}");
+    }
+}
+
+/// Marks the run clean (the graceful Quit path).
+pub fn mark_clean_exit() {
+    write_last_exit(&LastExit { clean: true, reason: None });
+}
+
+/// Marks the run unclean (the panic hook). Synchronous and best-effort —
+/// this runs while unwinding, so every failure is ignored.
+pub fn mark_unclean_exit(reason: Option<&str>) {
+    write_last_exit(&LastExit { clean: false, reason: reason.map(str::to_owned) });
+}
+
+/// Appends one entry to crash.log (created on demand); failures ignored.
+pub fn append_crash_log(entry: &str) {
+    use std::io::Write as _;
+    let Some(path) = crash_log_file() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    let _ = file.write_all(entry.as_bytes());
 }
 
 /// The layout/font clamp windows (also what the drag handles enforce).
@@ -162,6 +287,34 @@ mod tests {
     #[test]
     fn corrupt_store_is_rejected_and_load_falls_back() {
         assert!(parse("{ not json").is_none());
+    }
+
+    #[test]
+    fn format_utc_known_epochs() {
+        assert_eq!(format_utc(0), "1970-01-01 00:00:00");
+        // 2025-01-01T00:00:00Z and a leap-year day.
+        assert_eq!(format_utc(1_735_689_600), "2025-01-01 00:00:00");
+        assert_eq!(format_utc(1_709_164_800), "2024-02-29 00:00:00");
+    }
+
+    #[test]
+    fn crash_entry_shape() {
+        let line = crash_entry("2026-11-05 10:00:00", "main", "bad state", "src/editor.rs:42");
+        assert_eq!(line, "[2026-11-05 10:00:00] thread main panicked: bad state at src/editor.rs:42\n");
+    }
+
+    #[test]
+    fn last_exit_round_trip_and_fallbacks() {
+        // Unparseable and empty shapes never read as a crash.
+        assert!(parse_last_exit("{ not json").is_none());
+        assert!(parse_last_exit("{}").is_some_and(|exit| exit.clean));
+        let clean = parse_last_exit(r#"{"clean": true}"#).unwrap();
+        assert!(clean.clean && clean.reason.is_none());
+        let dirty = parse_last_exit(r#"{"clean": false, "reason": "bad state"}"#).unwrap();
+        assert!(!dirty.clean);
+        assert_eq!(dirty.reason.as_deref(), Some("bad state"));
+        // An unknown shape (foreign schema) stays optimistic.
+        assert!(parse_last_exit(r#"{"reason": 5}"#).is_none());
     }
 
     #[test]
