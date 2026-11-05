@@ -693,6 +693,11 @@ struct Hud {
     completion_paint_ms: Cell<Option<f32>>,
     /// The budget table logs once per pane (the transcript carries it).
     table_logged: Cell<bool>,
+    /// The last frame's prepaint wall time in ms (M8): the frame COST —
+    /// what the scroll-during-index budget judges. The `frame` value is an
+    /// interval between paints and says nothing about cost (event-driven
+    /// rendering makes idle intervals long by design).
+    prepaint_ms: Cell<Option<f32>>,
 }
 
 impl Hud {
@@ -3043,7 +3048,7 @@ impl EditorPane {
             let on = !self.hud.visible.get();
             self.hud.visible.set(on);
             eprintln!(
-                "[perf] hud {} — rows {} spans {}/{} parse {:?} ms@v{} input {:?} ms frame {:.1} ms completion {:?} ms budget {} ms",
+                "[perf] hud {} — rows {} spans {}/{} parse {:?} ms@v{} input {:?} ms frame {:.1} ms prepaint {:?} ms completion {:?} ms budget {} ms",
                 if on { "on" } else { "off" },
                 self.hud.rows_laid_out.get(),
                 self.hud.spans_painted.get(),
@@ -3052,6 +3057,7 @@ impl EditorPane {
                 self.hud.parse_version.get(),
                 self.hud.input_latency_ms.get(),
                 self.hud.last_frame_ms.get(),
+                self.hud.prepaint_ms.get().map(|ms| (ms * 10.0).round() / 10.0),
                 self.hud.completion_paint_ms.get().map(|ms| (ms * 10.0).round() / 10.0),
                 crate::perf::budgets().budget_for("key_to_px").map_or("-".to_owned(), |ms| format!("{ms:.0}"))
             );
@@ -5012,6 +5018,11 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> PrepaintState {
+        // The frame's real cost (M8): this method's wall time — layout, row
+        // shaping, span slicing. Sampled by the scroll-during-index budget
+        // scenario (the paint INTERVAL between scrolls says nothing about
+        // cost; event-driven rendering makes long idle intervals normal).
+        let prepaint_started = std::time::Instant::now();
         let pane = self.view.read(cx);
         let font_size = theme::px_font_size();
         let line_height = theme::px_line_height();
@@ -5279,6 +5290,7 @@ impl Element for EditorElement {
             hscroll: Scrollbar { track: h_track, thumb: h_thumb },
         }));
 
+        self.view.read(cx).hud.prepaint_ms.set(Some(prepaint_started.elapsed().as_secs_f32() * 1000.0));
         PrepaintState {
             rows,
             carets,
@@ -5394,6 +5406,7 @@ impl Element for EditorElement {
                 let latency = hud.input_latency_ms.get().map_or("-".to_owned(), |ms| format!("{ms:.1}"));
                 let parse = hud.parse_ms.get().map_or("-".to_owned(), |ms| format!("{ms:.1}"));
                 let completion = hud.completion_paint_ms.get().map_or("-".to_owned(), |ms| format!("{ms:.0}"));
+                let prepaint = hud.prepaint_ms.get().map_or("-".to_owned(), |ms| format!("{ms:.1}"));
                 let budget = crate::perf::budgets()
                     .budget_for("key_to_px")
                     .map_or_else(|| "-".to_owned(), |ms| format!("{ms:.0}"));
@@ -5403,7 +5416,7 @@ impl Element for EditorElement {
                     _ => "budget –".to_owned(),
                 };
                 let lines = [
-                    format!("{fps:.0} fps · frame {frame_ms:.1} ms"),
+                    format!("{fps:.0} fps · frame {frame_ms:.1} ms · prepaint {prepaint} ms"),
                     format!(
                         "rows {} · spans {}/{}",
                         hud.rows_laid_out.get(),

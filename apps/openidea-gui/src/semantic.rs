@@ -38,9 +38,16 @@ fn kind_for_token_type(name: &str) -> Option<Kind> {
 fn byte_col_in_line(rope: &Rope, line: usize, col16: usize) -> Option<usize> {
     let line_start = rope.try_line_to_byte(line).ok()?;
     let line_end = rope.try_line_to_byte(line + 1).unwrap_or(rope.len_bytes());
+    // Rope::slice indexes CHARS, not bytes: a multibyte file's byte offsets
+    // exceed its char counts, and the raw byte range panicked the render
+    // thread on the first non-ASCII file (caught by the M8 harness's first
+    // repo run). Convert, and drop the token when anything is out of range
+    // (a stale answer).
+    let start = rope.try_byte_to_char(line_start).ok()?;
+    let end = rope.try_byte_to_char(line_end).ok()?;
     let mut units = 0usize;
     let mut at = line_start;
-    for ch in rope.slice(line_start..line_end).chars() {
+    for ch in rope.slice(start..end).chars() {
         if units >= col16 {
             return Some(at);
         }
@@ -115,6 +122,24 @@ mod tests {
         let rope = rope_of("abc\n");
         // Type index beyond the legend, zero length, and a line past the end.
         let got = token_spans(&tokens(&["keyword"], &[0, 0, 3, 7, 0, 0, 0, 0, 0, 0, 5, 0, 3, 0, 0]), &rope);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn multibyte_lines_map_and_never_panic() {
+        // "héllo wörld\n次の行 keyword\n" — the second line's byte start (19)
+        // exceeds the rope's char count region the old code sliced raw (the
+        // render-thread panic the M8 harness caught on the first repo run).
+        let rope = rope_of("héllo wörld\n次の行 keyword\n");
+        // "keyword" starts at utf16 col 4 of line 1, length 7.
+        let got = token_spans(&tokens(&["keyword"], &[1, 4, 7, 0, 0]), &rope);
+        assert_eq!(got.len(), 1);
+        let (range, kind) = got[0].clone();
+        assert_eq!(kind, Kind::Keyword);
+        // The mapped bytes decode to exactly the token text.
+        assert_eq!(&rope.slice(rope.byte_to_char(range.start)..rope.byte_to_char(range.end)).to_string(), "keyword");
+        // A token past the last line drops instead of panicking.
+        let got = token_spans(&tokens(&["keyword"], &[9, 0, 3, 0, 0]), &rope);
         assert!(got.is_empty());
     }
 }
