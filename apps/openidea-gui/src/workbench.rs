@@ -379,11 +379,18 @@ impl Workbench {
     /// ⇧⌘F: opens (or just surfaces) the Find-in-Files dock page. The panel
     /// is created once per project; every Enter re-runs the search through
     /// the bus with a fresh dirty-buffer snapshot.
+    /// ⇧⌘F: opens (or just surfaces) the Find-in-Files dock page and hands
+    /// the query input the focus — the gesture means "type a search now".
+    /// The panel is created once per project; every Enter re-runs the search
+    /// through the bus with a fresh dirty-buffer snapshot.
     fn on_find_in_files(&mut self, _: &FindInFiles, window: &mut Window, cx: &mut Context<Self>) {
         if self.find_panel.is_none() {
             self.find_panel = Some(cx.new(|cx| FindPanel::new(self.bus.clone(), window, cx)));
         }
         self.dock_page = DockPage::Find;
+        if let Some(panel) = &self.find_panel {
+            window.focus(&panel.read(cx).query_focus(cx), cx);
+        }
         cx.notify();
     }
 
