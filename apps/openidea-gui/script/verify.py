@@ -68,7 +68,7 @@ FLAG_ALT = Quartz.kCGEventFlagMaskAlternate
 class Session:
     """One scripted app session: process, transcript, window, input channels."""
 
-    def __init__(self, binary, project, open_file, outdir, name, release=False, extra_env=None):
+    def __init__(self, binary, project, open_file, outdir, name, release=False, extra_env=None, env_project=True):
         self.binary = binary
         self.project = project
         self.open_file = open_file
@@ -76,6 +76,10 @@ class Session:
         self.name = name
         self.release = release
         self.extra_env = extra_env or {}
+        # The scripted-override env keeps sessions stateless (no session
+        # restore, no save). The restore test needs the real startup order —
+        # recents-driven project pick + session restore — so it drops the env.
+        self.env_project = env_project
         self.proc = None
         self.transcript_path = self.outdir / f"{name}-transcript.log"
         self.window_id = None
@@ -85,7 +89,8 @@ class Session:
     def start(self, wait_markers=("first paint",), timeout=90):
         self.outdir.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ)
-        env["OPENIDEA_GUI_PROJECT"] = self.project
+        if self.env_project:
+            env["OPENIDEA_GUI_PROJECT"] = self.project
         env["OPENIDEA_GUI_SETTINGS_DIR"] = str(self.outdir / f"{self.name}-settings")
         env["RUST_LOG"] = "info"
         if self.open_file:
@@ -426,28 +431,29 @@ def run_smoke(binary, project, open_file, outdir, name):
 
 def run_soak(binary, project, open_file, outdir, name, minutes):
     """The long-session loop: paste-edit-save cycles, ⌘W/⌘⇧T tab churn,
-    ⌘1/⌘4 dock toggles, run start/stop bursts; RSS sampled per minute."""
+    ⌘1/⌘4 dock toggles, run start bursts; RSS + settings-file watchpoints
+    sampled per minute (the M7 list: write frequency, file size, run-tab
+    accumulation)."""
     s = Session(binary, project, open_file, outdir, name)
+    settings_file = Path(outdir) / f"{name}-settings" / "settings.json"
     rows = []
     try:
-        s.start(wait_markers=("project opened",), timeout=120)
+        s.start(wait_markers=("first paint",), timeout=120)
         deadline = time.time() + minutes * 60
         cycle = 0
         last_sample = 0.0
         s.post_key("f12")
         while time.time() < deadline:
             cycle += 1
-            # Edit round: paste + save.
+            # Edit round first: the previous cycle ended with the tab
+            # REOPENED, so the editor pane holds the focus and the paste
+            # lands (an earlier draft closed the tab first and the whole
+            # rhythm dead-landed on the tree — the app's no-tab save no-op
+            # is correct; the driver was wrong).
             s.paste(f"soak := {cycle} // cycle {cycle}")
             time.sleep(0.5)
             s.post_key("s", FLAG_CMD)
             time.sleep(0.5)
-            # Tab churn (open/close): ⌘⇧T reopen, ⌘W close — a safe pair even
-            # with one tab (the M7 fallback keeps actions alive).
-            s.post_key("t", FLAG_SHIFT | FLAG_CMD)
-            time.sleep(0.6)
-            s.post_key("w", FLAG_CMD)
-            time.sleep(0.6)
             # Dock/tree toggles.
             s.post_key("1", FLAG_CMD)
             time.sleep(0.3)
@@ -455,16 +461,42 @@ def run_soak(binary, project, open_file, outdir, name, minutes):
             s.post_key("4", FLAG_CMD)
             time.sleep(0.3)
             s.post_key("4", FLAG_CMD)
+            # Run burst every 10th cycle: the Run palette takes a one-off
+            # shell line (paste channel); the run starts and exits on its
+            # own. Tabs accumulate BY DESIGN — that is the M7 watchpoint.
+            if cycle % 10 == 0:
+                s.post_key("r", FLAG_CTRL)
+                time.sleep(0.7)
+                s.paste(f"echo soak-{cycle}")
+                time.sleep(0.3)
+                s.post_key("enter")
+                time.sleep(0.9)
             # HUD sample every ~6 cycles.
             if cycle % 6 == 0:
                 s.post_key("f12")
                 s.post_key("f12")
-            # RSS per minute.
+            # RSS + watchpoints per minute.
             now = time.time()
             if now - last_sample >= 60.0:
                 last_sample = now
-                rows.append({"minute": round((minutes * 60 - (deadline - now)) / 60.0, 2), "rss_mb": s.rss_mb()})
-                print(f"[soak] t+{rows[-1]['minute']:.1f} min rss {rows[-1]['rss_mb']} MB", flush=True)
+                size = settings_file.stat().st_size if settings_file.exists() else 0
+                text = s.transcript_path.read_text(errors="replace")
+                row = {
+                    "minute": round((minutes * 60 - (deadline - now)) / 60.0, 2),
+                    "rss_mb": s.rss_mb(),
+                    "settings_bytes": size,
+                    "saves": len(re.findall(r"\[save\]", text)),
+                    "run_starts": len(re.findall(r"\[run\] starting", text)),
+                    "tab_opens": len(re.findall(r"\[session\]|\[reopen\]", text)),
+                }
+                rows.append(row)
+                print(f"[soak] t+{row['minute']:.1f} min rss {row['rss_mb']} MB settings {size}B saves {row['saves']} runs {row['run_starts']}", flush=True)
+            # Tab churn LAST (⌘W → ⌘⇧T): close pushes the stack, reopen pops
+            # it and re-lands the editor focus for the next cycle.
+            s.post_key("w", FLAG_CMD)
+            time.sleep(0.5)
+            s.post_key("t", FLAG_SHIFT | FLAG_CMD)
+            time.sleep(0.6)
         s.screenshot(s.outdir / f"{name}-final.png")
     finally:
         s.stop()
