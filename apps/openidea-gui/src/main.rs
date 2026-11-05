@@ -18,6 +18,7 @@ mod markdown;
 mod run_panel;
 mod semantic;
 mod strings;
+mod templates;
 mod theme;
 mod workbench;
 
