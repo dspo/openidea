@@ -309,14 +309,15 @@ def measure_key_to_px(session, rounds=6, label="x"):
     return samples
 
 
-def measure_completion(session):
-    """Triggers a member-access completion: pastes the receiver, then posts
-    one raw '.' — the only non-paste channel. The IME may swallow or
-    double-insert it (the M5 record), so the attempt retries: a backspace
-    converges any dot count toward exactly one, and a fresh dot re-arms the
-    trigger."""
+def measure_completion(session, snippet_go=True):
+    """Triggers a member-access completion: pastes a receiver declaration in
+    the scenario's language, then posts one raw '.' — the only non-paste
+    channel. The IME may swallow or double-insert it (the M5 record), so the
+    attempt retries: a backspace converges any dot count toward exactly one,
+    and a fresh dot re-arms the trigger."""
+    receiver = '\nrecv := pkg002.New("m8")\nrecv' if snippet_go else '\nlet recv = String::from("m8");\nrecv'
     session.post_key("cmd_down", FLAG_CMD)  # end of document
-    session.paste('\nrecv := pkg002.New("m8")\nrecv')
+    session.paste(receiver)
     time.sleep(0.3)
     for attempt in range(3):
         session.type_char(".")
@@ -369,7 +370,8 @@ def run_perf(binary, project, open_file, outdir, name, release, scroll_seconds):
         result["open_first_paint_ms"] = s.first_paint_ms()
         result["scroll_frames_during_index_ms"] = measure_scroll_during_index(s, seconds=scroll_seconds)
         result["key_to_px_ms"] = measure_key_to_px(s)
-        result["completion_first_frame_ms"] = measure_completion(s)
+        rust = (open_file or "").endswith(".rs")
+        result["completion_first_frame_ms"] = measure_completion(s, snippet_go=not rust)
         result["find_in_files_first_response_ms"] = measure_find(s)
         shot = s.outdir / f"{name}-hud.png"
         s.post_key("f12")  # HUD on for the shot
