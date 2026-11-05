@@ -18,6 +18,7 @@ mod host;
 mod markdown;
 mod run_panel;
 mod semantic;
+mod settings;
 mod strings;
 mod templates;
 mod theme;
@@ -53,12 +54,18 @@ pub(crate) struct ProjectHost(pub(crate) Arc<Host>);
 
 impl gpui::Global for ProjectHost {}
 
-/// The project to open at startup: `OPENIDEA_GUI_PROJECT` wins; otherwise the
-/// nearest enclosing git repository of the cwd (so `cargo run` inside a repo
-/// worktree just works), else the shell starts empty.
-fn initial_project() -> Option<PathBuf> {
+/// The project to open at startup (M7 order): `OPENIDEA_GUI_PROJECT` wins
+/// (the scripted-session override stays stateless); then the most recent
+/// project from the settings store (when it still exists); then the nearest
+/// enclosing git repository of the cwd as the stateless fallback (so
+/// `cargo run` inside a repo worktree still just works). `None` starts at
+/// the welcome view.
+fn initial_project(settings: &settings::Settings) -> Option<PathBuf> {
     if let Some(from_env) = std::env::var_os("OPENIDEA_GUI_PROJECT") {
         return Some(PathBuf::from(from_env));
+    }
+    if let Some(recent) = settings.recent_projects.first() {
+        return Some(recent.clone());
     }
     let mut dir = std::env::current_dir().ok()?;
     loop {
@@ -181,11 +188,16 @@ fn main() {
                     cx.quit();
                 });
                 let (bus, rx) = Bus::channel();
+                // The persisted settings (recents, layout, font size) load once;
+                // the workbench owns the value and saves on change. The editor
+                // font size feeds the theme before any view renders.
+                let app_settings = settings::load();
+                theme::set_font_size(app_settings.font_size);
                 // The manager must be constructed inside the runtime's context so
                 // it captures this handle for its background tasks.
                 let host = {
                     let _runtime = tokio::runtime::Handle::current().enter();
-                    initial_project().and_then(|root| {
+                    initial_project(&app_settings).and_then(|root| {
                         match Host::open(&root, bus.sink(), tokio::runtime::Handle::current()) {
                             Ok(host) => {
                                 let host = Arc::new(host);
@@ -199,7 +211,7 @@ fn main() {
                         }
                     })
                 };
-                let workbench = cx.new(|cx| Workbench::new(host.clone(), bus.clone(), cx));
+                let workbench = cx.new(|cx| Workbench::new(host.clone(), bus.clone(), app_settings, cx));
                 // Startup document for scripted verification sessions: the env
                 // names a file inside the project (opened like a tree double-click).
                 if let (Some(host), Some(open)) = (&host, std::env::var_os("OPENIDEA_GUI_OPEN")) {
