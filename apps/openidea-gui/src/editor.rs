@@ -1932,7 +1932,28 @@ impl EditorPane {
 
     fn code_actions_ready(&mut self, result: IdeResult<Vec<ide_lsp::types::CodeAction>>, cx: &mut gpui::Context<Self>) {
         match result {
-            Ok(actions) if !actions.is_empty() => {
+            Ok(mut actions) if !actions.is_empty() => {
+                // The server's disabled suggestions cannot apply — drop them.
+                actions.retain(|action| action.disabled_reason.is_none());
+                // Fixes before intentions (the IDEA menu shape): the server's
+                // preferred pick first, then quickfixes, refactors, and the
+                // source.* tools at the bottom.
+                let rank = |action: &ide_lsp::types::CodeAction| match action.kind.as_deref() {
+                    Some("quickfix") => 1,
+                    Some(k) if k.starts_with("refactor") => 2,
+                    Some(k) if k.starts_with("source") => 3,
+                    _ => 4,
+                };
+                actions.sort_by_key(|action| (!action.is_preferred, rank(action)));
+                if actions.is_empty() {
+                    self.host.sink.emit(ide_core::IdeEvent::Notify {
+                        level: ide_core::event::NotifyLevel::Info,
+                        title: strings::NO_CODE_ACTIONS.into(),
+                        body: None,
+                    });
+                    cx.notify();
+                    return;
+                }
                 eprintln!("[lsp] code actions {}", actions.len());
                 self.code_actions = Some((actions, 0));
             }
@@ -5554,7 +5575,7 @@ mod tests {
         // `repo := store.NewStore()` with a type hint after `repo ` (the
         // gopls shape: position between the name and `:=`, padding left).
         let line = "repo := store.NewStore()";
-        let base = vec![plain_run(line.len(), gpui::black().into())];
+        let base = vec![plain_run(line.len(), gpui::black())];
         let hints = vec![RowHint {
             at: 5,
             label: " *store.Store".to_owned(),
@@ -5575,7 +5596,7 @@ mod tests {
             width: 48.0,
             kind: ide_lsp::types::InlayKind::Parameter,
         }];
-        let (text, runs) = augment_with_hints(line, &hints, vec![plain_run(line.len(), gpui::black().into())]);
+        let (text, runs) = augment_with_hints(line, &hints, vec![plain_run(line.len(), gpui::black())]);
         assert_eq!(text, format!("{line} count:"));
         assert_eq!(runs.len(), 2);
         let total: usize = runs.iter().map(|run| run.len).sum();
