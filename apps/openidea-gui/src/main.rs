@@ -36,7 +36,7 @@ use crate::actions::{
     DeleteWordBackward, DeleteWordForward, Find, FindInFiles, FindUsages, FormatDocument, GoToFile, GotoDefinition,
     Newline, OpenFile, OrganizeImports, OutdentLine, Paste, Quit, Redo, Rename, Run, Save, SelectDocEnd,
     SelectDocStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineHome, SelectRight, SelectUp, SelectWordLeft,
-    SelectWordRight, ShowDiff, StopRun, TabIndent, TogglePerfHud, ToggleReplace, Undo,
+    SelectWordRight, ShowDiff, StopRun, TabIndent, ToggleInlayHints, TogglePerfHud, ToggleReplace, Undo,
 };
 use crate::actions::{SelectNext, SelectPrev};
 use crate::bus::Bus;
@@ -140,8 +140,9 @@ fn main() {
                     // M5: quick fixes and formatting.
                     KeyBinding::new("alt-enter", CodeActions, Some("Editor")),
                     KeyBinding::new("cmd-alt-l", FormatDocument, Some("Editor")),
-                    // M6: organize imports (also the ⌘S pre-save step).
+                    // M6: organize imports (also the ⌘S pre-save step) and inlay hints.
                     KeyBinding::new("ctrl-alt-o", OrganizeImports, Some("Editor")),
+                    KeyBinding::new("alt-cmd-i", ToggleInlayHints, Some("Editor")),
                     // Paste rides the editor context (the gpui-component inputs
                     // keep their own clipboard handling).
                     KeyBinding::new("cmd-v", Paste, Some("Editor")),
