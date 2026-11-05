@@ -268,7 +268,8 @@ impl Render for RunPanel {
                         })
                         .collect()
                 })
-                .track_scroll(&self.scroll),
+                .track_scroll(&self.scroll)
+                .h_full(),
             );
         div().flex().flex_col().size_full().bg(theme::surface_bg()).child(header).child(body)
     }
