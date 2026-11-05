@@ -1505,9 +1505,10 @@ impl Workbench {
     /// map and persists the store. The carets are read from the panes HERE —
     /// cursor moves stay in memory (in the panes) between events.
     pub fn save_session(&mut self, cx: &mut Context<Self>) {
-        if std::env::var_os("OPENIDEA_GUI_PROJECT").is_some() {
-            return; // scripted sessions stay stateless, like their restore
-        }
+        // Scripted determinism comes from OPENIDEA_GUI_SETTINGS_DIR (each
+        // harness session owns an isolated store), not from an env guard:
+        // a guard here would block the save/restore round trip the restore
+        // leg exists to exercise.
         let Some(host) = &self.host else { return };
         let root = host.root.clone();
         let tabs = self
@@ -1527,9 +1528,6 @@ impl Workbench {
     /// placed and scrolled into view. Gone files shrink the entry on the
     /// next save. No-op for the scripted-session override.
     pub fn restore_session(&mut self, cx: &mut Context<Self>) {
-        if std::env::var_os("OPENIDEA_GUI_PROJECT").is_some() {
-            return;
-        }
         let Some(host) = &self.host else { return };
         let Some(entry) = self.settings.session.get(&settings::session_key(&host.root)).cloned() else { return };
         eprintln!("[session] restoring {} tab(s)", entry.tabs.len());
