@@ -436,6 +436,14 @@ struct HoverDiag {
     line: u32,
 }
 
+/// The LSP hover card parked under the pointer's line (M5 phase 4).
+#[derive(Clone, PartialEq, Eq)]
+struct HoverCard {
+    line: u32,
+    markdown: bool,
+    contents: String,
+}
+
 /// The rename flow: an input overlay prefilled with the current name, then
 /// the server's workspace edit shown for confirmation before it applies.
 /// `confirmed` guards the Enter that is already in flight. The input view
@@ -669,6 +677,15 @@ pub struct EditorPane {
     rename: Option<RenameFlow>,
     // Code actions (M5 phase 3): the open quick-fix menu and its selection.
     code_actions: Option<(Vec<ide_lsp::types::CodeAction>, usize)>,
+    // Signature help (M5 phase 4): the open popup, caret-anchored like the
+    // completion popup; ↑/↓ cycle the active signature.
+    signature: Option<ide_lsp::types::SignatureHelp>,
+    // The LSP hover card (M5 phase 4): the landed answer for the offset the
+    // pointer rests on (markdown or plain text), plus request bookkeeping so
+    // mouse moves schedule exactly one debounced request per token.
+    hover_card: Option<HoverCard>,
+    hover_req_gen: u32,
+    hover_req_offset: Option<usize>,
     bus: Bus,
     /// F12 perf overlay counters (phase 7).
     hud: Hud,
@@ -730,6 +747,10 @@ impl EditorPane {
             jump: None,
             rename: None,
             code_actions: None,
+            signature: None,
+            hover_card: None,
+            hover_req_gen: 0,
+            hover_req_offset: None,
             bus,
             hud: Hud::default(),
             created_at: std::time::Instant::now(),
@@ -1008,6 +1029,17 @@ impl EditorPane {
         // its inverse is a plain deletion.
         let inverse = inverse_changes(&changes, &originals, cause == Cause::ImeCommit);
 
+        // Signature help: '(' or ',' requests at the primary caret, ')' or a
+        // newline closes; other typing keeps it up (the server refreshes on
+        // the next argument separator).
+        if matches!(cause, Cause::Typing | Cause::ImeCommit) {
+            let committed = changes.iter().rev().find(|c| !c.insert.is_empty()).map(|c| c.insert.clone());
+            match committed.as_deref().and_then(|text| text.chars().next()) {
+                Some('(' | ',') => self.request_signature_help(cx),
+                Some(')' | '\n') => self.close_signature(cx),
+                _ => {}
+            }
+        }
         let selections_before = std::mem::take(&mut self.selections);
         let selections_after = match cause {
             Cause::Typing | Cause::Delete | Cause::Paste => Selection::after_inserts(&changes),
@@ -1028,6 +1060,11 @@ impl EditorPane {
         // A menu parked over stale offsets is gone once the text moves.
         if matches!(cause, Cause::Typing | Cause::Delete | Cause::Paste) {
             self.close_code_actions(cx);
+        }
+        // Text moved: hover cards and pending requests answer for old offsets.
+        if !matches!(cause, Cause::Mechanical) {
+            self.hover_card = None;
+            self.hover_req_offset = None;
         }
         // The macOS IME commits printable input per character (Cause::
         // ImeCommit); plain keydowns (Cause::Typing) and deletions re-filter.
@@ -1229,6 +1266,7 @@ impl EditorPane {
     /// each cursor's goal column; other motions drop it.
     fn move_cursors(&mut self, motion: Motion, extend: bool, cx: &mut gpui::Context<Self>) {
         self.close_code_actions(cx);
+        self.close_signature(cx);
         let vertical = matches!(motion, Motion::Up | Motion::Down);
         let targets: Vec<usize> = self.selections.iter().map(|s| self.motion_target(motion, s)).collect();
         for (index, selection) in self.selections.iter_mut().enumerate() {
@@ -1765,6 +1803,101 @@ impl EditorPane {
         }
     }
 
+    // -- signature help & hover card (M5 phase 4) -----------------------------
+    //
+    // '(' / ',' request textDocument/signatureHelp; the popup rides the
+    // primary caret (the completion popup's anchor math) and renders the
+    // active signature with its active parameter accented. Hovering a token
+    // with no diagnostic schedules one debounced hover request; the answer
+    // renders as a markdown (or plain) card under its line.
+
+    fn request_signature_help(&mut self, cx: &mut gpui::Context<Self>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let lsp = self.host.lsp.clone();
+        let doc = self.doc_id;
+        let pos = self.caret_pos();
+        self.host.runtime.spawn(async move {
+            let result = lsp.signature_help(doc, pos).await;
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.await {
+                this.update(cx, |pane, cx| pane.signature_ready(result, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    fn signature_ready(
+        &mut self,
+        result: IdeResult<Option<ide_lsp::types::SignatureHelp>>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if let Ok(Some(help)) = result {
+            self.signature = Some(help);
+        } else {
+            self.signature = None;
+        }
+        cx.notify();
+    }
+
+    fn close_signature(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.signature.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn signature_cycle(&mut self, delta: isize, cx: &mut gpui::Context<Self>) {
+        if let Some(help) = &mut self.signature {
+            let count = help.signatures.len().max(1) as isize;
+            help.active_signature = ((help.active_signature as isize + delta).rem_euclid(count)) as u32;
+            cx.notify();
+        }
+    }
+
+    /// Schedules the pointer's hover request (debounced on the tokio side; a
+    /// mouse move across tokens collapses into the last generation).
+    fn schedule_lsp_hover(&mut self, offset: usize, cx: &mut gpui::Context<Self>) {
+        self.hover_req_gen += 1;
+        let req = self.hover_req_gen;
+        self.hover_req_offset = Some(offset);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let lsp = self.host.lsp.clone();
+        let doc = self.doc_id;
+        let line = self.buf.line_of(offset);
+        let pos = Pos::new(line, (offset - self.buf.line_start(line)) as u32);
+        self.host.runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let result = lsp.hover(doc, pos, CancellationToken::new()).await;
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.await {
+                this.update(cx, |pane, cx| pane.hover_ready(req, offset, result, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    fn hover_ready(
+        &mut self,
+        req: u32,
+        offset: usize,
+        result: IdeResult<Option<ide_lsp::types::Hover>>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if req != self.hover_req_gen {
+            return;
+        }
+        self.hover_req_offset = None;
+        if let Ok(Some(hover)) = result {
+            let line = self.buf.line_of(offset);
+            self.hover_card =
+                Some(HoverCard { line, markdown: hover.contents.kind == "markdown", contents: hover.contents.value });
+            cx.notify();
+        }
+    }
+
     // -- completion (M3 phase 4) ---------------------------------------------
     //
     // Typing schedules a debounced LSP request (immediately for a server
@@ -1887,6 +2020,8 @@ impl EditorPane {
         let selected = self.completion.as_ref().map_or(0, |open| open.selected.min(list.items.len() - 1));
         self.completion =
             Some(CompletionPopup { items: list.items, replace_start, selected, is_incomplete: list.is_incomplete });
+        // The completion list supersedes a signature popup over the same spot.
+        self.signature = None;
         cx.notify();
     }
 
@@ -1983,6 +2118,8 @@ impl EditorPane {
     pub fn set_diagnostics(&mut self, merged: Vec<Diagnostic>, cx: &mut gpui::Context<Self>) {
         self.diagnostics = merged;
         self.hover.set(None);
+        self.hover_card = None;
+        self.hover_req_offset = None;
         cx.notify();
     }
 
@@ -2143,6 +2280,27 @@ impl EditorPane {
                     cx.notify();
                     return;
                 }
+                _ => {}
+            }
+        }
+        // The signature popup cycles signatures with ↑/↓ and closes on Esc;
+        // motions and edits close it and fall through to their normal work.
+        if self.signature.is_some() {
+            match cmd {
+                Command::Move(Motion::Up, false) => {
+                    self.signature_cycle(-1, cx);
+                    return;
+                }
+                Command::Move(Motion::Down, false) => {
+                    self.signature_cycle(1, cx);
+                    return;
+                }
+                Command::Cancel => {
+                    self.close_signature(cx);
+                    return;
+                }
+                Command::Newline => self.close_signature(cx),
+                Command::Move(..) | Command::Delete { .. } | Command::Paste => self.close_signature(cx),
                 _ => {}
             }
         }
@@ -2375,11 +2533,12 @@ impl EditorPane {
         }
     }
 
-    /// Parks (or clears) the diagnostic under the pointer for the tooltip.
-    /// Only a change notifies — moves within one diagnostic re-render nothing.
+    /// Parks (or clears) what the pointer rests on: a diagnostic's tooltip,
+    /// else the token's LSP hover card (one debounced request per token).
+    /// Only a change notifies — moves within one range re-render nothing.
     fn update_hover(&mut self, position: Point<Pixels>, window: &Window, cx: &mut gpui::Context<Self>) {
-        let next = self.geometry.get().and_then(|geometry| {
-            let offset = self.offset_at(window, &geometry, position);
+        let offset = self.geometry.get().map(|geometry| self.offset_at(window, &geometry, position));
+        let next = offset.and_then(|offset| {
             let line = self.buf.line_of(offset);
             self.diagnostics
                 .iter()
@@ -2390,9 +2549,36 @@ impl EditorPane {
                 })
                 .map(|d| HoverDiag { message: d.message.clone(), severity: d.severity, line })
         });
+        let has_diag = next.is_some();
+        match (has_diag, offset) {
+            (true, _) => {
+                // The diagnostic tooltip wins; the LSP card retires.
+                self.hover_card = None;
+                self.hover_req_offset = None;
+            }
+            (false, Some(offset)) => {
+                if self.hover_answer_stale(offset) {
+                    self.schedule_lsp_hover(offset, cx);
+                }
+            }
+            (false, None) => {}
+        }
         if self.hover.replace(next.clone()) != next {
             cx.notify();
         }
+    }
+
+    /// Whether `offset` needs a hover request (nothing landed for it yet and
+    /// none is in flight).
+    fn hover_answer_stale(&self, offset: usize) -> bool {
+        if self.hover_req_offset == Some(offset) {
+            return false;
+        }
+        self.hover_card.as_ref().is_none_or(|card| {
+            // The card anchors per line; a move within the same line keeps it.
+            let line = self.buf.line_of(offset);
+            card.line != line
+        })
     }
 
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, window: &mut Window, cx: &mut gpui::Context<Self>) {
@@ -2793,6 +2979,10 @@ impl Render for EditorPane {
             }))
             // Hover tooltip: a plain-text bubble under the hovered diagnostic.
             .children(self.render_hover_tooltip(cx))
+            // LSP hover card (markdown or plain) under the pointer's token.
+            .children(self.render_hover_card(cx))
+            // Signature help popup above the primary caret.
+            .children(self.render_signature(cx))
             // Completion popup: the filtered item list at the caret.
             .children(self.render_completion_popup(window, cx))
             // Jump list: definitions / usages across files.
@@ -3087,6 +3277,85 @@ impl EditorPane {
 
     /// The hover tooltip for the diagnostic under the pointer, positioned
     /// under its line from the last frame's geometry.
+    /// The signature help popup (M5 phase 4): the active signature with its
+    /// active parameter accented, other signatures dimmed below, anchored
+    /// above the primary caret (the completion popup's geometry math).
+    fn render_signature(&self, _cx: &mut gpui::Context<Self>) -> Option<gpui::AnyElement> {
+        let help = self.signature.as_ref()?;
+        let geometry = self.geometry.get()?;
+        let caret = self.selections.first().map_or(0, |s| s.head);
+        let caret_row = self.display_of_line(self.buf.line_of(caret)) as f32 - geometry.scroll;
+        let x = geometry.origin.x + px(24.0) - px(geometry.scroll_x);
+        // Three rows of content parked above the caret line (clamped at the top).
+        let rows = help.signatures.len().min(4) as f32 + 0.6;
+        let y = (geometry.origin.y + geometry.line_height * (caret_row - rows - 0.6)).max(geometry.origin.y + px(2.0));
+
+        let active = help.active_signature as usize;
+        let mut list = gpui::div().flex().flex_col().gap_1();
+        for (index, sig) in help.signatures.iter().enumerate().take(4) {
+            let is_active = index == active;
+            let param_range = if is_active { help.active_parameter } else { u32::MAX };
+            list = list.child(render_signature_label(sig, param_range, is_active));
+        }
+        Some(
+            gpui::div()
+                .absolute()
+                .left(x)
+                .top(y)
+                .max_w(px(560.0))
+                .border_1()
+                .border_color(theme::border())
+                .bg(theme::raised_bg())
+                .px_2()
+                .py_1()
+                .text_size(px(12.))
+                .child(list)
+                .into_any_element(),
+        )
+    }
+
+    /// The LSP hover card (M5 phase 4): markdown (or plain) under the
+    /// pointer's token line. Follows the diagnostic tooltip's anchor math.
+    fn render_hover_card(&self, _cx: &mut gpui::Context<Self>) -> Option<gpui::AnyElement> {
+        let card = self.hover_card.as_ref()?;
+        // A diagnostic tooltip at the same spot wins (it is recomputed first).
+        let diag = self.hover.replace(None);
+        let has_diag = diag.is_some();
+        self.hover.set(diag);
+        if has_diag {
+            return None;
+        }
+        let geometry = self.geometry.get()?;
+        let row = self.display_of_line(card.line);
+        let y = geometry.origin.y + geometry.line_height * ((row as f32 - geometry.scroll) + 1.0) + px(4.0);
+        let x = geometry.origin.x + px(24.0) - px(geometry.scroll_x);
+        let mut body = gpui::div().flex().flex_col().gap_1();
+        if card.markdown {
+            for block in crate::markdown::block(&card.contents) {
+                body = body.child(render_markdown_block(block));
+            }
+        } else {
+            body = body.child(gpui::div().text_color(theme::fg()).child(SharedString::from(card.contents.clone())));
+        }
+        Some(
+            gpui::div()
+                .absolute()
+                .left(x)
+                .top(y)
+                .max_w(px(560.0))
+                .max_h(px(320.0))
+                .overflow_hidden()
+                .border_1()
+                .border_color(theme::border())
+                .bg(theme::raised_bg())
+                .px_2()
+                .py_1()
+                .text_size(px(12.))
+                .child(body)
+                .into_any_element(),
+        )
+    }
+
     fn render_hover_tooltip(&self, _cx: &mut gpui::Context<Self>) -> Option<gpui::AnyElement> {
         let hover = self.hover.replace(None);
         self.hover.set(hover.clone());
@@ -3273,6 +3542,92 @@ fn line_runs(
         runs.push(plain_run(len, fg));
     }
     runs
+}
+
+/// One signature label with the active parameter accented (UTF-16 range into
+/// the label); inactive signatures paint muted.
+fn render_signature_label(sig: &ide_lsp::types::Signature, active_parameter: u32, is_active: bool) -> gpui::Div {
+    let label = sig.label.as_str();
+    let color = if is_active { theme::fg() } else { theme::fg_muted() };
+    let param = if is_active { sig.parameters.get(active_parameter as usize).copied() } else { None };
+    let mut row = gpui::div().flex().flex_wrap();
+    let segments: Vec<(String, bool)> = match param {
+        Some((start, end)) => {
+            let s = byte_at_utf16(label, start as usize);
+            let e = byte_at_utf16(label, end.max(start) as usize).max(s);
+            vec![
+                (label[..s].to_owned(), false),
+                (label[s..e].to_owned(), true),
+                (label[e.min(label.len())..].to_owned(), false),
+            ]
+        }
+        None => vec![(label.to_owned(), false)],
+    };
+    for (text, highlighted) in segments {
+        if text.is_empty() {
+            continue;
+        }
+        let span = if highlighted {
+            gpui::div().font_weight(gpui::FontWeight::MEDIUM).text_color(theme::accent())
+        } else {
+            gpui::div().text_color(color)
+        };
+        row = row.child(span.child(SharedString::from(text)));
+    }
+    row
+}
+
+/// The markdown block renderer's gpui face: fenced code rows on the app
+/// background, headings medium, list items bulleted, inline `code` in the
+/// accent tone and **bold** as medium runs.
+fn render_markdown_block(block: crate::markdown::Block) -> gpui::Div {
+    match block {
+        crate::markdown::Block::Code(lines) => gpui::div()
+            .flex()
+            .flex_col()
+            .bg(theme::app_bg())
+            .px_2()
+            .py_1()
+            .text_color(theme::fg())
+            .font_family(theme::FONT_FAMILY)
+            .text_size(px(11.))
+            .children(lines.into_iter().map(|line| gpui::div().child(SharedString::from(line)))),
+        crate::markdown::Block::Heading(level, text) => {
+            let size = if level <= 1 { px(14.0) } else { px(13.0) };
+            gpui::div()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme::fg())
+                .text_size(size)
+                .child(render_inline(crate::markdown::inline(&text)))
+        }
+        crate::markdown::Block::ListItem(text) => gpui::div()
+            .flex()
+            .gap_1()
+            .child(gpui::div().text_color(theme::fg_muted()).child("•"))
+            .child(render_inline(crate::markdown::inline(&text))),
+        crate::markdown::Block::Paragraph(text) => {
+            gpui::div().text_color(theme::fg()).child(render_inline(crate::markdown::inline(&text)))
+        }
+    }
+}
+
+/// Inline markdown runs as one wrapped row of spans.
+fn render_inline(runs: Vec<crate::markdown::Inline>) -> gpui::AnyElement {
+    let mut row = gpui::div().flex().flex_wrap();
+    for run in runs {
+        let span = match run {
+            crate::markdown::Inline::Plain(text) => gpui::div().text_color(theme::fg()).child(SharedString::from(text)),
+            crate::markdown::Inline::Code(text) => {
+                gpui::div().text_color(theme::accent()).font_family(theme::FONT_FAMILY).child(SharedString::from(text))
+            }
+            crate::markdown::Inline::Bold(text) => gpui::div()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme::fg())
+                .child(SharedString::from(text)),
+        };
+        row = row.child(span);
+    }
+    row.into_any_element()
 }
 
 /// Error squiggles win over warnings, warnings over info hints.
