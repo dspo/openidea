@@ -17,10 +17,12 @@ use gpui::{
     KeyDownEvent, ModifiersChangedEvent, MouseButton, ParentElement, Render, SharedString,
     StatefulInteractiveElement as _, Styled, Window, div, px,
 };
+use gpui_component::WindowExt as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_component::notification::Notification;
 use gpui_component::status_bar::StatusBar;
 use gpui_component::tab::{Tab as ComponentTab, TabBar};
 use gpui_component::{Icon, IconName, Selectable as _, Sizable as _};
@@ -76,9 +78,6 @@ struct Tab {
     stale: bool,
     pinned: bool,
 }
-
-/// What the status bar shows on the right, until the next message.
-type Message = (NotifyLevel, String);
 
 /// One language server's live status (from `LanguageServer` events), keyed by
 /// server id so restarted instances replace their row.
@@ -187,6 +186,25 @@ struct TreeConfirm {
     name: String,
 }
 
+/// What a toast click does (M7): a toast is a notification, but some carry
+/// a jump — the failed save's editor, the failed run's dock.
+#[derive(Clone, Copy)]
+enum ToastClick {
+    FocusEditor,
+    ShowRun,
+}
+
+/// A toast's click handler face (`Notification::on_click`).
+type ToastHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut gpui::App)>;
+
+/// One queued toast: flushed to the window's notification stack at the next
+/// render (the bus pump has no window).
+struct Toast {
+    level: NotifyLevel,
+    text: String,
+    click: Option<ToastClick>,
+}
+
 pub struct Workbench {
     host: Option<Arc<Host>>,
     /// The persisted settings (recents, layout, font size) — saved on change.
@@ -201,7 +219,9 @@ pub struct Workbench {
     /// A bus-side project open has no window; the next render hands the tree
     /// the focus.
     tree_focus_pending: Cell<bool>,
-    message: Option<Message>,
+    /// Toasts queued for the window's notification stack (M7): the bus pump
+    /// has no window, so every toast lands here and the next render flushes.
+    toasts: std::cell::RefCell<Vec<Toast>>,
     servers: Vec<ServerRow>,
     /// Diagnostics per file, per producer (`Diagnostics` events replace one
     /// producer's list; the merged view reaches the pane). Sorted by position
@@ -296,7 +316,7 @@ impl Workbench {
             tree_focus: cx.focus_handle(),
             tree_focused_once: Cell::new(false),
             tree_focus_pending: Cell::new(false),
-            message: None,
+            toasts: std::cell::RefCell::new(Vec::new()),
             servers: Vec::new(),
             diagnostics: HashMap::new(),
             bus,
@@ -356,6 +376,55 @@ impl Workbench {
             .detach();
     }
 
+    /// Queues a toast (M7): flushed at the next render into the window's
+    /// notification stack — auto-hide, stacked, replaceable by id. This is
+    /// the M1 debt paid: the status message used to sit forever.
+    fn toast(&self, level: NotifyLevel, text: impl Into<String>) {
+        self.toasts.borrow_mut().push(Toast { level, text: text.into(), click: None });
+    }
+
+    /// The same, with a click target.
+    fn toast_with(&self, level: NotifyLevel, text: impl Into<String>, click: ToastClick) {
+        self.toasts.borrow_mut().push(Toast { level, text: text.into(), click: Some(click) });
+    }
+
+    /// Drains the queue into the window's notifications.
+    fn flush_toasts(&self, window: &mut Window, cx: &mut Context<Self>) {
+        for toast in self.toasts.borrow_mut().drain(..) {
+            let mut note = match toast.level {
+                NotifyLevel::Error => Notification::error(toast.text.clone()),
+                NotifyLevel::Warning => Notification::warning(toast.text.clone()),
+                NotifyLevel::Info => Notification::info(toast.text.clone()),
+            };
+            if let Some(click) = toast.click {
+                let workbench = cx.entity().downgrade();
+                let on_click: ToastHandler = match click {
+                    ToastClick::FocusEditor => {
+                        Box::new(move |_: &ClickEvent, window: &mut Window, cx: &mut gpui::App| {
+                            workbench.update(cx, |this, cx| this.focus_active(window, cx)).ok();
+                        })
+                    }
+                    ToastClick::ShowRun => Box::new(move |_: &ClickEvent, _: &mut Window, cx: &mut gpui::App| {
+                        workbench
+                            .update(cx, |this, cx| {
+                                if !this.runs.is_empty() {
+                                    this.dock_page = DockPage::Run(this.runs.len() - 1);
+                                    if !this.settings.layout.dock_visible {
+                                        this.settings.layout.dock_visible = true;
+                                        settings::save(&this.settings);
+                                    }
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                    }),
+                };
+                note = note.on_click(on_click);
+            }
+            window.push_notification(note, cx);
+        }
+    }
+
     // -- actions ----------------------------------------------------------
 
     /// ⌘O: the native dialog. Context-sensitive (M7): with a project open it
@@ -404,10 +473,10 @@ impl Workbench {
             Ok(host) => Arc::new(host),
             Err(e) => {
                 eprintln!("[workbench] opening {}: {}", root.display(), e.message);
-                self.message = Some((
+                self.toast(
                     NotifyLevel::Error,
                     format!("{} {}: {}", strings::OPEN_PROJECT_FAILED, file_name(&root), e.message),
-                ));
+                );
                 cx.notify();
                 return;
             }
@@ -492,10 +561,14 @@ impl Workbench {
             Ok(()) => {
                 tab.dirty = false;
                 tab.stale = false;
-                self.message = Some((NotifyLevel::Info, format!("{} {name}", strings::SAVED_TOAST)));
+                self.toast(NotifyLevel::Info, format!("{} {name}", strings::SAVED_TOAST));
             }
             Err(e) => {
-                self.message = Some((NotifyLevel::Error, format!("{} {name}: {}", strings::SAVE_FAILED, e.message)));
+                self.toast_with(
+                    NotifyLevel::Error,
+                    format!("{} {name}: {}", strings::SAVE_FAILED, e.message),
+                    ToastClick::FocusEditor,
+                );
             }
         }
         cx.notify();
@@ -642,12 +715,12 @@ impl Workbench {
     /// selected row when it carries a git change, else the active tab's file.
     fn on_show_diff(&mut self, _: &ShowDiff, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(host) = self.host.clone() else {
-            self.message = Some((NotifyLevel::Warning, strings::NO_PROJECT.to_owned()));
+            self.toast(NotifyLevel::Warning, strings::NO_PROJECT.to_owned());
             cx.notify();
             return;
         };
         if host.repo.is_none() {
-            self.message = Some((NotifyLevel::Warning, strings::GIT_NOT_A_REPO.to_owned()));
+            self.toast(NotifyLevel::Warning, strings::GIT_NOT_A_REPO.to_owned());
             cx.notify();
             return;
         }
@@ -658,7 +731,7 @@ impl Workbench {
             .filter(|path| self.git_status.contains_key(path))
             .or_else(|| self.active.and_then(|index| self.tabs.get(index)).map(|tab| tab.path.clone()));
         let Some(path) = target else {
-            self.message = Some((NotifyLevel::Warning, strings::DIFF_TARGET_HINT.to_owned()));
+            self.toast(NotifyLevel::Warning, strings::DIFF_TARGET_HINT.to_owned());
             cx.notify();
             return;
         };
@@ -697,17 +770,17 @@ impl Workbench {
             return;
         }
         let Some(host) = &self.host else {
-            self.message = Some((NotifyLevel::Warning, strings::NO_PROJECT.to_owned()));
+            self.toast(NotifyLevel::Warning, strings::NO_PROJECT.to_owned());
             cx.notify();
             return;
         };
         if host.repo.is_none() {
-            self.message = Some((NotifyLevel::Warning, strings::GIT_NOT_A_REPO.to_owned()));
+            self.toast(NotifyLevel::Warning, strings::GIT_NOT_A_REPO.to_owned());
             cx.notify();
             return;
         }
         if self.git_status.is_empty() {
-            self.message = Some((NotifyLevel::Info, strings::COMMIT_NO_CHANGES.to_owned()));
+            self.toast(NotifyLevel::Info, strings::COMMIT_NO_CHANGES.to_owned());
             cx.notify();
             return;
         }
@@ -749,7 +822,7 @@ impl Workbench {
             flow.files.len()
         );
         if message.trim().is_empty() {
-            self.message = Some((NotifyLevel::Warning, strings::COMMIT_EMPTY_MESSAGE.to_owned()));
+            self.toast(NotifyLevel::Warning, strings::COMMIT_EMPTY_MESSAGE.to_owned());
             cx.notify();
             return;
         }
@@ -758,7 +831,7 @@ impl Workbench {
         let unstaged: Vec<PathBuf> =
             flow.files.iter().filter(|file| !file.selected).map(|file| file.path.clone()).collect();
         if staged.is_empty() {
-            self.message = Some((NotifyLevel::Warning, strings::COMMIT_NO_CHANGES.to_owned()));
+            self.toast(NotifyLevel::Warning, strings::COMMIT_NO_CHANGES.to_owned());
             cx.notify();
             return;
         }
@@ -1084,7 +1157,7 @@ impl Workbench {
                 match cx.build_action(action.name, None) {
                     Ok(action) => window.dispatch_action(action, cx),
                     Err(e) => {
-                        self.message = Some((NotifyLevel::Error, format!("{} cannot run: {}", action.title, e)));
+                        self.toast(NotifyLevel::Error, format!("{} cannot run: {}", action.title, e));
                         cx.notify();
                     }
                 }
@@ -1109,7 +1182,7 @@ impl Workbench {
 
     fn start_run(&mut self, config: RunConfig, cx: &mut Context<Self>) {
         let Some(host) = self.host.clone() else {
-            self.message = Some((NotifyLevel::Warning, strings::NO_PROJECT.to_owned()));
+            self.toast(NotifyLevel::Warning, strings::NO_PROJECT.to_owned());
             cx.notify();
             return;
         };
@@ -1249,7 +1322,7 @@ impl Workbench {
     /// Opens `path` in a tab (activating the existing one when already open).
     pub fn open_path(&mut self, path: &Path, cx: &mut Context<Self>) {
         let Some(host) = self.host.clone() else {
-            self.message = Some((NotifyLevel::Warning, strings::NO_PROJECT.to_owned()));
+            self.toast(NotifyLevel::Warning, strings::NO_PROJECT.to_owned());
             cx.notify();
             return;
         };
@@ -1262,10 +1335,10 @@ impl Workbench {
         let info = match host.open_document(path) {
             Ok(info) => info,
             Err(e) => {
-                self.message = Some((
+                self.toast(
                     NotifyLevel::Error,
                     format!("{} {}: {}", strings::LOADING_FAILED, file_name(path), e.message),
-                ));
+                );
                 cx.notify();
                 return;
             }
@@ -1354,7 +1427,7 @@ impl Workbench {
                 cx.notify();
             }
             BusMessage::Ide(IdeEvent::Notify { level, title, .. }) => {
-                self.message = Some((level, title));
+                self.toast(level, title);
                 cx.notify();
             }
             BusMessage::OpenLocation { path, pos } => {
@@ -1395,10 +1468,10 @@ impl Workbench {
                     self.servers.push(ServerRow { id: server, name: name.clone(), status, message: message.clone() });
                 }
                 if matches!(status, ServerStatus::Missing | ServerStatus::Crashed | ServerStatus::Misconfigured) {
-                    self.message = Some((
+                    self.toast(
                         NotifyLevel::Warning,
                         message.clone().unwrap_or_else(|| format!("{name} is not running")),
-                    ));
+                    );
                 }
                 cx.notify();
             }
@@ -1424,8 +1497,11 @@ impl Workbench {
                                 cx.notify();
                             });
                         }
-                        self.message =
-                            Some((NotifyLevel::Error, format!("{} {name}: {}", strings::RUN_LAUNCH_FAILED, e.message)));
+                        self.toast_with(
+                            NotifyLevel::Error,
+                            format!("{} {name}: {}", strings::RUN_LAUNCH_FAILED, e.message),
+                            ToastClick::ShowRun,
+                        );
                     }
                 }
                 cx.notify();
@@ -1465,11 +1541,10 @@ impl Workbench {
                         self.diff_focus_pending.set(true);
                     }
                     Ok(_) => {
-                        self.message = Some((NotifyLevel::Info, strings::DIFF_NO_CHANGES.to_owned()));
+                        self.toast(NotifyLevel::Info, strings::DIFF_NO_CHANGES.to_owned());
                     }
                     Err(e) => {
-                        self.message =
-                            Some((NotifyLevel::Error, format!("{} {}: {}", strings::DIFF_FAILED, title, e.message)));
+                        self.toast(NotifyLevel::Error, format!("{} {}: {}", strings::DIFF_FAILED, title, e.message));
                     }
                 }
                 cx.notify();
@@ -1481,12 +1556,12 @@ impl Workbench {
                         self.commit = None;
                         self.commit_sub.take();
                         self.restore_focus_pending.set(true);
-                        self.message = Some((NotifyLevel::Info, format!("{} {short}", strings::COMMIT_TOAST)));
+                        self.toast(NotifyLevel::Info, format!("{} {short}", strings::COMMIT_TOAST));
                         eprintln!("[vcs] committed {id}");
                         self.refresh_git(cx);
                     }
                     Err(e) => {
-                        self.message = Some((NotifyLevel::Error, format!("{}: {}", strings::COMMIT_FAILED, e.message)));
+                        self.toast(NotifyLevel::Error, format!("{}: {}", strings::COMMIT_FAILED, e.message));
                     }
                 }
                 cx.notify();
@@ -1501,7 +1576,7 @@ impl Workbench {
                             panel.finished(request, Vec::new(), ide_search::SearchSummary::default(), cx)
                         });
                     }
-                    self.message = Some((NotifyLevel::Warning, strings::NO_PROJECT.to_owned()));
+                    self.toast(NotifyLevel::Warning, strings::NO_PROJECT.to_owned());
                     cx.notify();
                     return;
                 };
@@ -1570,10 +1645,10 @@ impl Workbench {
                         }
                     }
                     Some(message) => {
-                        self.message = Some((
+                        self.toast(
                             NotifyLevel::Error,
                             format!("{} {}: {}", strings::FS_CREATE_FAILED, file_name(&path), message),
-                        ));
+                        );
                     }
                 }
                 if let Some(host) = &self.host {
@@ -1585,10 +1660,10 @@ impl Workbench {
                 match error {
                     None => self.open_path(&to, cx),
                     Some(message) => {
-                        self.message = Some((
+                        self.toast(
                             NotifyLevel::Error,
                             format!("{} {}: {}", strings::FS_RENAME_FAILED, file_name(&from), message),
-                        ));
+                        );
                     }
                 }
                 if let Some(host) = &self.host {
@@ -1598,7 +1673,7 @@ impl Workbench {
             }
             BusMessage::FsDeleted { error } => {
                 if let Some(message) = error {
-                    self.message = Some((NotifyLevel::Error, format!("{}: {}", strings::FS_DELETE_FAILED, message)));
+                    self.toast(NotifyLevel::Error, format!("{}: {}", strings::FS_DELETE_FAILED, message));
                 }
                 if let Some(host) = &self.host {
                     self.tree.refresh(host);
@@ -1614,7 +1689,7 @@ impl Workbench {
                         panel.exited(code);
                         cx.notify();
                     });
-                    self.message = Some((NotifyLevel::Info, format!("{} {code:?}", strings::RUN_EXITED)));
+                    self.toast(NotifyLevel::Info, format!("{} {code:?}", strings::RUN_EXITED));
                 }
                 cx.notify();
             }
@@ -1639,11 +1714,14 @@ impl Workbench {
                         } else {
                             strings::SAVED_TOAST.to_owned()
                         };
-                        self.message = Some((NotifyLevel::Info, format!("{note} {name}")));
+                        self.toast(NotifyLevel::Info, format!("{note} {name}"));
                     }
                     Some(message) => {
-                        self.message =
-                            Some((NotifyLevel::Error, format!("{} {name}: {}", strings::SAVE_FAILED, message)));
+                        self.toast_with(
+                            NotifyLevel::Error,
+                            format!("{} {name}: {}", strings::SAVE_FAILED, message),
+                            ToastClick::FocusEditor,
+                        );
                     }
                 }
                 eprintln!("[save] {name} organized={organized} error={error:?}");
@@ -1831,10 +1909,11 @@ impl Workbench {
                     && self.tabs[index].dirty
                     && let Err(e) = host.save_document(self.tabs[index].doc)
                 {
-                    self.message = Some((
+                    self.toast_with(
                         NotifyLevel::Error,
                         format!("{} {}: {}", strings::SAVE_FAILED, file_name(&prompt.target), e.message),
-                    ));
+                        ToastClick::FocusEditor,
+                    );
                     cx.notify();
                     return;
                 }
@@ -2045,6 +2124,8 @@ impl Render for Workbench {
         if self.diff_focus_pending.replace(false) {
             window.focus(&self.diff_focus, cx);
         }
+        // The toast queue drains here (the window exists from now on).
+        self.flush_toasts(window, cx);
         // A bus message closed an overlay (the commit landed): focus returns
         // to where editing happens.
         if self.restore_focus_pending.replace(false) {
@@ -2600,15 +2681,6 @@ impl Workbench {
             (Some(host), None) => (host.name.clone(), None, (strings::SAVE_STATE_SAVED, theme::fg_muted())),
             (None, _) => (strings::NO_PROJECT.to_owned(), None, (strings::SAVE_STATE_SAVED, theme::fg_muted())),
         };
-        let message = self.message.clone().map(|(level, text)| {
-            let color = match level {
-                NotifyLevel::Error => theme::error(),
-                NotifyLevel::Warning => theme::warning(),
-                _ => theme::fg_muted(),
-            };
-            (text, color)
-        });
-
         let mut left = div().flex().items_center().gap_2().text_size(px(12.));
         left = left.child(div().text_color(theme::fg_muted()).child(SharedString::from(project)));
         if let Some(branch) = &self.git_branch {
@@ -2657,9 +2729,6 @@ impl Workbench {
                 .child(div().max_w(px(160.0)).truncate().text_color(theme::warning()).child(SharedString::from(text)));
         }
         right = right.child(div().text_color(state.1).child(SharedString::from(state.0)));
-        if let Some((text, color)) = message {
-            right = right.child(div().max_w_96().truncate().text_color(color).child(SharedString::from(text)));
-        }
         StatusBar::new().left(left).right(right)
     }
 }
