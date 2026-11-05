@@ -14,6 +14,7 @@ mod file_tree;
 mod fuzzy;
 mod highlight;
 mod host;
+mod markdown;
 mod run_panel;
 mod semantic;
 mod strings;
