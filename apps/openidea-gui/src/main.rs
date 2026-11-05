@@ -221,17 +221,6 @@ fn main() {
                     KeyBinding::new("up", SelectPrev, Some("Palette")),
                     KeyBinding::new("down", SelectNext, Some("Palette")),
                 ]);
-                cx.on_action(|_: &Quit, cx| {
-                    // Best-effort graceful server shutdown before the loop exits;
-                    // peers are killed regardless when the process ends.
-                    if let Some(host) = cx.try_global::<ProjectHost>() {
-                        host.0.shutdown_lsp();
-                    }
-                    // A graceful exit is a clean exit (M8): the marker keeps the
-                    // crash toast honest on the next launch.
-                    settings::mark_clean_exit();
-                    cx.quit();
-                });
                 let (bus, rx) = Bus::channel();
                 // The persisted settings (recents, layout, font size) load once;
                 // the workbench owns the value and saves on change. The editor
@@ -257,6 +246,20 @@ fn main() {
                     })
                 };
                 let workbench = cx.new(|cx| Workbench::new(host.clone(), bus.clone(), app_settings, cx));
+                // The Quit action persists the session (tabs + carets) on the
+                // graceful path (M8); registered here so it can reach the
+                // workbench entity.
+                cx.on_action({
+                    let workbench = workbench.downgrade();
+                    move |_: &Quit, cx| {
+                        if let Some(host) = cx.try_global::<ProjectHost>() {
+                            host.0.shutdown_lsp();
+                        }
+                        workbench.update(cx, |workbench, cx| workbench.save_session(cx)).ok();
+                        settings::mark_clean_exit();
+                        cx.quit();
+                    }
+                });
                 // An unclean previous run surfaces as the first toast (M8): the
                 // crash itself could not show one, so the next launch does. The
                 // marker flips to "clean (running)" only after the read, so this
@@ -273,6 +276,10 @@ fn main() {
                     });
                 }
                 settings::mark_clean_exit();
+                // The recorded session (tabs + carets) restores before any
+                // scripted open, so OPENIDEA_GUI_OPEN still wins the active
+                // tab for scripted sessions (M8).
+                workbench.update(cx, |workbench, cx| workbench.restore_session(cx));
                 // Startup document for scripted verification sessions: the env
                 // names a file inside the project (opened like a tree double-click).
                 if let (Some(host), Some(open)) = (&host, std::env::var_os("OPENIDEA_GUI_OPEN")) {

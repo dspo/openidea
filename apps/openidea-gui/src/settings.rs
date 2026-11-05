@@ -1,19 +1,31 @@
 //! The app's persisted settings (M7): recent projects, the workbench layout
-//! (tree/dock visibility + sizes), and the editor font size. One JSON file in
-//! the platform data dir, read-modify-written with the same discipline the
-//! reference host uses: every write round-trips through parse (foreign keys
-//! survive), and a corrupt file is replaced rather than allowed to block.
+//! (tree/dock visibility + sizes), the editor font size, and — M8 — the
+//! per-project session (open tabs, the active one, each tab's caret). One
+//! JSON file in the platform data dir, read-modify-written with the same
+//! discipline the reference host uses: every write round-trips through
+//! parse (foreign keys survive), and a corrupt file is replaced rather than
+//! allowed to block.
 //!
-//! Loaded once at startup; the workbench owns the value and saves on every
-//! change. Missing fields fall back to the defaults, so an older file keeps
-//! working when new fields land.
+//! Loaded once at startup; the workbench owns the value and saves on change
+//! — for the session, on the rare structural events only (tab
+//! open/close/activate, project switch, graceful quit), never on typing.
+//! Missing fields fall back to the defaults, so an older file keeps working
+//! when new fields land.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 /// How many projects the recents list remembers.
 const MAX_RECENTS: usize = 10;
+
+/// How many tabs a session entry remembers (M8) — the file must never grow
+/// unbounded (the M7 watchpoint).
+pub const MAX_SESSION_TABS: usize = 30;
+
+/// How many projects the session map remembers (M8).
+pub const MAX_SESSION_PROJECTS: usize = 20;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -22,6 +34,29 @@ pub struct Settings {
     pub recent_projects: Vec<PathBuf>,
     pub layout: Layout,
     pub font_size: f32,
+    /// Per-project session (M8), keyed by the canonical project root.
+    pub session: BTreeMap<String, SessionTabs>,
+}
+
+/// One project's restored session (M8): the tabs in open order, the active
+/// one, and each tab's caret.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionTabs {
+    #[serde(default)]
+    pub tabs: Vec<TabSession>,
+    #[serde(default)]
+    pub active: Option<usize>,
+}
+
+/// One tab of a session entry (M8): the file and where the caret was.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TabSession {
+    #[serde(default)]
+    pub path: PathBuf,
+    #[serde(default)]
+    pub cursor_line: u32,
+    #[serde(default)]
+    pub cursor_col_utf16: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -40,7 +75,12 @@ impl Default for Layout {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { recent_projects: Vec::new(), layout: Layout::default(), font_size: crate::theme::FONT_SIZE }
+        Self {
+            recent_projects: Vec::new(),
+            layout: Layout::default(),
+            font_size: crate::theme::FONT_SIZE,
+            session: BTreeMap::new(),
+        }
     }
 }
 
@@ -53,6 +93,8 @@ struct Store {
     layout: Option<StoreLayout>,
     #[serde(default)]
     font_size: Option<f32>,
+    #[serde(default)]
+    session: BTreeMap<String, SessionTabs>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -203,11 +245,23 @@ pub const DOCK_HEIGHT_RANGE: std::ops::RangeInclusive<f32> = 120.0..=560.0;
 pub const FONT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 10.0..=24.0;
 
 /// Converts a parsed store into settings: defaults fill missing fields,
-/// out-of-range values fall back, recents prune to existing directories.
+/// out-of-range values fall back, recents prune to existing directories,
+/// and session entries prune to existing projects (M8).
 fn from_store(store: Store) -> Settings {
     let defaults = Settings::default();
     let layout = store.layout;
     let recent_projects = store.recent_projects.into_iter().filter(|path| path.is_dir()).take(MAX_RECENTS).collect();
+    let session = store
+        .session
+        .into_iter()
+        .filter(|(root, _)| Path::new(root).is_dir())
+        .map(|(root, mut entry)| {
+            entry.tabs.truncate(MAX_SESSION_TABS);
+            entry.active = entry.active.filter(|index| *index < entry.tabs.len());
+            (root, entry)
+        })
+        .take(MAX_SESSION_PROJECTS)
+        .collect();
     Settings {
         recent_projects,
         layout: Layout {
@@ -225,6 +279,7 @@ fn from_store(store: Store) -> Settings {
                 .unwrap_or(defaults.layout.dock_height),
         },
         font_size: store.font_size.filter(|size| FONT_SIZE_RANGE.contains(size)).unwrap_or(defaults.font_size),
+        session,
     }
 }
 
@@ -254,6 +309,7 @@ pub fn save(settings: &Settings) {
             dock_height: Some(settings.layout.dock_height),
         }),
         font_size: Some(settings.font_size),
+        session: settings.session.clone(),
     };
     let Ok(json) = serde_json::to_string_pretty(&store) else { return };
     if let Some(parent) = path.parent()
@@ -274,6 +330,30 @@ pub fn push_recent(recents: &mut Vec<PathBuf>, root: &Path) {
     recents.retain(|path| path != &canonical);
     recents.insert(0, canonical);
     recents.truncate(MAX_RECENTS);
+}
+
+/// The session map's key for a project root (canonical path, matching the
+/// recents entries).
+pub fn session_key(root: &Path) -> String {
+    let canonical = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    canonical.to_string_lossy().into_owned()
+}
+
+/// Records (or drops, when empty) the session for `root` and enforces the
+/// caps (M8): ≤ [`MAX_SESSION_TABS`] per project, ≤ [`MAX_SESSION_PROJECTS`]
+/// projects.
+pub fn set_session(session: &mut BTreeMap<String, SessionTabs>, root: &Path, mut entry: SessionTabs) {
+    entry.tabs.truncate(MAX_SESSION_TABS);
+    let active = entry.active.filter(|index| *index < entry.tabs.len());
+    let key = session_key(root);
+    if entry.tabs.is_empty() {
+        session.remove(&key);
+    } else {
+        session.insert(key, SessionTabs { tabs: entry.tabs, active });
+    }
+    while session.len() > MAX_SESSION_PROJECTS {
+        session.pop_first();
+    }
 }
 
 #[cfg(test)]
@@ -353,6 +433,67 @@ mod tests {
     }
 
     #[test]
+    fn session_round_trips_with_caps() {
+        let mut session = BTreeMap::new();
+        // More tabs than the cap: truncated, the active index filtered.
+        let tabs: Vec<TabSession> = (0..(MAX_SESSION_TABS + 5))
+            .map(|i| TabSession {
+                path: PathBuf::from(format!("/tmp/m8-sess/{i}.go")),
+                cursor_line: i as u32,
+                cursor_col_utf16: 2,
+            })
+            .collect();
+        set_session(&mut session, Path::new("/tmp/m8-sess"), SessionTabs { tabs, active: Some(MAX_SESSION_TABS + 2) });
+        let entry = session.values().next().unwrap();
+        assert_eq!(entry.tabs.len(), MAX_SESSION_TABS);
+        assert_eq!(entry.active, None, "an out-of-range active must drop");
+
+        // A valid active survives.
+        let tabs = vec![TabSession { path: PathBuf::from("/tmp/m8-sess/a.go"), cursor_line: 1, cursor_col_utf16: 0 }];
+        set_session(&mut session, Path::new("/tmp/m8-sess"), SessionTabs { tabs, active: Some(0) });
+        assert_eq!(session.values().next().unwrap().active, Some(0));
+
+        // An empty tab list removes the entry (the last tab closed).
+        set_session(&mut session, Path::new("/tmp/m8-sess"), SessionTabs { tabs: Vec::new(), active: None });
+        assert!(session.is_empty());
+    }
+
+    #[test]
+    fn session_project_count_caps_and_store_prunes_missing_roots() {
+        let mut session = BTreeMap::new();
+        for i in 0..(MAX_SESSION_PROJECTS + 4) {
+            set_session(
+                &mut session,
+                Path::new(&format!("/tmp/m8-sess-p{i}")),
+                SessionTabs {
+                    tabs: vec![TabSession {
+                        path: PathBuf::from(format!("/tmp/m8-sess-p{i}/a.go")),
+                        cursor_line: 0,
+                        cursor_col_utf16: 0,
+                    }],
+                    active: Some(0),
+                },
+            );
+        }
+        assert_eq!(session.len(), MAX_SESSION_PROJECTS);
+
+        // Reading the store prunes entries whose project directory is gone
+        // (nothing here exists on the test machine).
+        let store = parse(r#"{"session": { "/tmp/m8-gone": { "tabs": [{"path": "/tmp/m8-gone/a.go"}], "active": 0 } } }"#).unwrap();
+        assert!(from_store(store).session.is_empty());
+    }
+
+    #[test]
+    fn session_shape_defaults_fill_missing_fields() {
+        // An older/foreign session entry: missing cursor and active parse.
+        let store = parse(r#"{"session": { "/tmp": { "tabs": [{}] } }, "recent_projects": ["/tmp"]}"#).unwrap();
+        let settings = from_store(store);
+        let entry = settings.session.get("/tmp").unwrap();
+        assert_eq!(entry.tabs[0], TabSession { path: PathBuf::new(), cursor_line: 0, cursor_col_utf16: 0 });
+        assert_eq!(entry.active, None);
+    }
+
+    #[test]
     fn save_store_shape_round_trips() {
         // Round-trip the Store type directly (the file path is user-global,
         // so the test does not touch it).
@@ -360,6 +501,17 @@ mod tests {
             recent_projects: vec![PathBuf::from("/tmp/m7-roundtrip")],
             layout: Layout { tree_visible: false, tree_width: 300.0, dock_visible: false, dock_height: 320.0 },
             font_size: 16.0,
+            session: BTreeMap::from([(
+                "/tmp/m8-roundtrip".to_owned(),
+                SessionTabs {
+                    tabs: vec![TabSession {
+                        path: PathBuf::from("/tmp/m8-roundtrip/a.go"),
+                        cursor_line: 3,
+                        cursor_col_utf16: 7,
+                    }],
+                    active: Some(0),
+                },
+            )]),
         };
         let store = Store {
             recent_projects: settings.recent_projects.clone(),
@@ -370,6 +522,7 @@ mod tests {
                 dock_height: Some(settings.layout.dock_height),
             }),
             font_size: Some(settings.font_size),
+            session: settings.session.clone(),
         };
         let back: Store = serde_json::from_str(&serde_json::to_string(&store).unwrap()).unwrap();
         assert_eq!(back.recent_projects, settings.recent_projects);
@@ -379,5 +532,7 @@ mod tests {
         assert_eq!(layout.dock_visible, Some(false));
         assert_eq!(layout.dock_height, Some(320.0));
         assert_eq!(back.font_size, Some(16.0));
+        // The session round-trips verbatim (M8).
+        assert_eq!(back.session, settings.session);
     }
 }
