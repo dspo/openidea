@@ -86,6 +86,12 @@ rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[dev-dependencies]
+# The headless gpui harness (TestAppContext / VisualTestContext): the M7
+# focus/Esc-chain regression rides it, like gpui-component's own tests. Same
+# pin as the runtime dependency — only the feature set widens, for tests.
+gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
+
 [profile.dev.package]
 # gpui needs opt-level 3 even in debug, or rendering crawls. Keys use the
 # real package names (gpui-pre*), not the dependency alias.

@@ -184,6 +184,9 @@ struct TreeConfirm {
     path: PathBuf,
     is_dir: bool,
     name: String,
+    /// The dialog's own focus, seeded once rendered so Esc retreats through
+    /// the chain from the topmost surface.
+    focus: FocusHandle,
 }
 
 /// The settings overlay (⌘,): font size steppers, the active tab's indent
@@ -287,8 +290,10 @@ pub struct Workbench {
     tree_prompt: Option<TreePrompt>,
     tree_prompt_sub: Option<gpui::Subscription>,
     tree_prompt_focus_pending: Cell<bool>,
-    /// The delete confirmation overlay (M7).
+    /// The delete confirmation overlay (M7), its focus handle, and the
+    /// deferred focus seed (opened from a menu click).
     tree_confirm: Option<TreeConfirm>,
+    tree_confirm_focus_pending: Cell<bool>,
     /// The settings overlay (⌘,) and its focus handle (Esc closes it).
     settings_overlay: Option<SettingsOverlay>,
     settings_focus: FocusHandle,
@@ -350,6 +355,7 @@ impl Workbench {
             tree_prompt_sub: None,
             tree_prompt_focus_pending: Cell::new(false),
             tree_confirm: None,
+            tree_confirm_focus_pending: Cell::new(false),
             settings_overlay: None,
             settings_focus: cx.focus_handle(),
             restore_focus_pending: Cell::new(false),
@@ -683,16 +689,29 @@ impl Workbench {
         }
     }
 
-    /// Hands the focus to the live editing surface: the active editor pane,
-    /// else the (visible) tree, else the workbench root. Every hide/close
+    /// Hands the focus to the topmost live surface: the still-open overlays
+    /// first (topmost in the render order), then the active editor pane,
+    /// then the (visible) tree, then the workbench root. Every hide/close
     /// path lands here — a focus left on an unmounted element silences all
     /// action dispatch (the M3 death), so nothing may strand it.
     fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(index) = self.active
+        if let Some(prompt) = &self.tree_prompt {
+            window.focus(&prompt.input.read(cx).presentation().focus_handle().clone(), cx);
+        } else if let Some(confirm) = self.tree_confirm.as_ref().map(|confirm| confirm.focus.clone()) {
+            window.focus(&confirm, cx);
+        } else if let Some(commit) = &self.commit {
+            window.focus(&commit.input.read(cx).focus_handle(cx), cx);
+        } else if self.diff.is_some() {
+            window.focus(&self.diff_focus, cx);
+        } else if self.settings_overlay.is_some() {
+            window.focus(&self.settings_focus, cx);
+        } else if let Some(picker) = &self.picker {
+            window.focus(&picker.input.read(cx).presentation().focus_handle().clone(), cx);
+        } else if let Some(index) = self.active
             && let Some(pane) = self.tabs.get(index).map(|tab| tab.pane.clone())
         {
             window.focus(&pane.read(cx).focus_handle(cx), cx);
-        } else if self.settings.layout.tree_visible {
+        } else if self.host.is_some() && self.settings.layout.tree_visible {
             window.focus(&self.tree_focus, cx);
         } else {
             window.focus(&self.root_focus, cx);
@@ -765,11 +784,7 @@ impl Workbench {
         if self.diff.take().is_none() {
             return;
         }
-        if self.active.is_some() {
-            self.focus_active(window, cx);
-        } else {
-            window.focus(&self.tree_focus, cx);
-        }
+        self.restore_focus(window, cx);
         cx.notify();
     }
 
@@ -865,23 +880,32 @@ impl Workbench {
             return;
         }
         self.commit_sub.take();
-        if self.active.is_some() {
-            self.focus_active(window, cx);
-        } else {
-            window.focus(&self.tree_focus, cx);
-        }
+        self.restore_focus(window, cx);
         cx.notify();
     }
 
-    /// Esc outside the pane's own overlays: the focus returns to where
-    /// editing happens. This is the way out of the dock's query input after
-    /// ⇧⌘F (the dock is not inside the pane, so the pane's own Esc chain
-    /// never sees it, and ⌘F — an Editor-context action — is out of reach).
+    /// Esc: retreat one surface — close the topmost overlay (settings,
+    /// delete confirm, tree prompt, commit, diff, picker); with none open,
+    /// hand the focus back to where editing happens. The chain order mirrors
+    /// the render children (topmost first). This is the way out of the
+    /// dock's query input after ⇧⌘F (the dock is not inside the pane, so the
+    /// pane's own Esc chain never sees it, and ⌘F — an Editor-context action
+    /// — is out of reach).
     fn on_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active.is_some() {
-            self.focus_active(window, cx);
+        if self.settings_overlay.is_some() {
+            self.close_settings(window, cx);
+        } else if self.tree_confirm.is_some() {
+            self.close_tree_confirm(window, cx);
+        } else if self.tree_prompt.is_some() {
+            self.close_tree_prompt(window, cx);
+        } else if self.commit.is_some() {
+            self.close_commit(window, cx);
+        } else if self.diff.is_some() {
+            self.close_diff(window, cx);
+        } else if self.picker.is_some() {
+            self.close_picker(window, cx);
         } else {
-            window.focus(&self.tree_focus, cx);
+            self.restore_focus(window, cx);
         }
         cx.notify();
     }
@@ -951,12 +975,9 @@ impl Workbench {
             return;
         }
         self.picker_sub.take();
-        // Focus goes back to where editing happens (the tree when none).
-        if self.active.is_some() {
-            self.focus_active(window, cx);
-        } else {
-            window.focus(&self.tree_focus, cx);
-        }
+        // Focus goes back to the topmost live surface (the editing surface
+        // when the palette was the last one).
+        self.restore_focus(window, cx);
         cx.notify();
     }
 
@@ -1970,7 +1991,8 @@ impl Workbench {
         if self.tree_prompt.is_some() || self.tree_confirm.is_some() {
             return;
         }
-        self.tree_confirm = Some(TreeConfirm { is_dir, name: file_name(&path), path });
+        self.tree_confirm = Some(TreeConfirm { is_dir, name: file_name(&path), path, focus: cx.focus_handle() });
+        self.tree_confirm_focus_pending.set(true);
         cx.notify();
     }
 
@@ -2353,6 +2375,13 @@ impl Render for Workbench {
         {
             window.focus(&prompt.input.read(cx).presentation().focus_handle().clone(), cx);
         }
+        // The delete confirmation (context menu) takes the focus once
+        // rendered, so Esc retreats from it.
+        if self.tree_confirm_focus_pending.replace(false)
+            && let Some(confirm) = &self.tree_confirm
+        {
+            window.focus(&confirm.focus.clone(), cx);
+        }
         // The diff overlay opens from the bus (no window there); take the
         // focus on the next render so Esc lands on its Cancel handler.
         if self.diff_focus_pending.replace(false) {
@@ -2361,13 +2390,9 @@ impl Render for Workbench {
         // The toast queue drains here (the window exists from now on).
         self.flush_toasts(window, cx);
         // A bus message closed an overlay (the commit landed): focus returns
-        // to where editing happens.
+        // to the topmost live surface.
         if self.restore_focus_pending.replace(false) {
-            if self.active.is_some() {
-                self.focus_active(window, cx);
-            } else {
-                window.focus(&self.tree_focus, cx);
-            }
+            self.restore_focus(window, cx);
         }
         div()
             .size_full()
@@ -3466,6 +3491,7 @@ impl Workbench {
                         .rounded(px(6.0))
                         .bg(theme::raised_bg())
                         .key_context("TreeConfirm")
+                        .track_focus(&confirm.focus)
                         .on_mouse_down(
                             MouseButton::Left,
                             |_: &gpui::MouseDownEvent, _: &mut Window, cx: &mut gpui::App| cx.stop_propagation(),
@@ -3585,5 +3611,173 @@ mod closed_tab_tests {
         assert_eq!(indent_label(Some(IndentConfig { tab_size: 4, insert_spaces: false })), "tabs, width 4");
         // No policy in the registry: the editor's default (4 spaces).
         assert_eq!(indent_label(None), "4-space indent (default)");
+    }
+}
+
+/// The focus / Esc-chain regression (M7). The M3 failure class: a focus left
+/// on an unmounted element — one hidden tree, one overlay closed from the
+/// wrong place — silently swallows every action. Each overlay class is
+/// opened, retreated from with the real Esc keystroke, and a follow-up
+/// action must still land. Headless (`TestAppContext`), no host: the chain
+/// mechanics live in the workbench, not the backend.
+#[cfg(test)]
+mod focus_chain_tests {
+    use gpui::{KeyBinding, TestAppContext, VisualTestContext};
+
+    use super::*;
+
+    /// The bindings the regression drives — the workbench subset of
+    /// main.rs's keymap (tests do not run main).
+    fn bind_keys(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.bind_keys([
+                KeyBinding::new("escape", Cancel, None),
+                KeyBinding::new("shift-cmd-o", acts::GoToFile, None),
+                KeyBinding::new("cmd-,", acts::OpenSettings, None),
+            ]);
+        });
+    }
+
+    /// Mounts the workbench without a host (the welcome shape: the tree is
+    /// NOT rendered, so the fallback sink is the only live focus target).
+    fn mount(cx: &mut TestAppContext) -> (Entity<Workbench>, VisualTestContext) {
+        let (bus, _rx) = Bus::channel();
+        let (workbench, visual) =
+            cx.add_window_view(|_, cx| Workbench::new(None, bus, settings::Settings::default(), cx));
+        (workbench, visual.clone())
+    }
+
+    /// Whether a window-level action lands: the palette opens, then closes.
+    fn action_lands(workbench: &Entity<Workbench>, cx: &mut VisualTestContext) -> bool {
+        cx.dispatch_action(acts::GoToFile);
+        let opened = cx.read_entity(workbench, |state, _| state.picker.is_some());
+        cx.simulate_keystrokes("escape");
+        let closed = cx.read_entity(workbench, |state, _| state.picker.is_none());
+        opened && closed
+    }
+
+    /// Opens one overlay class and asserts the focus moved into it, so the
+    /// Esc keystroke below retreats from the topmost surface.
+    fn open_overlay(workbench: &Entity<Workbench>, cx: &mut VisualTestContext, kind: &str) {
+        match kind {
+            // The real gesture paths first.
+            "settings" => cx.simulate_keystrokes("cmd-,"),
+            "picker" => cx.simulate_keystrokes("shift-cmd-o"),
+            // The rest open from clicks/menus whose wiring lives outside the
+            // workbench; the overlay state is the contract under test.
+            "tree_prompt" => workbench.update_in(cx, |this, window, cx| {
+                this.open_tree_prompt(TreePromptKind::Rename, PathBuf::from("/tmp/m7-focus/file.rs"), window, cx)
+            }),
+            "tree_confirm" => {
+                workbench.update(cx, |this, cx| this.begin_delete(PathBuf::from("/tmp/m7-focus/file.rs"), false, cx))
+            }
+            "commit" => workbench.update_in(cx, |this, window, cx| {
+                let input = cx.new(|cx| TextareaState::new(window, cx));
+                window.focus(&input.read(cx).focus_handle(cx), cx);
+                this.commit = Some(CommitFlow { input, files: Vec::new() });
+                cx.notify();
+            }),
+            "diff" => workbench.update_in(cx, |this, window, cx| {
+                this.diff = Some(DiffState { title: "focus.rs".to_owned(), lines: Vec::new() });
+                window.focus(&this.diff_focus.clone(), cx);
+                cx.notify();
+            }),
+            other => unreachable!("unknown overlay class {other}"),
+        }
+        cx.run_until_parked();
+    }
+
+    fn overlay_open(workbench: &Entity<Workbench>, cx: &VisualTestContext, kind: &str) -> bool {
+        cx.read_entity(workbench, |state, _| match kind {
+            "settings" => state.settings_overlay.is_some(),
+            "picker" => state.picker.is_some(),
+            "tree_prompt" => state.tree_prompt.is_some(),
+            "tree_confirm" => state.tree_confirm.is_some(),
+            "commit" => state.commit.is_some(),
+            "diff" => state.diff.is_some(),
+            other => unreachable!("unknown overlay class {other}"),
+        })
+    }
+
+    /// THE regression: every overlay class closes via Esc, and the window
+    /// keeps dispatching actions afterwards. One stranded focus is the whole
+    /// M3 bug class; this walks every close path there is.
+    #[gpui::test]
+    fn after_any_overlay_closes_actions_still_land(cx: &mut TestAppContext) {
+        bind_keys(cx);
+        let (workbench, mut cx) = mount(cx);
+
+        // The welcome view's fallback sink holds the focus; an action lands.
+        assert!(action_lands(&workbench, &mut cx));
+
+        for kind in ["settings", "picker", "tree_prompt", "tree_confirm", "commit", "diff"] {
+            open_overlay(&workbench, &mut cx, kind);
+            assert!(overlay_open(&workbench, &cx, kind), "{kind} did not open");
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            assert!(!overlay_open(&workbench, &cx, kind), "{kind} did not close on Esc");
+            assert!(action_lands(&workbench, &mut cx), "actions died after closing {kind}");
+        }
+    }
+
+    /// Esc retreats ONE surface: with a palette underneath, the settings
+    /// overlay's Esc leaves the palette open (and focused) for typing.
+    #[gpui::test]
+    fn esc_retreats_the_topmost_surface_only(cx: &mut TestAppContext) {
+        bind_keys(cx);
+        let (workbench, mut cx) = mount(cx);
+
+        cx.simulate_keystrokes("shift-cmd-o");
+        assert!(overlay_open(&workbench, &cx, "picker"));
+        cx.simulate_keystrokes("cmd-,");
+        assert!(overlay_open(&workbench, &cx, "settings"));
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!overlay_open(&workbench, &cx, "settings"), "topmost overlay must close");
+        assert!(overlay_open(&workbench, &cx, "picker"), "the palette beneath survives");
+
+        // The focus is back in the palette's query input, and a second Esc
+        // closes the palette itself.
+        let query_focused = cx.update(|window, cx| {
+            workbench
+                .read(cx)
+                .picker
+                .as_ref()
+                .is_some_and(|picker| picker.input.read(cx).focus_handle(cx).is_focused(window))
+        });
+        assert!(query_focused, "the palette's input lost the focus");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!overlay_open(&workbench, &cx, "picker"));
+    }
+
+    /// `restore_focus` lands on a MOUNTED surface: without a host the tree
+    /// is not rendered (the welcome view), and a hidden tree (⌘1) must not
+    /// strand the focus either — the root sink takes both cases.
+    #[gpui::test]
+    fn restore_focus_never_lands_on_an_unmounted_tree(cx: &mut TestAppContext) {
+        bind_keys(cx);
+        let (workbench, mut cx) = mount(cx);
+
+        // No host → no tree element → the root sink holds the focus.
+        workbench.update_in(&mut cx, |this, window, cx| {
+            this.restore_focus(window, cx);
+            assert!(this.root_focus.is_focused(window), "the root sink must hold the focus");
+            assert!(!this.tree_focus.is_focused(window), "the unmounted tree took the focus");
+        });
+
+        // The same when ⌘1 hid the tree: the root sink, never the hidden one.
+        workbench.update_in(&mut cx, |this, window, cx| {
+            this.settings.layout.tree_visible = false;
+            this.restore_focus(window, cx);
+            assert!(this.root_focus.is_focused(window), "a hidden tree stranded the focus");
+        });
+
+        // And an action still lands from the root sink.
+        cx.simulate_keystrokes("shift-cmd-o");
+        cx.run_until_parked();
+        assert!(overlay_open(&workbench, &cx, "picker"));
     }
 }
