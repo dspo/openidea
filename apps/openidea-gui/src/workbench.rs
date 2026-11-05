@@ -1816,13 +1816,7 @@ impl Workbench {
             }
             right = right
                 .child(div().text_color(theme::fg()).child(SharedString::from(title.clone())))
-                .child(
-                    div()
-                        .max_w(px(160.0))
-                        .truncate()
-                        .text_color(theme::warning())
-                        .child(SharedString::from(text)),
-                );
+                .child(div().max_w(px(160.0)).truncate().text_color(theme::warning()).child(SharedString::from(text)));
         }
         right = right.child(div().text_color(state.1).child(SharedString::from(state.0)));
         if let Some((text, color)) = message {
