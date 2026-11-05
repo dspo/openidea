@@ -546,6 +546,19 @@ impl Workbench {
         cx.notify();
     }
 
+    /// Esc outside the pane's own overlays: the focus returns to where
+    /// editing happens. This is the way out of the dock's query input after
+    /// ⇧⌘F (the dock is not inside the pane, so the pane's own Esc chain
+    /// never sees it, and ⌘F — an Editor-context action — is out of reach).
+    fn on_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active.is_some() {
+            self.focus_active(window, cx);
+        } else {
+            window.focus(&self.tree_focus, cx);
+        }
+        cx.notify();
+    }
+
     /// Bare-⇧ taps, two within a short window, open Search Everywhere.
     /// Modifier-only presses never become key events (macOS turns them into
     /// `ModifiersChanged`), so the gesture lives here on the rising edge of a
@@ -1391,6 +1404,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_find_in_files))
             .on_action(cx.listener(Self::on_show_diff))
             .on_action(cx.listener(Self::on_commit))
+            .on_action(cx.listener(Self::on_cancel))
             // Double ⇧ gesture (modifier presses arrive as modifiers events).
             .on_modifiers_changed(cx.listener(Self::on_modifiers))
             .child(
