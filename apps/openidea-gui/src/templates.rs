@@ -336,7 +336,7 @@ pub fn parse_body(body: &str) -> Vec<Segment> {
                 }
             }
         }
-        let ch = body[i..].chars().next().expect("non-empty suffix");
+        let Some(ch) = body[i..].chars().next() else { break };
         text.push(ch);
         i += ch.len_utf8();
     }
@@ -376,7 +376,7 @@ fn parse_lsp_snippet(body: &str) -> Vec<LspSegment> {
     };
     let mut at = 0usize;
     while at < body.len() {
-        let ch = body[at..].chars().next().expect("non-empty suffix");
+        let Some(ch) = body[at..].chars().next() else { break };
         match ch {
             '\\' => {
                 if let Some(esc) = body[at + 1..].chars().next()

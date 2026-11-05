@@ -102,3 +102,5 @@ pub const SETTINGS_FONT: &str = "Editor font size";
 pub const SETTINGS_INDENT: &str = "Indent";
 pub const SETTINGS_INDENT_DEFAULT: &str = "Follows the language defaults";
 pub const SETTINGS_KEYMAP: &str = "Keymap";
+// Stability (M8): the crash toast on the launch after an unclean exit.
+pub const LAST_RUN_UNCLEAN: &str = "The previous session ended unexpectedly";
