@@ -544,6 +544,17 @@ struct FindBar {
     _sub: gpui::Subscription,
 }
 
+/// One inlay hint rendered into a row (M6): its UTF-16 position in the line,
+/// the padded label as it joins the row's text, its shaped width (what every
+/// x past the position shifts by), and the kind (the label's color).
+#[derive(Clone)]
+struct RowHint {
+    at: usize,
+    label: String,
+    width: f32,
+    kind: ide_lsp::types::InlayKind,
+}
+
 impl CompletionPopup {
     /// The items matching the currently typed word (a case-insensitive
     /// subsequence of `filter_text`, falling back to `label`), server order
@@ -648,6 +659,8 @@ struct Hud {
     rows_laid_out: Cell<u32>,
     spans_painted: Cell<u32>,
     spans_total: Cell<u32>,
+    /// Rows carrying inlay hints this frame (M6).
+    hints_rows: Cell<u32>,
     parse_started: Cell<Option<std::time::Instant>>,
     parse_ms: Cell<Option<f32>>,
     parse_version: Cell<u32>,
@@ -769,6 +782,15 @@ pub struct EditorPane {
     // bar (the bar implies matches; matches may exist without the bar).
     find_hits: Option<FindMatches>,
     find_bar: Option<FindBar>,
+    // Inlay hints (M6): the viewport's hints (sorted by position) and the
+    // buffer-line range the current answer covers; edits invalidate, scroll
+    // extends. `hints_by_line` is the last frame's render form — the prepaint
+    // fills it, the x-mapping helpers and the mouse handlers read it.
+    inlays: Vec<ide_lsp::types::InlayHint>,
+    inlay_cover: Option<(u32, u32)>,
+    inlay_gen: u32,
+    inlays_on: bool,
+    hints_by_line: RefCell<std::collections::HashMap<u32, Vec<RowHint>>>,
     bus: Bus,
     /// F12 perf overlay counters (phase 7).
     hud: Hud,
@@ -837,12 +859,18 @@ impl EditorPane {
             template: None,
             find_hits: None,
             find_bar: None,
+            inlays: Vec::new(),
+            inlay_cover: None,
+            inlay_gen: 0,
+            inlays_on: true,
+            hints_by_line: RefCell::new(std::collections::HashMap::new()),
             bus,
             hud: Hud::default(),
             created_at: std::time::Instant::now(),
             first_paint_done: Cell::new(false),
         };
         pane.start_syntax(cx);
+        pane.schedule_inlays(cx);
         pane
     }
 
@@ -950,6 +978,113 @@ impl EditorPane {
                 }
             }
         }
+    }
+
+    // -- inlay hints (M6 phase 3) ---------------------------------------------
+    //
+    // Viewport-driven `textDocument/inlayHint`: the request covers the visible
+    // lines plus a viewport of slack, the answer renders inline (the label
+    // joins the row's shaped text, pushing the rest of the line right), and
+    // every x-mapping helper shifts by the widths of the hints it passes.
+
+    /// Schedules the debounced hint request over the visible window widened by
+    /// a viewport of slack. A range the current answer already covers is free
+    /// (scrolling back costs nothing); edits drop the cover and re-request.
+    fn schedule_inlays(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.large || self.read_only || !self.inlays_on {
+            return;
+        }
+        let viewport =
+            self.geometry.get().map_or(24.0, |g| (g.height - px(theme::TEXT_INSET) * 2.0) / g.line_height).ceil()
+                as u32;
+        let first_visible = self.scroll.get().floor().max(0.0) as u32;
+        let slack = viewport.max(12);
+        let first = first_visible.saturating_sub(slack);
+        let last = (first_visible + viewport + slack).min(self.buf.line_count());
+        if let Some((lo, hi)) = self.inlay_cover
+            && lo <= first
+            && last <= hi
+        {
+            return;
+        }
+        self.inlay_gen += 1;
+        let req = self.inlay_gen;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let lsp = self.host.lsp.clone();
+        let doc = self.doc_id;
+        let range = ide_core::Range::new(ide_core::Pos::new(first, 0), ide_core::Pos::new(last, 0));
+        self.host.runtime.spawn(async move {
+            // The debounce lives on the tokio side (keystroke bursts collapse).
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let result = lsp.inlay_hints(doc, range).await;
+            let _ = tx.send((range, result));
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok((range, result)) = rx.await {
+                this.update(cx, |pane, cx| pane.inlays_ready(req, range, result, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Lands a hint answer for the current generation: hints outside the
+    /// buffer (a stale answer racing an edit) drop, and the cover remembers
+    /// what this answer speaks for.
+    fn inlays_ready(
+        &mut self,
+        req: u32,
+        range: ide_core::Range,
+        result: IdeResult<Vec<ide_lsp::types::InlayHint>>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if req != self.inlay_gen {
+            return;
+        }
+        match result {
+            Ok(hints) => {
+                let count = self.buf.line_count();
+                self.inlays = hints.into_iter().filter(|hint| hint.position.line < count).collect();
+                self.inlay_cover = Some((range.start.line, range.end.line));
+                cx.notify();
+            }
+            Err(e) => {
+                eprintln!("[lsp] inlay hints: {}", e.message);
+            }
+        }
+    }
+
+    /// The row's hints in render form (padded label, shaped width), the
+    /// buffer's hint list sliced to `line`. Called per visible row from the
+    /// prepaint, which also publishes them into `hints_by_line` for the
+    /// x-mapping helpers.
+    fn row_hints(&self, line: u32, window: &Window, font_size: Pixels) -> Vec<RowHint> {
+        let start = self.inlays.partition_point(|hint| hint.position.line < line);
+        let end = start + self.inlays[start..].partition_point(|hint| hint.position.line == line);
+        let line_len = self.buf.line_span(line).len();
+        let mut hints = Vec::new();
+        for hint in &self.inlays[start..end] {
+            if hint.label.is_empty() {
+                continue;
+            }
+            // The label joins the row text with the server's paddings, so the
+            // shaped width is what every x past the position shifts by.
+            let mut label = String::new();
+            if hint.padding_left {
+                label.push(' ');
+            }
+            label.push_str(&hint.label);
+            if hint.padding_right {
+                label.push(' ');
+            }
+            let at = (hint.position.col as usize).min(line_len);
+            hints.push(RowHint {
+                at,
+                label: label.clone(),
+                width: f32::from(shaped_width(window, &label, font_size)),
+                kind: hint.kind,
+            });
+        }
+        hints
     }
 
     /// Schedules an incremental re-parse on the background executor. The tree
@@ -1086,6 +1221,10 @@ impl EditorPane {
             // per settled edit round, exactly like the parse-driven path.
             self.schedule_semantic(cx);
         }
+        // Hints speak for positions the edit moved: invalidate and re-request
+        // (debounced on the runtime side like every edit round).
+        self.inlay_cover = None;
+        self.schedule_inlays(cx);
     }
 
     /// The one edit pipeline: apply ascending non-overlapping changes locally
@@ -1946,6 +2085,21 @@ impl EditorPane {
                     body: None,
                 });
             }
+        }
+        cx.notify();
+    }
+
+    /// ⌥⌘I: hints default on (the Go DX state); off clears the painted set
+    /// and stops asking. On again re-requests the viewport.
+    fn toggle_inlays(&mut self, cx: &mut gpui::Context<Self>) {
+        self.inlays_on = !self.inlays_on;
+        if self.inlays_on {
+            self.inlay_cover = None;
+            self.schedule_inlays(cx);
+        } else {
+            self.inlays.clear();
+            self.inlay_cover = None;
+            self.hints_by_line.borrow_mut().clear();
         }
         cx.notify();
     }
@@ -3017,18 +3171,56 @@ impl EditorPane {
 
     // -- mouse -------------------------------------------------------------
 
+    /// The x offset the row's hints add before `at` (UTF-16 in the line):
+    /// every hint the position passes shifts the text right by its width.
+    fn hint_shift(&self, line: u32, at: usize) -> f32 {
+        self.hints_by_line
+            .borrow()
+            .get(&line)
+            .map_or(0.0, |hints| hints.iter().filter(|hint| hint.at < at).map(|hint| hint.width).sum())
+    }
+
+    /// Buffer offset for a point inside one row's line, hints included: text
+    /// segments and hint labels alternate left to right, and a point inside a
+    /// label resolves to the hint's position (the token it annotates).
+    fn offset_in_line(&self, window: &Window, line: u32, text_x: Pixels) -> usize {
+        let span = self.buf.line_span(line);
+        let line_text = self.buf.slice_utf16(span.clone());
+        let font_size = theme::px_font_size();
+        let hints = self.hints_by_line.borrow().get(&line).cloned().unwrap_or_default();
+        if hints.is_empty() {
+            return span.start + utf16_index_at_x(window, &line_text, text_x, font_size);
+        }
+        let mut consumed = 0.0f32;
+        let mut prev = 0usize;
+        for hint in &hints {
+            let piece = &line_text[prev..hint.at];
+            let piece_len = piece.chars().map(char::len_utf16).sum::<usize>();
+            let width = f32::from(x_at_utf16(window, piece, piece_len, font_size));
+            if text_x < px(consumed) + px(width) {
+                let col = utf16_index_at_x(window, piece, text_x - px(consumed), font_size);
+                return span.start + prev + col;
+            }
+            consumed += width;
+            if text_x < px(consumed) + px(hint.width) {
+                return span.start + hint.at;
+            }
+            consumed += hint.width;
+            prev = hint.at;
+        }
+        let rest = &line_text[prev..];
+        if prev < line_text.len() {
+            let col = utf16_index_at_x(window, rest, text_x - px(consumed), font_size);
+            return span.start + prev + col;
+        }
+        span.end
+    }
+
     /// Buffer offset for a window point (its row's line, clamped into it).
     fn offset_at(&self, window: &Window, geometry: &Geometry, position: Point<Pixels>) -> usize {
         let (line, _) = self.resolve_display(self.row_at(geometry, position.y));
-        let span = self.buf.line_span(line);
-        let line = self.buf.slice_utf16(span.clone());
-        let col = utf16_index_at_x(
-            window,
-            &line,
-            position.x - geometry.origin.x + px(geometry.scroll_x),
-            theme::px_font_size(),
-        );
-        span.start + col
+        let text_x = position.x - geometry.origin.x + px(geometry.scroll_x);
+        self.offset_in_line(window, line, text_x)
     }
 
     /// The display row a window y falls on. The viewport-relative row clamps
@@ -3244,13 +3436,11 @@ impl EditorPane {
             if placeholder.is_some() {
                 continue;
             }
-            let span = self.buf.line_span(line);
-            let text = self.buf.slice_utf16(span.clone());
+            // The x-to-offset mapping goes through the hint-aware helper, so
+            // a column drag over an annotated row resolves like a click.
             let scroll_x = px(geometry.scroll_x);
-            let c0 = utf16_index_at_x(window, &text, x_left - geometry.origin.x + scroll_x, theme::px_font_size());
-            let c1 = utf16_index_at_x(window, &text, x_right - geometry.origin.x + scroll_x, theme::px_font_size());
-            let start = span.start + c0;
-            let end = span.start + c1;
+            let start = self.offset_in_line(window, line, x_left - geometry.origin.x + scroll_x);
+            let end = self.offset_in_line(window, line, x_right - geometry.origin.x + scroll_x);
             selections.push(if down {
                 Selection { anchor: start, head: end, reversed: false, goal_col: None }
             } else {
@@ -3274,6 +3464,9 @@ impl EditorPane {
         }
         self.clamp_scroll();
         self.clamp_scroll_x();
+        // A vertical scroll may have entered an uncovered range: hints for it
+        // request (free when the cover still spans the view).
+        self.schedule_inlays(cx);
         cx.notify();
     }
 
@@ -3536,6 +3729,75 @@ fn map_stop_range(range: (usize, usize), changes: &[TextChange]) -> Option<(usiz
     Some(range)
 }
 
+/// Joins a row's inlay hints into its shaped text (M6): the runs (byte-length
+/// segments over `line`) split at each hint position and the padded labels
+/// interleave as their own runs — the muted kind tone on a subtle chip, so a
+/// hint reads as meta, not code. Returns the augmented string and runs; the
+/// widths of the inserted labels are what every x past a position shifts by
+/// (see [`EditorPane::hint_shift`]).
+fn augment_with_hints(line: &str, hints: &[RowHint], runs: Vec<TextRun>) -> (String, Vec<TextRun>) {
+    let mut out = String::new();
+    let mut out_runs: Vec<TextRun> = Vec::new();
+    let mut queue: std::collections::VecDeque<TextRun> = runs.into_iter().collect();
+    let mut emitted = 0usize; // bytes of the original line already in `out`
+    for hint in hints {
+        let at = byte_at_utf16(line, hint.at);
+        // The original text before the hint, splitting the boundary run.
+        let mut have = emitted;
+        while have < at {
+            let Some(mut run) = queue.pop_front() else { break };
+            let run_end = have + run.len;
+            if run_end <= at {
+                out.push_str(&line[have..run_end]);
+                out_runs.push(run);
+                have = run_end;
+            } else {
+                let head = at - have;
+                let tail = TextRun {
+                    len: run.len - head,
+                    font: run.font.clone(),
+                    color: run.color,
+                    background_color: run.background_color,
+                    underline: run.underline,
+                    strikethrough: run.strikethrough,
+                };
+                run.len = head;
+                out.push_str(&line[have..at]);
+                out_runs.push(run);
+                queue.push_front(tail);
+                have = at;
+            }
+        }
+        emitted = have;
+        // The label itself.
+        let color = match hint.kind {
+            ide_lsp::types::InlayKind::Type => theme::hint_text(),
+            _ => theme::fg_muted(),
+        };
+        out.push_str(&hint.label);
+        out_runs.push(TextRun {
+            len: hint.label.len(),
+            font: theme::font(),
+            color,
+            background_color: Some(rgba_of(theme::BG_RAISED).into()),
+            underline: None,
+            strikethrough: None,
+        });
+    }
+    // Whatever the hints left behind.
+    while let Some(mut run) = queue.pop_front() {
+        let len = run.len;
+        let end = (emitted + len).min(line.len());
+        if emitted < end {
+            out.push_str(&line[emitted..end]);
+            run.len = end - emitted;
+            out_runs.push(run);
+        }
+        emitted += len;
+    }
+    (out, out_runs)
+}
+
 impl Render for EditorPane {
     fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
         if !self.focused_once.get() {
@@ -3660,6 +3922,7 @@ impl Render for EditorPane {
             .on_action(cx.listener(|this, _: &acts::CodeActions, _, cx| this.request_code_actions(cx)))
             .on_action(cx.listener(|this, _: &acts::FormatDocument, _, cx| this.format_document(cx)))
             .on_action(cx.listener(|this, _: &acts::OrganizeImports, _, cx| this.organize_imports(cx)))
+            .on_action(cx.listener(|this, _: &acts::ToggleInlayHints, _, cx| this.toggle_inlays(cx)))
             .on_action(cx.listener(|this, _: &acts::Find, window, cx| this.open_find(window, cx)))
             .on_action(cx.listener(|this, _: &acts::ToggleReplace, _, cx| this.find_toggle_replace(cx)))
             // Navigation/refactoring handlers arrive in later M3 phases.
@@ -3971,7 +4234,8 @@ impl EditorPane {
         let caret_line = self.buf.line_of(caret);
         let span = self.buf.line_span(caret_line);
         let line_text = self.buf.slice_utf16(span.clone());
-        let x = x_at_utf16(window, &line_text, caret - span.start, theme::px_font_size());
+        let x = x_at_utf16(window, &line_text, caret - span.start, theme::px_font_size())
+            + px(self.hint_shift(caret_line, caret - span.start));
         let row = self.display_of_line(caret_line) as f32 - geometry.scroll;
         let y = geometry.origin.y + geometry.line_height * (row + 1.0) + px(2.0);
 
@@ -4528,6 +4792,8 @@ impl Element for EditorElement {
         let mut chevrons = Vec::new();
         let mut diag_marks = Vec::new();
         let mut frame_max_w = px(0.0);
+        let mut hinted_rows = 0u32;
+        pane.hints_by_line.borrow_mut().clear();
         for display in first..last {
             let (line, placeholder) = pane.resolve_display(display);
             let shaped = match placeholder {
@@ -4557,7 +4823,18 @@ impl Element for EditorElement {
                         diag_marks.push((display, severity));
                     }
                     let runs = line_runs(&content, span, marked.clone(), line_start_byte, &pane.spans, &line_diags, fg);
-                    window.text_system().shape_line(content.into(), font_size, &runs, None)
+                    // Inlay hints join the row text inline: split the runs at
+                    // each hint and interleave the labels (the rest of the
+                    // line shifts right by their widths).
+                    let hints = pane.row_hints(line, window, font_size);
+                    let (painted, runs) = if hints.is_empty() {
+                        (content, runs)
+                    } else {
+                        hinted_rows += 1;
+                        pane.hints_by_line.borrow_mut().insert(line, hints.clone());
+                        augment_with_hints(&content, &hints, runs)
+                    };
+                    window.text_system().shape_line(painted.into(), font_size, &runs, None)
                 }
             };
             let folded_here = placeholder.is_some();
@@ -4580,7 +4857,8 @@ impl Element for EditorElement {
             let caret_line = pane.buf.line_of(caret);
             let span = pane.buf.line_span(caret_line);
             let caret_x =
-                f32::from(x_at_utf16(window, &pane.buf.slice_utf16(span.clone()), caret - span.start, font_size));
+                f32::from(x_at_utf16(window, &pane.buf.slice_utf16(span.clone()), caret - span.start, font_size))
+                    + pane.hint_shift(caret_line, caret - span.start);
             let pad = 48.0;
             let mut x = pane.scroll_x.get().clamp(0.0, max_x);
             if caret_x < x {
@@ -4603,9 +4881,11 @@ impl Element for EditorElement {
             if (first..last).contains(&head_display) {
                 let span = pane.buf.line_span(head_line);
                 let line_text = pane.buf.slice_utf16(span.clone());
-                let head_x = x_at_utf16(window, &line_text, selection.head - span.start, font_size) - px(scroll_x);
+                let head_x = f32::from(x_at_utf16(window, &line_text, selection.head - span.start, font_size))
+                    + pane.hint_shift(head_line, selection.head - span.start)
+                    - f32::from(px(scroll_x));
                 let head_y = origin.y + line_height * (head_display as f32 - scroll);
-                carets.push(Bounds::new(point(origin.x + head_x, head_y), size(px(2.0), line_height)));
+                carets.push(Bounds::new(point(origin.x + px(head_x), head_y), size(px(2.0), line_height)));
             }
             let (start, end) = selection.normalized();
             if start == end {
@@ -4620,15 +4900,19 @@ impl Element for EditorElement {
                 }
                 let span = pane.buf.line_span(row);
                 let line_text = pane.buf.slice_utf16(span.clone());
+                let row_len = line_text.chars().map(char::len_utf16).sum::<usize>();
                 let x0 = if row > start_line {
                     px(0.0)
                 } else {
                     x_at_utf16(window, &line_text, start - span.start, font_size)
+                        + px(pane.hint_shift(row, start - span.start))
                 };
                 let x1 = if row < end_line {
-                    shaped_width(window, &line_text, font_size)
+                    // The whole row: the text plus whatever hints widen it.
+                    shaped_width(window, &line_text, font_size) + px(pane.hint_shift(row, row_len))
                 } else {
                     x_at_utf16(window, &line_text, end - span.start, font_size)
+                        + px(pane.hint_shift(row, end - span.start))
                 };
                 let y = origin.y + line_height * (display as f32 - scroll);
                 let left = origin.x + x0 - px(scroll_x);
@@ -4657,8 +4941,9 @@ impl Element for EditorElement {
                     let line_text = pane.buf.slice_utf16(span.clone());
                     let local_start = range.start.clamp(span.start, span.end) - span.start;
                     let local_end = range.end.clamp(span.start, span.end) - span.start;
-                    let x0 = x_at_utf16(window, &line_text, local_start, font_size);
-                    let x1 = x_at_utf16(window, &line_text, local_end, font_size);
+                    let x0 =
+                        x_at_utf16(window, &line_text, local_start, font_size) + px(pane.hint_shift(row, local_start));
+                    let x1 = x_at_utf16(window, &line_text, local_end, font_size) + px(pane.hint_shift(row, local_end));
                     let left = origin.x + x0 - px(scroll_x);
                     find_rects.push((
                         Bounds::new(point(left, y), size((x1 - x0).max(px(2.0)), line_height)),
@@ -4708,6 +4993,7 @@ impl Element for EditorElement {
             pane.hud.last_input.set(None);
         }
         pane.hud.rows_laid_out.set(rows.len() as u32);
+        pane.hud.hints_rows.set(hinted_rows);
         pane.hud.spans_total.set(pane.spans.len() as u32);
         let visible_lo =
             rows.iter().filter_map(|row| row.line.map(|line| pane.buf.line_start(line))).min().unwrap_or(usize::MAX);
@@ -4853,9 +5139,10 @@ impl Element for EditorElement {
                     ),
                     format!("key→px {latency} ms · parse {parse} ms @v{}", hud.parse_version.get()),
                     format!(
-                        "cursors {} · folds {}",
+                        "cursors {} · folds {} · hints {}",
                         self.view.read(cx).selections.len(),
-                        self.view.read(cx).folds.len()
+                        self.view.read(cx).folds.len(),
+                        hud.hints_rows.get()
                     ),
                 ];
                 let font_size = theme::px_font_size();
@@ -4972,8 +5259,10 @@ impl InputHandler for EditorInputHandler {
         let span = pane.buf.line_span(line);
         let start = (pane.buf.clamp(range_utf16.start) as usize).max(span.start);
         let end = (pane.buf.clamp(range_utf16.end) as usize).min(span.end).max(start);
-        let x0 = shaped_width(window, &pane.buf.slice_utf16(span.start..start), theme::px_font_size());
-        let x1 = shaped_width(window, &pane.buf.slice_utf16(span.start..end), theme::px_font_size());
+        let x0 = shaped_width(window, &pane.buf.slice_utf16(span.start..start), theme::px_font_size())
+            + px(pane.hint_shift(line, start - span.start));
+        let x1 = shaped_width(window, &pane.buf.slice_utf16(span.start..end), theme::px_font_size())
+            + px(pane.hint_shift(line, end - span.start));
         let bounds = Bounds::new(
             point(
                 geometry.origin.x + x0 - px(geometry.scroll_x),
@@ -5258,6 +5547,39 @@ mod tests {
             new_text: String::new(),
         }];
         assert!(text_edits_to_changes(&edits, &buf).is_empty());
+    }
+
+    #[test]
+    fn hints_augment_a_row_inline() {
+        // `repo := store.NewStore()` with a type hint after `repo ` (the
+        // gopls shape: position between the name and `:=`, padding left).
+        let line = "repo := store.NewStore()";
+        let base = vec![plain_run(line.len(), gpui::black().into())];
+        let hints = vec![RowHint {
+            at: 5,
+            label: " *store.Store".to_owned(),
+            width: 90.0,
+            kind: ide_lsp::types::InlayKind::Type,
+        }];
+        let (text, runs) = augment_with_hints(line, &hints, base);
+        assert_eq!(text, "repo  *store.Store:= store.NewStore()", "the label joins at its position");
+        // Three runs: the text before, the hint chip, the text after — lens
+        // concatenate to the augmented string's byte length.
+        assert_eq!(runs.len(), 3);
+        let total: usize = runs.iter().map(|run| run.len).sum();
+        assert_eq!(total, text.len());
+        // A hint at the very end keeps its label (nothing after to drain).
+        let hints = vec![RowHint {
+            at: line.chars().map(char::len_utf16).sum(),
+            label: " count:".to_owned(),
+            width: 48.0,
+            kind: ide_lsp::types::InlayKind::Parameter,
+        }];
+        let (text, runs) = augment_with_hints(line, &hints, vec![plain_run(line.len(), gpui::black().into())]);
+        assert_eq!(text, format!("{line} count:"));
+        assert_eq!(runs.len(), 2);
+        let total: usize = runs.iter().map(|run| run.len).sum();
+        assert_eq!(total, text.len());
     }
 
     #[test]

@@ -23,6 +23,9 @@ pub const SELECTED_BG: u32 = (ACCENT << 8) | 0x38;
 /// current match at ~33%.
 const FIND_BG: u32 = (WARNING << 8) | 0x30;
 const FIND_CURRENT_BG: u32 = (WARNING << 8) | 0x55;
+/// Inlay hints (M6): the muted label tone, quieter than code so a hint reads
+/// as meta.
+const HINT_TEXT: u32 = 0x9dabbf;
 
 pub const FONT_FAMILY: &str = "Menlo";
 pub const FONT_SIZE: f32 = 14.0;
@@ -95,6 +98,10 @@ pub fn find_bg() -> gpui::Rgba {
 }
 pub fn find_current_bg() -> gpui::Rgba {
     rgba(FIND_CURRENT_BG)
+}
+/// Inlay hint labels (M6): a quieter tone than code so hints read as meta.
+pub fn hint_text() -> gpui::Hsla {
+    rgba((HINT_TEXT << 8) | 0xff).into()
 }
 pub fn fg() -> gpui::Hsla {
     rgba((FG << 8) | 0xff).into()
