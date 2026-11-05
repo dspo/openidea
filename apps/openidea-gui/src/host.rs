@@ -126,6 +126,32 @@ impl Host {
         // edit, so open tabs reconcile via DocPatched (the Tauri host's hook).
         let hook_documents = documents.clone();
         lsp.set_apply_edit_hook(Box::new(move |edit| hook_documents.apply_workspace_edit(&edit).is_ok()));
+        // References/rename widening (M6): project files mentioning the symbol
+        // name as a whole word are opened on the server for a second pass —
+        // the word-index stand-in `ide-host` wires the same way.
+        {
+            let hook_documents = documents.clone();
+            let hook_languages = languages.clone();
+            lsp.set_candidates_hook(Box::new(move |q, cancel| {
+                let query = ide_search::WordQuery {
+                    word: q.word.clone(),
+                    dir: q.root.clone(),
+                    exclude: Vec::new(),
+                    limit: q.limit,
+                };
+                let filter = |rel: &str| q.languages.contains(&hook_languages.detect(&q.root.join(rel), None));
+                match ide_search::files_with_word(
+                    &q.root,
+                    &query,
+                    Some(&filter),
+                    &|p| hook_documents.search_text_of(p),
+                    cancel,
+                ) {
+                    Ok(found) => ide_lsp::CandidateFiles { files: found.files, limit_hit: found.limit_hit },
+                    Err(_) => ide_lsp::CandidateFiles::default(),
+                }
+            }));
+        }
         let watcher_index = index.clone();
         let watcher = {
             let documents = documents.clone();

@@ -350,6 +350,171 @@ fn is_var_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// A parsed piece of an LSP snippet body (`textDocument/completion` items the
+/// server marks `insertTextFormat: 2`): literal text or a placeholder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LspSegment {
+    Text(String),
+    /// The placeholder's id (`1`, `x`, `0` …) and its default text.
+    Placeholder(String, String),
+    /// `$0`, the final cursor.
+    End,
+}
+
+/// Parses the LSP snippet grammar this editor's completions use: `$1` /
+/// `$name` bare placeholders, `${1:default}`, `${1|a,b|}` (choice, first item
+/// wins), `$0` (final cursor), `\$` `\}` `\\` escapes. Nested placeholders
+/// keep their inner text as the outer default (servers this editor talks to do
+/// not nest).
+fn parse_lsp_snippet(body: &str) -> Vec<LspSegment> {
+    let mut out = Vec::new();
+    let mut text = String::new();
+    let flush = |out: &mut Vec<LspSegment>, text: &mut String| {
+        if !text.is_empty() {
+            out.push(LspSegment::Text(std::mem::take(text)));
+        }
+    };
+    let mut at = 0usize;
+    while at < body.len() {
+        let ch = body[at..].chars().next().expect("non-empty suffix");
+        match ch {
+            '\\' => {
+                if let Some(esc) = body[at + 1..].chars().next()
+                    && matches!(esc, '$' | '}' | '\\')
+                {
+                    text.push(esc);
+                    at += 1 + esc.len_utf8();
+                    continue;
+                }
+                text.push('\\');
+                at += 1;
+            }
+            '$' => {
+                let rest = &body[at + 1..];
+                let braced = rest.starts_with('{');
+                let (token, after) = if braced {
+                    match balanced_close(&rest[1..]) {
+                        Some(close) => (rest[1..1 + close].to_owned(), close + 2),
+                        None => (String::new(), 0),
+                    }
+                } else {
+                    let len = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+                    (rest[..len].to_owned(), len)
+                };
+                // `${id:default}` and `${id|a,b|}`: the id ends at the first
+                // `:` or `|`; a bare `$id` has no default.
+                let (id, default) = if braced {
+                    match token.split_once(':') {
+                        Some((id, rest)) => (id.to_owned(), rest.to_owned()),
+                        None => match token.split_once('|') {
+                            // `${1|a,b|}`: the items are comma-separated, the
+                            // trailing pipe closes the list.
+                            Some((id, choices)) => (
+                                id.to_owned(),
+                                choices
+                                    .strip_suffix('|')
+                                    .unwrap_or(choices)
+                                    .split(',')
+                                    .next()
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                            ),
+                            None => (token.clone(), String::new()),
+                        },
+                    }
+                } else {
+                    (token.clone(), String::new())
+                };
+                let valid = !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if !valid {
+                    text.push('$');
+                    at += 1;
+                    continue;
+                }
+                flush(&mut out, &mut text);
+                if id == "0" {
+                    out.push(LspSegment::End);
+                } else {
+                    out.push(LspSegment::Placeholder(id, default));
+                }
+                at += 1 + after;
+                continue;
+            }
+            _ => {
+                text.push(ch);
+                at += ch.len_utf8();
+            }
+        }
+    }
+    flush(&mut out, &mut text);
+    out
+}
+
+/// The `}` that closes a `{…` body (the opening brace already consumed), as
+/// an offset into `s`.
+fn balanced_close(s: &str) -> Option<usize> {
+    let mut depth = 1i32;
+    for (at, ch) in s.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// One LSP placeholder's collected ranges, keyed by its numeric id for stop
+/// ordering.
+struct LspStop {
+    id: String,
+    key: usize,
+    ranges: Vec<(usize, usize)>,
+}
+
+/// Converts an LSP snippet completion body into the expansion model the
+/// template sessions already drive: concrete text plus tab stops (numeric
+/// placeholders ordered, repeats linked, `$0` the final caret). A body with no
+/// placeholders yields `None` (the plain-text accept path is cheaper).
+pub fn lsp_snippet_to_expansion(body: &str) -> Option<Expansion> {
+    let segments = parse_lsp_snippet(body);
+    if !segments.iter().any(|s| matches!(s, LspSegment::Placeholder(..))) {
+        return None;
+    }
+    let utf16_of = |s: &str| s.chars().map(char::len_utf16).sum::<usize>();
+    let mut text = String::new();
+    // One placeholder's ranges in the produced text, keyed for ordering.
+    let mut ordered: Vec<LspStop> = Vec::new();
+    for segment in segments {
+        match segment {
+            LspSegment::Text(piece) => text.push_str(&piece),
+            LspSegment::Placeholder(id, default) => {
+                let start = utf16_of(&text);
+                text.push_str(&default);
+                let range = (start, start + utf16_of(&default));
+                let key = id.parse::<usize>().unwrap_or(usize::MAX);
+                match ordered.iter_mut().find(|stop| stop.id == id) {
+                    Some(stop) => stop.ranges.push(range),
+                    None => ordered.push(LspStop { id: id.clone(), key, ranges: vec![range] }),
+                }
+            }
+            LspSegment::End => {}
+        }
+    }
+    ordered.sort_by_key(|stop| stop.key);
+    let mut stops: Vec<Stop> =
+        ordered.into_iter().map(|LspStop { id, ranges, .. }| Stop { name: id, ranges }).collect();
+    // The `$0` caret (or a plain end) closes the session.
+    let end = utf16_of(&text);
+    stops.push(Stop { name: String::new(), ranges: vec![(end, end)] });
+    Some(Expansion { text, stops })
+}
+
 /// One tab stop: the variable's name (`""` for `$END$`) and its occurrence
 /// ranges in the expanded text (UTF-16 offsets, ascending).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -493,5 +658,57 @@ mod tests {
         assert_eq!(for_language("go").count(), 13);
         assert_eq!(for_language("rust").count(), 24);
         assert_eq!(for_language("plaintext").count(), 0);
+    }
+
+    #[test]
+    fn lsp_snippet_parses_gopls_shapes() {
+        // gopls's member-access shape: `Println(${1:})`.
+        let got = parse_lsp_snippet("Println(${1:})");
+        assert_eq!(
+            got,
+            vec![
+                LspSegment::Text("Println(".into()),
+                LspSegment::Placeholder("1".into(), String::new()),
+                LspSegment::Text(")".into())
+            ]
+        );
+        // Placeholders with defaults (the LSP form), `$1` bare.
+        assert_eq!(
+            parse_lsp_snippet("f(${1:a}, $2, ${3:b})"),
+            vec![
+                LspSegment::Text("f(".into()),
+                LspSegment::Placeholder("1".into(), "a".into()),
+                LspSegment::Text(", ".into()),
+                LspSegment::Placeholder("2".into(), String::new()),
+                LspSegment::Text(", ".into()),
+                LspSegment::Placeholder("3".into(), "b".into()),
+                LspSegment::Text(")".into()),
+            ]
+        );
+        // Choice keeps the first item; `$0` is the final cursor.
+        assert_eq!(
+            parse_lsp_snippet("${1|io,os|}.$0"),
+            vec![LspSegment::Placeholder("1".into(), "io".into()), LspSegment::Text(".".into()), LspSegment::End,]
+        );
+        // Escapes stay literal; a `$` not followed by a placeholder id does too.
+        assert_eq!(parse_lsp_snippet("a\\$b\\\\c$ d"), vec![LspSegment::Text("a$b\\c$ d".into())]);
+    }
+
+    #[test]
+    fn lsp_snippet_expands_into_linked_stops() {
+        // `fmt.Printf(${1:format}, ${2:args})`-style: stops ascend, $0 last.
+        let got = lsp_snippet_to_expansion("Printf(${1:format}, ${1:x}, ${2:})").expect("placeholders");
+        assert_eq!(got.text, "Printf(format, x, )");
+        assert_eq!(got.stops.len(), 3, "two placeholders plus the final caret");
+        assert_eq!(got.stops[0].ranges, vec![(7, 13), (15, 16)], "repeat placeholder links");
+        assert_eq!(got.stops[1].ranges, vec![(18, 18)]);
+        assert_eq!(got.stops[2].name, "", "the last stop is the caret");
+        assert_eq!(got.stops[2].ranges, vec![(19, 19)]);
+    }
+
+    #[test]
+    fn lsp_snippet_without_placeholders_is_none() {
+        assert_eq!(lsp_snippet_to_expansion("Formatter"), None);
+        assert_eq!(lsp_snippet_to_expansion(""), None);
     }
 }

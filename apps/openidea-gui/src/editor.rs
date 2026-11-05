@@ -547,15 +547,14 @@ struct FindBar {
 impl CompletionPopup {
     /// The items matching the currently typed word (a case-insensitive
     /// subsequence of `filter_text`, falling back to `label`), server order
-    /// kept (rust-analyzer pre-sorts by relevance).
+    /// kept (rust-analyzer pre-sorts by relevance). Snippet-format items
+    /// participate (M6): gopls answers member access almost entirely as
+    /// snippets and they expand through the template sessions.
     fn filtered(&self, filter: &str) -> Vec<&CompletionItem> {
         let lower = filter.to_lowercase();
         self.items
             .iter()
             .filter(|item| {
-                if item.is_snippet {
-                    return false;
-                }
                 let text = item.filter_text.as_ref().unwrap_or(&item.label).to_lowercase();
                 let mut at = 0;
                 for ch in lower.chars() {
@@ -2448,7 +2447,9 @@ impl EditorPane {
             // it is (typing re-requests).
             return;
         };
-        if list.items.iter().all(|item| item.is_snippet) || list.items.is_empty() {
+        // Snippet-format items stay (gopls answers member access entirely as
+        // snippets — M6 opened that seam); only a truly empty list closes.
+        if list.items.is_empty() {
             self.close_completion(cx);
             return;
         }
@@ -2515,7 +2516,9 @@ impl EditorPane {
     /// Applies the selected item: its `replace_range` (or the typed word)
     /// becomes `insert_text`, plus any additional edits, in one batch through
     /// the ordinary pipeline (so undo, tree-sitter and server sync all see an
-    /// ordinary edit).
+    /// ordinary edit). A snippet-format item expands through the template
+    /// session machinery: the placeholder stops open linked (Tab walks them,
+    /// typing mirrors across repeats), and the caret rides the final stop.
     fn completion_accept(&mut self, cx: &mut gpui::Context<Self>) {
         let Some(open) = self.completion.take() else { return };
         self.template = None;
@@ -2547,6 +2550,46 @@ impl EditorPane {
             changes.push(TextChange { from: from as u32, to: to.max(from) as u32, insert: edit.new_text.clone() });
         }
         self.close_completion(cx);
+        if item.is_snippet
+            && let Some(expansion) = crate::templates::lsp_snippet_to_expansion(&item.insert_text)
+        {
+            // Same batch shape, template cause: the stops open linked and the
+            // undo step removes the whole expansion.
+            let insert_at = start.min(end);
+            let mut changes =
+                vec![TextChange { from: insert_at as u32, to: end.max(start) as u32, insert: expansion.text.clone() }];
+            let mut shift: i64 = 0;
+            for edit in &item.additional_edits {
+                let from = self.buf.line_start(edit.range.start.line).min(self.buf.utf16_len())
+                    + edit.range.start.col as usize;
+                let to =
+                    self.buf.line_start(edit.range.end.line).min(self.buf.utf16_len()) + edit.range.end.col as usize;
+                let (lo, hi) = (from.min(to), from.max(to));
+                let inserted = crate::editor::utf16_len(&edit.new_text) as i64;
+                if lo <= insert_at {
+                    shift += inserted - (hi - lo) as i64;
+                }
+                changes.push(TextChange { from: lo as u32, to: hi as u32, insert: edit.new_text.clone() });
+            }
+            self.apply_edits(changes, Cause::Template, cx);
+            let offset = (insert_at as i64 + shift).max(0) as usize;
+            let mut session = TemplateSession {
+                stops: expansion
+                    .stops
+                    .into_iter()
+                    .map(|mut stop| {
+                        stop.ranges = stop.ranges.iter().map(|(from, to)| (from + offset, to + offset)).collect();
+                        stop
+                    })
+                    .collect(),
+                active: 0,
+            };
+            self.select_template_stop(&mut session);
+            self.template = Some(session);
+            self.clamp_scroll_to_primary();
+            cx.notify();
+            return;
+        }
         self.apply_edits(changes, Cause::Typing, cx);
         // The caret lands at the end of the inserted text.
         self.selections = vec![Selection::caret(start.min(end) + crate::editor::utf16_len(&item.insert_text))];
