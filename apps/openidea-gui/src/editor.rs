@@ -268,6 +268,9 @@ enum Cause {
     /// A document format (⌘⌥L): its own undo step (a whole-file rewrite must
     /// not merge into typing), selections kept (clamped).
     Format,
+    /// A live-template expansion: its own undo step (Esc/undo removes the
+    /// whole expansion); the session's stops manage the cursors.
+    Template,
     /// Undo/redo/IME marked-text application: no undo entry, selections are
     /// managed by the caller.
     Mechanical,
@@ -442,6 +445,15 @@ struct HoverCard {
     line: u32,
     markdown: bool,
     contents: String,
+}
+
+/// An active template expansion: tab stops with buffer UTF-16 ranges, the
+/// active index walking them. The active stop's occurrences are the pane's
+/// selections while it is current — that is the linked editing (typing
+/// replaces every occurrence through the ordinary multi-cursor path).
+struct TemplateSession {
+    stops: Vec<crate::templates::Stop>,
+    active: usize,
 }
 
 /// The rename flow: an input overlay prefilled with the current name, then
@@ -686,6 +698,8 @@ pub struct EditorPane {
     hover_card: Option<HoverCard>,
     hover_req_gen: u32,
     hover_req_offset: Option<usize>,
+    // Live templates (M5 phase 5): the active expansion session, if any.
+    template: Option<TemplateSession>,
     bus: Bus,
     /// F12 perf overlay counters (phase 7).
     hud: Hud,
@@ -751,6 +765,7 @@ impl EditorPane {
             hover_card: None,
             hover_req_gen: 0,
             hover_req_offset: None,
+            template: None,
             bus,
             hud: Hud::default(),
             created_at: std::time::Instant::now(),
@@ -1007,6 +1022,9 @@ impl EditorPane {
             return;
         }
         let version = self.buf.doc.version();
+        // The session re-maps its stops through this batch (a copy: the
+        // original moves into the undo entry below).
+        let batch = changes.clone();
         // The inverse needs the text the batch replaces, captured pre-apply.
         let originals: Vec<String> =
             changes.iter().map(|c| self.buf.slice_utf16(c.from as usize..c.to as usize)).collect();
@@ -1046,7 +1064,9 @@ impl EditorPane {
             // Mechanical/indent/format batches keep the caller's cursors:
             // they are restored (undo/redo), ride along (indentation at line
             // starts), stay put (format) or clamp (IME, patches) afterwards.
-            Cause::ImeCommit | Cause::Mechanical | Cause::Indent | Cause::Format => selections_before.clone(),
+            Cause::ImeCommit | Cause::Mechanical | Cause::Indent | Cause::Format | Cause::Template => {
+                selections_before.clone()
+            }
         };
         self.selections = normalize_selections(
             selections_after.into_iter().map(|s| clamp_selection(s, self.buf.utf16_len())).collect(),
@@ -1058,7 +1078,7 @@ impl EditorPane {
             Some((std::time::Instant::now(), matches!(cause, Cause::Typing | Cause::Delete | Cause::ImeCommit)));
         self.hover.set(None);
         // A menu parked over stale offsets is gone once the text moves.
-        if matches!(cause, Cause::Typing | Cause::Delete | Cause::Paste) {
+        if matches!(cause, Cause::Typing | Cause::Delete | Cause::Paste | Cause::Template) {
             self.close_code_actions(cx);
         }
         // Text moved: hover cards and pending requests answer for old offsets.
@@ -1076,6 +1096,9 @@ impl EditorPane {
             self.close_completion(cx);
         }
         self.after_edits(&byte_edits, cx);
+        if self.template.is_some() {
+            self.template_after_batch(&batch, cause);
+        }
         self.clamp_scroll_to_primary();
         cx.notify();
     }
@@ -1151,6 +1174,8 @@ impl EditorPane {
     /// whose text ends with `{`, minus one when the text after the caret
     /// starts with `}`. One change per cursor, one typing batch.
     fn newline(&mut self, cx: &mut gpui::Context<Self>) {
+        // Enter inside an expansion ends it (the stops would mis-map).
+        self.template = None;
         let mut changes: Vec<TextChange> = Vec::new();
         for selection in &self.selections {
             let (start, end) = selection.normalized();
@@ -1167,10 +1192,16 @@ impl EditorPane {
         self.apply_edits(changes, Cause::Typing, cx);
     }
 
-    /// Tab: a non-empty selection indents its lines; bare carets insert one
-    /// indent unit at each cursor. (A snippet trigger expands instead —
-    /// phase 5 hooks in here.)
+    /// Tab: a live template session walks its stops first, then an abbrev at
+    /// the caret expands; otherwise a non-empty selection indents its lines
+    /// and bare carets insert one indent unit at each cursor.
     fn tab(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.advance_template(cx) {
+            return;
+        }
+        if self.try_expand_template(cx) {
+            return;
+        }
         if self.selections.iter().any(|s| !s.is_empty()) {
             self.indent_lines(1, cx);
         } else {
@@ -1393,6 +1424,7 @@ impl EditorPane {
             self.semantic_spans.clear();
             self.semantic_gen += 1;
             self.pending_edits.clear();
+            self.template = None;
             self.fold_candidates.clear();
             self.folds.clear();
             if let Some(highlighter) = self.highlighter.clone() {
@@ -1898,6 +1930,129 @@ impl EditorPane {
         }
     }
 
+    // -- live templates (M5 phase 5) ------------------------------------------
+    //
+    // Tab on an abbrev for the document's language expands it (the frontend's
+    // builtin Go/Rust sets); the session walks tab stops with Tab/Shift-Tab,
+    // typing at the active stop replaces every linked occurrence (the stops
+    // are the selections), and `$END$`/Esc/undo/click ends it.
+
+    /// Tab's template half: walk the active session's stops.
+    fn advance_template(&mut self, cx: &mut gpui::Context<Self>) -> bool {
+        let Some(mut session) = self.template.take() else { return false };
+        session.active += 1;
+        if session.active < session.stops.len() {
+            self.select_template_stop(&mut session);
+            self.template = Some(session);
+            self.clamp_scroll_to_primary();
+        }
+        cx.notify();
+        true
+    }
+
+    /// Shift-Tab's template half: back one stop.
+    fn previous_template(&mut self, cx: &mut gpui::Context<Self>) -> bool {
+        let Some(mut session) = self.template.take() else { return false };
+        if session.active > 0 {
+            session.active -= 1;
+            self.select_template_stop(&mut session);
+            self.template = Some(session);
+        }
+        self.clamp_scroll_to_primary();
+        cx.notify();
+        true
+    }
+
+    /// Selects the session's active stop: its ranges become the selections
+    /// (typing replaces all linked occurrences); `$END$` ends the session.
+    fn select_template_stop(&mut self, session: &mut TemplateSession) {
+        let stop = &session.stops[session.active];
+        if stop.name.is_empty() {
+            let (at, _) = stop.ranges[0];
+            self.selections = vec![Selection::caret(at)];
+            self.template = None;
+        } else {
+            self.selections = stop
+                .ranges
+                .iter()
+                .map(|(start, end)| Selection { anchor: *start, head: *end, reversed: false, goal_col: None })
+                .collect();
+        }
+    }
+
+    /// Tab on an abbrev expands it: one batch replaces the abbrev with the
+    /// expanded body (its own undo step), then the session opens on the first
+    /// stop. Returns false when the word before the caret is no abbrev.
+    fn try_expand_template(&mut self, cx: &mut gpui::Context<Self>) -> bool {
+        if self.selections.len() != 1 || !self.selections[0].is_empty() {
+            return false;
+        }
+        let caret = self.selections[0].head;
+        let start = self.typed_word_start();
+        if start == caret {
+            return false;
+        }
+        let word = self.buf.slice_utf16(start..caret);
+        let Some(expansion_template) =
+            crate::templates::for_language(self.language.as_str()).find(|t| t.abbrev == word)
+        else {
+            return false;
+        };
+        let line = self.buf.line_of(caret);
+        let line_text = self.buf.slice_utf16(self.buf.line_span(line));
+        let base_indent = &line_text[..line_text.len() - line_text.trim_start_matches([' ', '\t']).len()];
+        let expansion = crate::templates::expand(expansion_template, &self.indent.unit(), base_indent);
+        let insert_at = start;
+        let changes = vec![TextChange { from: start as u32, to: caret as u32, insert: expansion.text.clone() }];
+        self.apply_edits(changes, Cause::Template, cx);
+        let session = TemplateSession {
+            stops: expansion
+                .stops
+                .into_iter()
+                .map(|mut stop| {
+                    stop.ranges = stop.ranges.iter().map(|(from, to)| (from + insert_at, to + insert_at)).collect();
+                    stop
+                })
+                .collect(),
+            active: 0,
+        };
+        eprintln!("[template] expanded {}", expansion_template.id);
+        let mut session = session;
+        self.select_template_stop(&mut session);
+        self.template = Some(session);
+        self.clamp_scroll_to_primary();
+        cx.notify();
+        true
+    }
+
+    /// Re-maps the session's stops through an applied batch. Typing/paste/IME
+    /// at the active stop rewrite its ranges (the stops were the selections);
+    /// other stops shift by the batch deltas; undo/redo ends the session.
+    fn template_after_batch(&mut self, changes: &[TextChange], cause: Cause) {
+        let Some(session) = &mut self.template else { return };
+        match cause {
+            Cause::Typing | Cause::Paste | Cause::ImeCommit => {
+                let active = session.active;
+                let mut delta: i64 = 0;
+                let mut new_ranges = Vec::with_capacity(changes.len());
+                for change in changes {
+                    let inserted = change.insert.chars().map(char::len_utf16).sum::<usize>() as i64;
+                    let from = (change.from as i64 + delta).max(0) as usize;
+                    new_ranges.push((from, from + inserted.max(0) as usize));
+                    delta += inserted - (change.to as i64 - change.from as i64);
+                }
+                for (index, stop) in session.stops.iter_mut().enumerate() {
+                    if index != active {
+                        stop.ranges = stop.ranges.iter().filter_map(|r| map_stop_range(*r, changes)).collect();
+                    }
+                }
+                session.stops[active].ranges = new_ranges;
+            }
+            Cause::Mechanical => self.template = None,
+            _ => {}
+        }
+    }
+
     // -- completion (M3 phase 4) ---------------------------------------------
     //
     // Typing schedules a debounced LSP request (immediately for a server
@@ -2079,6 +2234,7 @@ impl EditorPane {
     /// ordinary edit).
     fn completion_accept(&mut self, cx: &mut gpui::Context<Self>) {
         let Some(open) = self.completion.take() else { return };
+        self.template = None;
         let filter = self.completion_filter();
         let visible = open.filtered(&filter);
         let Some(item) = visible.get(open.selected.min(visible.len().saturating_sub(1))).map(|item| (*item).clone())
@@ -2179,8 +2335,33 @@ impl EditorPane {
         self.hud.note_input();
         let caret = self.selections.first().map_or(0, |s| s.head);
         let base = range_utf16.clone().or_else(|| self.buf.marked.clone()).unwrap_or(caret..caret);
-        let (inserted, change) = self.buf.replace(base, text);
         self.buf.marked = None;
+        // A live template's active stop: the commit mirrors to every linked
+        // occurrence (the other cursors froze during composition).
+        let linked = self.template.as_ref().and_then(|session| {
+            let stop = session.stops.get(session.active)?;
+            (!stop.name.is_empty()).then(|| stop.ranges.clone())
+        });
+        if let Some(ranges) = linked
+            && ranges.iter().any(|(start, end)| base.start >= *start && base.end <= *end)
+        {
+            let mut changes = Vec::with_capacity(ranges.len());
+            for (start, end) in ranges {
+                if base.start >= start && base.end <= end {
+                    changes.push(TextChange { from: base.start as u32, to: base.end as u32, insert: text.to_owned() });
+                } else {
+                    changes.push(TextChange { from: start as u32, to: end as u32, insert: text.to_owned() });
+                }
+            }
+            if self.selections.is_empty() {
+                self.selections.push(Selection::caret(base.start + utf16_len(text)));
+            } else {
+                self.selections[0] = Selection::caret(base.start + utf16_len(text));
+            }
+            self.apply_edits(changes, Cause::ImeCommit, cx);
+            return;
+        }
+        let (inserted, change) = self.buf.replace(base, text);
         if self.selections.is_empty() {
             self.selections.push(Selection::caret(inserted.end));
         } else {
@@ -2363,14 +2544,24 @@ impl EditorPane {
             Command::Delete { forward, word } => self.delete(forward, word, cx),
             Command::Newline => self.newline(cx),
             Command::Tab => self.tab(cx),
-            Command::Outdent => self.indent_lines(-1, cx),
+            Command::Outdent => {
+                if self.previous_template(cx) {
+                    return;
+                }
+                self.indent_lines(-1, cx)
+            }
             Command::Paste => {
                 let text = cx.read_from_clipboard().and_then(|item| item.text());
                 if let Some(text) = text {
                     self.paste(&text, cx);
                 }
             }
-            Command::Cancel => self.collapse_cursors(cx),
+            Command::Cancel => {
+                if self.template.take().is_some() {
+                    cx.notify();
+                }
+                self.collapse_cursors(cx)
+            }
             Command::ToggleHud => unreachable!("handled above"),
         }
     }
@@ -2459,6 +2650,7 @@ impl EditorPane {
             cx.notify();
             return;
         }
+        self.template = None;
         let display_row = self.row_at(&geometry, ev.position.y);
         // The gutter folds: a chevron row toggles its fold.
         if ev.position.x < geometry.gutter_x + geometry.gutter_w {
@@ -2873,6 +3065,27 @@ fn text_edits_to_changes(edits: &[ide_core::TextEdit], buf: &Buffer) -> Vec<Text
         .collect();
     changes.sort_by_key(|change| (change.from, change.to));
     changes
+}
+
+/// Shifts one UTF-16 range through an ascending change batch (pre-batch
+/// coordinates, the same convention `after_edits` uses for the syntax tree);
+/// a batch that ran through the range drops it.
+fn map_stop_range(range: (usize, usize), changes: &[TextChange]) -> Option<(usize, usize)> {
+    let mut range = range;
+    for change in changes {
+        let (from, to) = (change.from as usize, change.to as usize);
+        if range.1 <= from {
+            continue;
+        }
+        if range.0 >= to {
+            let shift = change.insert.chars().map(char::len_utf16).sum::<usize>() as i64 - (to - from) as i64;
+            range.0 = (range.0 as i64 + shift).max(0) as usize;
+            range.1 = (range.1 as i64 + shift).max(0) as usize;
+        } else {
+            return None;
+        }
+    }
+    Some(range)
 }
 
 impl Render for EditorPane {
