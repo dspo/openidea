@@ -165,6 +165,10 @@ pub struct Workbench {
     picker: Option<Picker>,
     /// The input's Change / PressEnter subscription, alive while the picker is.
     picker_sub: Option<gpui::Subscription>,
+    /// The palette's index-query generation (M5 phase 7): every query change
+    /// bumps it on the UI thread; answers from older generations drop, so a
+    /// burst of keystrokes never lands stale rows.
+    picker_gen: u32,
     /// The Run dock (M4), from the first run until the project closes: one
     /// run at a time, output streaming through the bus.
     run_panel: Option<Entity<RunPanel>>,
@@ -224,6 +228,7 @@ impl Workbench {
             bus,
             picker: None,
             picker_sub: None,
+            picker_gen: 0,
             run_panel: None,
             find_panel: None,
             dock_page: DockPage::Run,
@@ -615,41 +620,69 @@ impl Workbench {
         self.refresh_picker(cx);
     }
 
-    /// Re-runs the palette's queries against the index, the action registry
-    /// and the cached run configs. The index answers from whatever is indexed
-    /// so far and is fast at fixture scale, so this runs on the UI thread
-    /// (moving it behind a request channel is an M4 seam).
+    /// Re-runs the palette's queries against the index and the action
+    /// registry. Action filtering (the tiny registry scan) stays synchronous;
+    /// the index calls (find_files / find_symbols / recent_files) run on the
+    /// background executor behind a generation counter — a newer query bumps
+    /// it and the stale answer drops, so typing never blocks on the index
+    /// (the M3 debt, paid in M5 phase 7). The previous answer stays visible
+    /// until the fresh one lands.
     fn refresh_picker(&mut self, cx: &mut Context<Self>) {
         let Some(picker) = &mut self.picker else { return };
         let query = picker.query.trim().to_string();
-        let Some(host) = self.host.clone() else { return };
-        match picker.mode {
-            PickerMode::Run => {}
-            _ => {
-                picker.files = if query.is_empty() {
-                    host.index
-                        .recent_files()
-                        .into_iter()
-                        .take(8)
-                        .map(|path| FileMatch {
-                            rel_path: path.strip_prefix(&host.root).unwrap_or(&path).display().to_string(),
-                            path: ide_core::IpcPath(path),
-                            score: 0,
-                            indices: Vec::new(),
-                        })
-                        .collect()
-                } else {
-                    host.index.find_files(&query, 12)
-                };
-            }
-        }
-        if picker.mode == PickerMode::Everywhere {
-            picker.symbols =
-                if query.is_empty() { Vec::new() } else { host.index.find_symbols(&query, SymbolFilter::All, 8) };
+        let mode = picker.mode;
+        if mode == PickerMode::Everywhere {
             picker.actions = ranked_actions(&query);
         }
         picker.selected = 0;
-        cx.notify();
+        if mode == PickerMode::Run {
+            cx.notify();
+            return;
+        }
+        self.picker_gen += 1;
+        let generation = self.picker_gen;
+        let Some(host) = self.host.clone() else { return };
+        let everywhere = mode == PickerMode::Everywhere;
+        cx.spawn(async move |this, cx| {
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    let files = if query.is_empty() {
+                        host.index
+                            .recent_files()
+                            .into_iter()
+                            .take(8)
+                            .map(|path| FileMatch {
+                                rel_path: path.strip_prefix(&host.root).unwrap_or(&path).display().to_string(),
+                                path: ide_core::IpcPath(path),
+                                score: 0,
+                                indices: Vec::new(),
+                            })
+                            .collect()
+                    } else {
+                        host.index.find_files(&query, 12)
+                    };
+                    let symbols = if everywhere && !query.is_empty() {
+                        host.index.find_symbols(&query, SymbolFilter::All, 8)
+                    } else {
+                        Vec::new()
+                    };
+                    (files, symbols)
+                })
+                .await;
+            this.update(cx, |workbench, cx| {
+                // A newer query superseded this answer: drop it.
+                if workbench.picker_gen == generation
+                    && let Some(picker) = &mut workbench.picker
+                {
+                    picker.files = answer.0;
+                    picker.symbols = answer.1;
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The run palette's rows: configs matching the query (name or command),
