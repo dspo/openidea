@@ -551,6 +551,8 @@ impl Workbench {
             }
         };
         cx.set_global(ProjectHost(host.clone()));
+        // The outgoing project's session persists before its tabs drop (M8).
+        self.save_session(cx);
         self.host = Some(host.clone());
         self.tabs.clear();
         self.active = None;
@@ -571,6 +573,8 @@ impl Workbench {
         settings::push_recent(&mut self.settings.recent_projects, &host.root);
         settings::save(&self.settings);
         eprintln!("[workbench] project opened {}", host.root.display());
+        // The incoming project's recorded session restores (M8).
+        self.restore_session(cx);
         cx.notify();
     }
 
@@ -1378,6 +1382,7 @@ impl Workbench {
             0 => None,
             len => Some(self.active.map_or(len - 1, |active| active.min(len - 1))),
         };
+        self.save_session(cx);
         cx.notify();
     }
 
@@ -1411,6 +1416,7 @@ impl Workbench {
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index < self.tabs.len() {
             self.active = Some(index);
+            self.save_session(cx);
             self.focus_active(window, cx);
             cx.notify();
         }
@@ -1439,6 +1445,7 @@ impl Workbench {
         };
         if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
             self.active = Some(index);
+            self.save_session(cx);
             self.tree.select(path.to_path_buf());
             cx.notify();
             return;
@@ -1477,7 +1484,70 @@ impl Workbench {
         if let Some(host) = &self.host {
             host.index.mark_recent(&path);
         }
+        self.save_session(cx);
         self.tree.select(path);
+        cx.notify();
+    }
+
+    // -- session restore (M8) ---------------------------------------------
+    //
+    // The open tabs, the active one and each caret persist per project root
+    // and restore at startup / project open. Writes ride the structural
+    // events only (tab open/close/activate, project switch, graceful quit)
+    // — never typing, so the settings file never sees per-keystroke traffic
+    // (the M7 write-amplification watchpoint).
+
+    /// Records the open tabs + carets for the current root into the session
+    /// map and persists the store. The carets are read from the panes HERE —
+    /// cursor moves stay in memory (in the panes) between events.
+    pub fn save_session(&mut self, cx: &mut Context<Self>) {
+        if std::env::var_os("OPENIDEA_GUI_PROJECT").is_some() {
+            return; // scripted sessions stay stateless, like their restore
+        }
+        let Some(host) = &self.host else { return };
+        let root = host.root.clone();
+        let tabs = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let pos = tab.pane.read(cx).cursor_pos();
+                settings::TabSession { path: tab.path.clone(), cursor_line: pos.line, cursor_col_utf16: pos.col }
+            })
+            .collect();
+        settings::set_session(&mut self.settings.session, &root, settings::SessionTabs { tabs, active: self.active });
+        settings::save(&self.settings);
+    }
+
+    /// Reopens the recorded session for the current root: files that still
+    /// exist, in recorded order, the recorded active tab, each pane's caret
+    /// placed and scrolled into view. Gone files shrink the entry on the
+    /// next save. No-op for the scripted-session override.
+    pub fn restore_session(&mut self, cx: &mut Context<Self>) {
+        if std::env::var_os("OPENIDEA_GUI_PROJECT").is_some() {
+            return;
+        }
+        let Some(host) = &self.host else { return };
+        let Some(entry) = self.settings.session.get(&settings::session_key(&host.root)).cloned() else { return };
+        eprintln!("[session] restoring {} tab(s)", entry.tabs.len());
+        for tab in &entry.tabs {
+            if !tab.path.is_file() {
+                eprintln!("[session] gone, skipping: {}", tab.path.display());
+                continue;
+            }
+            self.open_path(&tab.path, cx);
+            if let Some(last) = self.tabs.last() {
+                let pos = ide_core::Pos::new(tab.cursor_line, tab.cursor_col_utf16);
+                last.pane.update(cx, |pane, cx| pane.jump_to_offset(pos, cx));
+            }
+        }
+        // The recorded active wins over "last opened" (open_path activates
+        // each tab as it opens); a skipped file may have shifted the
+        // numbering, so the index clamps to what actually opened.
+        if let Some(index) = entry.active
+            && index < self.tabs.len()
+        {
+            self.active = Some(index);
+        }
         cx.notify();
     }
 

@@ -1811,6 +1811,14 @@ impl EditorPane {
         cx.notify();
     }
 
+    /// The primary caret as an IDE position (0-based line, UTF-16 column —
+    /// the IPC convention): the session record's shape (M8).
+    pub fn cursor_pos(&self) -> Pos {
+        let caret = self.selections.first().map_or(0, |s| s.head);
+        let line = self.buf.line_of(caret);
+        Pos::new(line, (caret - self.buf.line_start(line)) as u32)
+    }
+
     /// ⇧F6: the identifier around the caret opens the input overlay
     /// immediately (locally computed range — what prepareRename returns for
     /// well-formed sources anyway; its server round trip is an M4 refinement).
