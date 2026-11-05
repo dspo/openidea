@@ -25,7 +25,8 @@ use gpui::{
     App, Bounds, ClickEvent, Element, ElementId, Entity, FocusHandle, Focusable, GlobalElementId, InputHandler,
     InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent, ShapedLine, SharedString,
-    Styled, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, fill, point, px, relative, rgba, size,
+    StatefulInteractiveElement as _, Styled, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, fill, point,
+    px, relative, rgba, size,
 };
 use gpui_component::button::ButtonVariants as _;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -476,8 +477,21 @@ fn char_class(ch: char) -> u8 {
 struct HoverDiag {
     message: String,
     severity: Severity,
+    /// The producer ("compiler", "syntax", an analyzer name) — what the
+    /// tooltip's classification line shows.
+    source: Option<String>,
     /// The buffer line the pointer was on (the tooltip anchors under it).
     line: u32,
+    /// The diagnostic's own range: what the one-click fixes anchor at.
+    range: ide_core::Range,
+}
+
+/// The one-click fixes of the hovered diagnostic (M6): requested once per
+/// diagnostic, keyed by its line + message so a pointer wiggle re-requests
+/// nothing.
+struct HoverFixes {
+    key: (u32, String),
+    actions: Vec<ide_lsp::types::CodeAction>,
 }
 
 /// The LSP hover card parked under the pointer's line (M5 phase 4).
@@ -776,6 +790,8 @@ pub struct EditorPane {
     hover_card: Option<HoverCard>,
     hover_req_gen: u32,
     hover_req_offset: Option<usize>,
+    // The hovered diagnostic's one-click fixes (M6), when they landed.
+    hover_fixes: Option<HoverFixes>,
     // Live templates (M5 phase 5): the active expansion session, if any.
     template: Option<TemplateSession>,
     // Find & replace (M5 phase 6): the in-buffer match list and the open
@@ -856,6 +872,7 @@ impl EditorPane {
             hover_card: None,
             hover_req_gen: 0,
             hover_req_offset: None,
+            hover_fixes: None,
             template: None,
             find_hits: None,
             find_bar: None,
@@ -2827,6 +2844,7 @@ impl EditorPane {
         self.hover.set(None);
         self.hover_card = None;
         self.hover_req_offset = None;
+        self.hover_fixes = None;
         cx.notify();
     }
 
@@ -3381,9 +3399,25 @@ impl EditorPane {
                     // An empty range (bare caret position) still shows on hover.
                     (range.start..range.end.max(range.start + 1)).contains(&offset)
                 })
-                .map(|d| HoverDiag { message: d.message.clone(), severity: d.severity, line })
+                .map(|d| HoverDiag {
+                    message: d.message.clone(),
+                    severity: d.severity,
+                    source: d.source.clone(),
+                    line,
+                    range: d.range,
+                })
         });
         let has_diag = next.is_some();
+        // A diagnostic under the pointer also asks for its fixes once (the
+        // tooltip renders them as one-click rows).
+        if let Some(diag) = &next {
+            let key = (diag.line, diag.message.clone());
+            if self.hover_fixes.as_ref().is_none_or(|fixes| fixes.key != key) {
+                self.request_hover_fixes(diag.range, key, cx);
+            }
+        } else if self.hover_fixes.take().is_some() {
+            // nothing else to do; dropping the fixes with the hover
+        }
         match (has_diag, offset) {
             (true, _) => {
                 // The diagnostic tooltip wins; the LSP card retires.
@@ -3413,6 +3447,50 @@ impl EditorPane {
             let line = self.buf.line_of(offset);
             card.line != line
         })
+    }
+
+    /// The hovered diagnostic's code actions (the tooltip's fix rows). The
+    /// same menu shape the ⌥⌘-path uses: disabled suggestions drop, fixes
+    /// sort before intentions.
+    fn request_hover_fixes(&mut self, range: ide_core::Range, key: (u32, String), cx: &mut gpui::Context<Self>) {
+        self.hover_fixes = None;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let lsp = self.host.lsp.clone();
+        let doc = self.doc_id;
+        self.host.runtime.spawn(async move {
+            let result = lsp.code_actions(doc, range, Vec::new()).await;
+            let _ = tx.send((key, result));
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok((key, result)) = rx.await {
+                this.update(cx, |pane, _cx| {
+                    if let Ok(actions) = result {
+                        let mut actions = actions;
+                        actions.retain(|action| action.disabled_reason.is_none());
+                        let rank = |action: &ide_lsp::types::CodeAction| match action.kind.as_deref() {
+                            Some("quickfix") => 1,
+                            Some(k) if k.starts_with("refactor") => 2,
+                            Some(k) if k.starts_with("source") => 3,
+                            _ => 4,
+                        };
+                        actions.sort_by_key(|action| (!action.is_preferred, rank(action)));
+                        if !actions.is_empty() {
+                            pane.hover_fixes = Some(HoverFixes { key, actions });
+                        }
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// One-click apply from the tooltip (the same funnel the ⌥⏎ menu uses).
+    fn apply_hover_fix(&mut self, index: usize, cx: &mut gpui::Context<Self>) {
+        let Some(fixes) = self.hover_fixes.take() else { return };
+        let Some(action) = fixes.actions.into_iter().nth(index) else { return };
+        self.hover.set(None);
+        self.finish_code_action(action, cx);
     }
 
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, window: &mut Window, cx: &mut gpui::Context<Self>) {
@@ -4409,7 +4487,7 @@ impl EditorPane {
         )
     }
 
-    fn render_hover_tooltip(&self, _cx: &mut gpui::Context<Self>) -> Option<gpui::AnyElement> {
+    fn render_hover_tooltip(&self, cx: &mut gpui::Context<Self>) -> Option<gpui::AnyElement> {
         let hover = self.hover.replace(None);
         self.hover.set(hover.clone());
         let hover = hover?;
@@ -4417,6 +4495,47 @@ impl EditorPane {
         let row = self.display_of_line(hover.line);
         let y = geometry.origin.y + geometry.line_height * ((row as f32 - geometry.scroll) + 1.0) + px(4.0);
         let x = geometry.origin.x + px(24.0);
+        // The classification line: producer + severity, the gutter mark's
+        // classes made legible (syntax vs compiler vs an analyzer).
+        let mut lines = gpui::div().flex().flex_col();
+        let mut head = gpui::div().text_color(theme::fg()).child(SharedString::from(hover.message.clone()));
+        if let Some(source) = &hover.source {
+            head = head.child(
+                gpui::div()
+                    .mt_0p5()
+                    .text_size(px(10.))
+                    .text_color(theme::severity_color(hover.severity))
+                    .child(SharedString::from(format!("{source} · {}", severity_word(hover.severity)))),
+            );
+        }
+        lines = lines.child(head);
+        // The one-click fixes, when the server answered for this diagnostic.
+        let key = (hover.line, hover.message.clone());
+        if let Some(fixes) = self.hover_fixes.as_ref()
+            && fixes.key == key
+        {
+            for (index, action) in fixes.actions.iter().enumerate().take(6) {
+                if action.kind.as_deref() != Some("quickfix") {
+                    continue;
+                }
+                let selected = index;
+                lines = lines.child(
+                    gpui::div()
+                        .id(("hover-fix", index))
+                        .mt_0p5()
+                        .px_1()
+                        .py_0p5()
+                        .rounded(px(3.0))
+                        .text_color(theme::accent())
+                        .hover(|row| row.bg(theme::selected_bg()))
+                        .child(SharedString::from(format!("fix: {}", action.title)))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            this.apply_hover_fix(selected, cx);
+                        })),
+                );
+            }
+        }
         Some(
             gpui::div()
                 .absolute()
@@ -4429,8 +4548,7 @@ impl EditorPane {
                 .px_2()
                 .py_1()
                 .text_size(px(12.))
-                .text_color(theme::fg())
-                .child(SharedString::from(hover.message))
+                .child(lines)
                 .into_any_element(),
         )
     }
@@ -4687,6 +4805,16 @@ fn render_inline(runs: Vec<crate::markdown::Inline>) -> gpui::AnyElement {
 }
 
 /// Error squiggles win over warnings, warnings over info hints.
+/// The tooltip's word for a severity ("compiler · error").
+fn severity_word(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Error => "error",
+        Severity::Warning => "warning",
+        Severity::Info => "info",
+        Severity::Hint => "hint",
+    }
+}
+
 fn severity_rank(severity: Severity) -> u8 {
     match severity {
         Severity::Error => 3,
