@@ -8,6 +8,7 @@ N="${2:-100}"
 mkdir -p "$DIR"
 test -f "$DIR/go.mod" || (cd "$DIR" && go mod init m8gomodule)
 for i in $(seq -w 1 "$N"); do
+  V=$((10#$i))
   P="$DIR/pkg$i"
   mkdir -p "$P"
   # Every package exposes Sym$i used by the next package (a real reference
@@ -31,7 +32,7 @@ type Provider interface {
 func New(name string) *Sym$i {
 	s := &Sym$i{Name: name, Values: make([]int, 0, 8)}
 	for k := range 8 {
-		s.Values = append(s.Values, k*i)
+		s.Values = append(s.Values, k*$V)
 	}
 	return s
 }
