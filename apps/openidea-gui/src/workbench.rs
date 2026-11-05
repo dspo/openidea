@@ -211,6 +211,9 @@ pub struct Workbench {
     /// ⌘S's organize-imports-then-save flow in flight (M6), if any: the doc
     /// it organizes. A second ⌘S on it saves plainly instead of queueing.
     save_flow: Cell<Option<DocId>>,
+    /// Live `$/progress` tasks (M6): the servers' indexing / load bursts, so
+    /// a big first index reads as work in progress, not a hang.
+    tasks: Vec<(ide_core::TaskId, String, Option<String>, Option<f32>)>,
 }
 
 impl Workbench {
@@ -252,6 +255,7 @@ impl Workbench {
             last_shift: Cell::new(None),
             shift_held: Cell::new(false),
             save_flow: Cell::new(None),
+            tasks: Vec::new(),
         }
     }
 
@@ -1341,6 +1345,23 @@ impl Workbench {
                 eprintln!("[save] {name} organized={organized} error={error:?}");
                 cx.notify();
             }
+            BusMessage::Ide(IdeEvent::Task { id, title, message, fraction, done, .. }) => {
+                // gopls announces its load/index bursts here; the status bar
+                // shows the live ones until their `end`.
+                if done {
+                    self.tasks.retain(|(live, ..)| *live != id);
+                } else {
+                    match self.tasks.iter_mut().find(|(live, ..)| *live == id) {
+                        Some(entry) => {
+                            entry.1 = title;
+                            entry.2 = message;
+                            entry.3 = fraction;
+                        }
+                        None => self.tasks.push((id, title, message, fraction)),
+                    }
+                }
+                cx.notify();
+            }
             BusMessage::Ide(_) => {}
         }
     }
@@ -1786,6 +1807,22 @@ impl Workbench {
                     .child(div().text_color(theme::fg()).child(SharedString::from(row.name.clone())))
                     .child(div().text_color(color).child(SharedString::from(text))),
             );
+        }
+        // Live server tasks (indexing, package loads): the anti-"hang" face.
+        for (_, title, message, fraction) in &self.tasks {
+            let mut text = message.clone().unwrap_or_else(|| title.clone());
+            if let Some(fraction) = fraction {
+                text = format!("{text} {}%", (fraction * 100.0).round() as u32);
+            }
+            right = right
+                .child(div().text_color(theme::fg()).child(SharedString::from(title.clone())))
+                .child(
+                    div()
+                        .max_w(px(160.0))
+                        .truncate()
+                        .text_color(theme::warning())
+                        .child(SharedString::from(text)),
+                );
         }
         right = right.child(div().text_color(state.1).child(SharedString::from(state.0)));
         if let Some((text, color)) = message {
