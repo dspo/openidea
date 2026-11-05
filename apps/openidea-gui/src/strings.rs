@@ -57,6 +57,9 @@ pub const CODE_ACTIONS_UNAVAILABLE: &str = "Code actions unavailable";
 pub const CODE_ACTION_FAILED: &str = "Code action failed";
 pub const FORMAT_UNAVAILABLE: &str = "Format unavailable";
 pub const ALREADY_FORMATTED: &str = "Already formatted";
+// Organize imports (M6).
+pub const ORGANIZED_IMPORTS: &str = "Organized imports";
+pub const ORGANIZE_NO_ACTIONS: &str = "Nothing to organize";
 // In-file find/replace (M5).
 pub const FIND_PLACEHOLDER: &str = "Find (⏎ next, ⇧⏎ previous)";
 pub const FIND_NO_MATCHES: &str = "No matches";

@@ -73,6 +73,7 @@ actions!(
         Rename,
         CodeActions,
         FormatDocument,
+        OrganizeImports,
         Find,
     ]
 );
@@ -120,6 +121,7 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("editor::Rename", "Rename…", "Refactor", "⇧F6"),
     action_info!("editor::CodeActions", "Quick Fix…", "Refactor", "⌥⏎"),
     action_info!("editor::FormatDocument", "Format Document", "Code", "⌘⌥L"),
+    action_info!("editor::OrganizeImports", "Organize Imports", "Code", "⌃⌥O"),
     action_info!("editor::Find", "Find…", "Edit", "⌘F"),
     action_info!("editor::TogglePerfHud", "Toggle Perf HUD", "View", "F12"),
 ];
