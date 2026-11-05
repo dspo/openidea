@@ -31,7 +31,6 @@ pub const RUN_EXIT_CODE: &str = "exit code";
 pub const RUN_EXITED: &str = "exited";
 pub const RUN_STOP: &str = "Stop";
 pub const RUN_CLEAR: &str = "Clear";
-pub const RUN_ALREADY_RUNNING: &str = "A run is already active — stop it first";
 pub const RUN_LAUNCH_FAILED: &str = "Run failed";
 // The Run picker's synthetic row for a one-off shell command line.
 pub const RUN_SHELL_PREFIX: &str = "Run command: ";

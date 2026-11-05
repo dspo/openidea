@@ -45,11 +45,21 @@ use crate::host::Host;
 use crate::run_panel::{RunPanel, stream_of};
 use crate::{ProjectHost, settings, strings, theme};
 
-/// The bottom dock's active page when both panels exist (M5).
+/// The bottom dock's active page. Run pages are per-run tabs (M7): `Run(i)`
+/// indexes `Workbench::runs`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DockPage {
-    Run,
+    Run(usize),
     Find,
+}
+
+/// An active dock/tree drag (M7): which handle, where the press started, and
+/// the size the drag grew from. Positions/sizes are plain f32 window
+/// coordinates.
+#[derive(Clone, Copy)]
+enum Drag {
+    Tree { start_x: f32, start_width: f32 },
+    Dock { start_y: f32, start_height: f32 },
 }
 
 /// One open file: the editor pane, its document in the backend, and the two
@@ -169,6 +179,11 @@ pub struct Workbench {
     /// for the pane's line lookups.
     diagnostics: HashMap<PathBuf, HashMap<String, Vec<Diagnostic>>>,
     bus: Bus,
+    /// The root's own focus handle: the fallback sink when nothing else is
+    /// mounted to take the focus (e.g. after ⌘1 hides a focused tree — a
+    /// focus left on an unmounted element silences every action, the M3
+    /// failure class). The root carries every window-level action handler.
+    root_focus: FocusHandle,
     /// The open Go to File / Search Everywhere / Run palette, if any.
     picker: Option<Picker>,
     /// The input's Change / PressEnter subscription, alive while the picker is.
@@ -177,15 +192,18 @@ pub struct Workbench {
     /// bumps it on the UI thread; answers from older generations drop, so a
     /// burst of keystrokes never lands stale rows.
     picker_gen: u32,
-    /// The Run dock (M4), from the first run until the project closes: one
-    /// run at a time, output streaming through the bus.
-    run_panel: Option<Entity<RunPanel>>,
+    /// The Run dock (M4), one panel per started run (M7 multi-run tabs);
+    /// output streams through the bus. A panel lives until the project closes
+    /// or the user closes its tab (which stops a live run).
+    runs: Vec<Entity<RunPanel>>,
     /// The Find-in-Files dock page (M5), from the first ⇧⌘F until the
     /// project closes; searches run through the bus (the workbench owns the
     /// dirty-buffer snapshot).
     find_panel: Option<Entity<FindPanel>>,
-    /// The dock's active page when both panels exist.
+    /// The dock's active page (a run tab index, or Find).
     dock_page: DockPage,
+    /// An in-flight tree/dock resize drag (M7), if any.
+    drag: Cell<Option<Drag>>,
     /// Git working-tree kind per absolute path (working-tree kind wins, the
     /// staged one when the tree is clean), and the current branch. Refreshed
     /// on the background executor (M4).
@@ -242,12 +260,14 @@ impl Workbench {
             servers: Vec::new(),
             diagnostics: HashMap::new(),
             bus,
+            root_focus: cx.focus_handle(),
             picker: None,
             picker_sub: None,
             picker_gen: 0,
-            run_panel: None,
+            runs: Vec::new(),
             find_panel: None,
-            dock_page: DockPage::Run,
+            dock_page: DockPage::Run(0),
+            drag: Cell::new(None),
             git_status: HashMap::new(),
             git_branch: None,
             git_refreshing: Cell::new(false),
@@ -354,9 +374,9 @@ impl Workbench {
         self.diagnostics.clear();
         self.git_status.clear();
         self.git_branch = None;
-        self.run_panel = None;
+        self.runs.clear();
         self.find_panel = None;
-        self.dock_page = DockPage::Run;
+        self.dock_page = DockPage::Run(0);
         if let Err(e) = self.tree.open(&host) {
             eprintln!("[workbench] tree open: {}", e.message);
         }
@@ -477,17 +497,83 @@ impl Workbench {
         self.open_picker(PickerMode::Run, window, cx);
     }
 
-    /// ⌃⌘R: stops the live run (the dock's Stop button in keymap form).
+    /// ⌃⌘R: stops a live run — the selected run tab's, else the first live
+    /// one (the dock's Stop button in keymap form).
     fn on_stop_run(&mut self, _: &StopRun, _window: &mut Window, cx: &mut Context<Self>) {
-        let run_id = self.run_panel.as_ref().and_then(|panel| panel.read(cx).run_id);
-        let live = self.run_panel.as_ref().is_some_and(|panel| panel.read(cx).running());
-        if let (Some(run_id), true) = (run_id, live)
-            && let Some(host) = &self.host
+        let selected = match self.dock_page {
+            DockPage::Run(index) => self.runs.get(index).cloned(),
+            DockPage::Find => None,
+        };
+        let target = selected
+            .filter(|panel| panel.read(cx).running())
+            .or_else(|| self.runs.iter().find(|panel| panel.read(cx).running()).cloned());
+        if let (Some(panel), Some(host)) = (target, self.host.as_ref())
+            && let Some(run_id) = panel.read(cx).run_id
         {
             if let Err(e) = host.stop_run(run_id) {
                 eprintln!("[run] stop: {}", e.message);
             }
             cx.notify();
+        }
+    }
+
+    /// ⌘1: shows/hides the project tree (the persisted layout follows).
+    /// Hiding hands the focus to a live surface (the root when no editor is
+    /// open), or ⌘1 itself would go dead with it.
+    fn on_toggle_tree(&mut self, _: &acts::ToggleTree, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.layout.tree_visible = !self.settings.layout.tree_visible;
+        if !self.settings.layout.tree_visible {
+            self.restore_focus(window, cx);
+        } else if self.active.is_none() {
+            window.focus(&self.tree_focus, cx);
+        }
+        settings::save(&self.settings);
+        cx.notify();
+    }
+
+    /// ⌘4: shows/hides the bottom dock. Showing selects the last page the
+    /// dock had; with no panel ever created there is nothing to show (the M4
+    /// contract: the dock exists from the first run/search onward). Hiding
+    /// hands the focus to a live surface.
+    fn on_toggle_dock(&mut self, _: &acts::ToggleDock, window: &mut Window, cx: &mut Context<Self>) {
+        if self.runs.is_empty() && self.find_panel.is_none() {
+            return;
+        }
+        self.settings.layout.dock_visible = !self.settings.layout.dock_visible;
+        self.clamp_dock_page();
+        if !self.settings.layout.dock_visible {
+            self.restore_focus(window, cx);
+        }
+        settings::save(&self.settings);
+        cx.notify();
+    }
+
+    /// Keeps `dock_page` pointing at an existing run tab (tabs can close).
+    fn clamp_dock_page(&mut self) {
+        if let DockPage::Run(index) = self.dock_page {
+            if self.runs.is_empty() {
+                self.dock_page = if self.find_panel.is_some() { DockPage::Find } else { DockPage::Run(0) };
+            } else if index >= self.runs.len() {
+                self.dock_page = DockPage::Run(self.runs.len() - 1);
+            }
+        } else if self.find_panel.is_none() {
+            self.dock_page = DockPage::Run(self.runs.len().saturating_sub(1));
+        }
+    }
+
+    /// Hands the focus to the live editing surface: the active editor pane,
+    /// else the (visible) tree, else the workbench root. Every hide/close
+    /// path lands here — a focus left on an unmounted element silences all
+    /// action dispatch (the M3 death), so nothing may strand it.
+    fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.active
+            && let Some(pane) = self.tabs.get(index).map(|tab| tab.pane.clone())
+        {
+            window.focus(&pane.read(cx).focus_handle(cx), cx);
+        } else if self.settings.layout.tree_visible {
+            window.focus(&self.tree_focus, cx);
+        } else {
+            window.focus(&self.root_focus, cx);
         }
     }
 
@@ -503,6 +589,10 @@ impl Workbench {
             self.find_panel = Some(cx.new(|cx| FindPanel::new(self.bus.clone(), window, cx)));
         }
         self.dock_page = DockPage::Find;
+        if !self.settings.layout.dock_visible {
+            self.settings.layout.dock_visible = true;
+            settings::save(&self.settings);
+        }
         if let Some(panel) = &self.find_panel {
             window.focus(&panel.read(cx).query_focus(cx), cx);
         }
@@ -971,12 +1061,12 @@ impl Workbench {
         }
     }
 
-    // -- run (M4) ----------------------------------------------------------
+    // -- run (M4, multi-run tabs in M7) --------------------------------------
     //
     // ⌃R opens the Run palette; a picked (or typed shell) configuration
     // starts through the host on the background executor. Output streams
-    // through the bus into the Run dock; the exit lands as an `IdeEvent` on
-    // the same bus. One run at a time.
+    // through the bus into the run's own dock tab; the exit lands as an
+    // `IdeEvent` on the same bus. Runs run in parallel, each with its tab.
 
     fn start_run(&mut self, config: RunConfig, cx: &mut Context<Self>) {
         let Some(host) = self.host.clone() else {
@@ -984,36 +1074,37 @@ impl Workbench {
             cx.notify();
             return;
         };
-        if self.run_panel.as_ref().is_some_and(|panel| panel.read(cx).running()) {
-            self.message = Some((NotifyLevel::Warning, strings::RUN_ALREADY_RUNNING.to_owned()));
-            cx.notify();
-            return;
-        }
         let name = config.name.clone();
-        self.run_panel = Some(cx.new(|cx| RunPanel::new(host.clone(), name.clone(), cx)));
-        self.dock_page = DockPage::Run;
+        let index = self.runs.len();
+        self.runs.push(cx.new(|cx| RunPanel::new(host.clone(), name.clone(), cx)));
+        self.dock_page = DockPage::Run(index);
+        if !self.settings.layout.dock_visible {
+            self.settings.layout.dock_visible = true;
+            settings::save(&self.settings);
+        }
         let bus = self.bus.clone();
         let on_output = {
             let bus = bus.clone();
-            move |chunk: ide_run::OutputChunk| bus.send(BusMessage::RunOutput { chunk })
+            move |chunk: ide_run::OutputChunk| bus.send(BusMessage::RunOutput { index, chunk })
         };
         // start_run forks the process and spawns its own reader threads, so
-        // it stays off the UI thread; the answer comes back through the bus.
+        // it stays off the UI thread; the answer comes back through the bus
+        // (with the tab index, so concurrent starts cannot cross routes).
         let task_name = name.clone();
         cx.background_executor()
             .spawn(async move {
                 let result = host.start_run(&config, Box::new(on_output));
-                bus.send(BusMessage::RunStarted { name: task_name, result });
+                bus.send(BusMessage::RunStarted { index, name: task_name, result });
             })
             .detach();
-        // Elapsed-time ticks for the header / status bar while the run is
+        // Elapsed-time ticks for the header / status bar while any run is
         // quiet (output chunks notify anyway).
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(500)).await;
                 let live = this
                     .update(cx, |this, cx| {
-                        let live = this.run_panel.as_ref().is_some_and(|panel| panel.read(cx).running());
+                        let live = this.runs.iter().any(|panel| panel.read(cx).running());
                         if live {
                             cx.notify();
                         }
@@ -1028,6 +1119,33 @@ impl Workbench {
         .detach();
         eprintln!("[run] starting {name}");
         cx.notify();
+    }
+
+    /// Closes a run tab (the tab's close button): a live run stops first.
+    fn close_run_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(panel) = self.runs.get(index) else { return };
+        if let (Some(run_id), true) = (panel.read(cx).run_id, panel.read(cx).running())
+            && let Some(host) = &self.host
+            && let Err(e) = host.stop_run(run_id)
+        {
+            eprintln!("[run] stop: {}", e.message);
+        }
+        self.runs.remove(index);
+        self.clamp_dock_page();
+        cx.notify();
+    }
+
+    /// The run status the status bar shows: the selected run tab's, else the
+    /// last live one, else the newest run. `None` with no runs.
+    fn run_status(&self, cx: &Context<Self>) -> Option<(String, gpui::Hsla)> {
+        let selected = match self.dock_page {
+            DockPage::Run(index) => self.runs.get(index),
+            DockPage::Find => None,
+        };
+        let panel = selected
+            .or_else(|| self.runs.iter().find(|panel| panel.read(cx).running()))
+            .or_else(|| self.runs.last())?;
+        Some(panel.read(cx).status())
     }
 
     // -- tab plumbing -----------------------------------------------------
@@ -1214,10 +1332,10 @@ impl Workbench {
                 self.servers.retain(|row| row.id != server);
                 cx.notify();
             }
-            BusMessage::RunStarted { name, result } => {
+            BusMessage::RunStarted { index, name, result } => {
                 match result {
                     Ok(info) => {
-                        if let Some(panel) = &self.run_panel {
+                        if let Some(panel) = self.runs.get(index) {
                             panel.update(cx, |panel, cx| {
                                 panel.started(&info);
                                 cx.notify();
@@ -1226,7 +1344,7 @@ impl Workbench {
                         eprintln!("[run] started {name} (run {})", info.id.0);
                     }
                     Err(e) => {
-                        if let Some(panel) = &self.run_panel {
+                        if let Some(panel) = self.runs.get(index) {
                             panel.update(cx, |panel, cx| {
                                 panel.start_failed(&e.message);
                                 cx.notify();
@@ -1238,8 +1356,8 @@ impl Workbench {
                 }
                 cx.notify();
             }
-            BusMessage::RunOutput { chunk } => {
-                if let Some(panel) = &self.run_panel {
+            BusMessage::RunOutput { index, chunk } => {
+                if let Some(panel) = self.runs.get(index) {
                     let (stream, text) = stream_of(&chunk);
                     panel.update(cx, |panel, cx| {
                         panel.append(stream, text);
@@ -1372,8 +1490,8 @@ impl Workbench {
             }
             BusMessage::Ide(IdeEvent::RunExited { run, code }) => {
                 eprintln!("[run] exited {run} code {code:?}");
-                let mine = self.run_panel.as_ref().is_some_and(|panel| panel.read(cx).run_id == Some(run));
-                if mine && let Some(panel) = &self.run_panel {
+                let mine = self.runs.iter().find(|panel| panel.read(cx).run_id == Some(run)).cloned();
+                if let Some(panel) = mine {
                     panel.update(cx, |panel, cx| {
                         panel.exited(code);
                         cx.notify();
@@ -1584,22 +1702,21 @@ fn symbol_kind_label(kind: ide_core::SymbolKind) -> String {
 impl Render for Workbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Seed the initial focus once (a view render cannot focus earlier):
-        // the tree when no tab is active, so ⌘O and the tree keys work
-        // immediately after launch. The first render also kicks the git
-        // status refresh.
+        // where editing happens — the tree when no tab is active, so ⌘O and
+        // the tree keys work immediately after launch (the root when the
+        // persisted layout hides the tree). The first render also kicks the
+        // git status refresh.
         if !self.tree_focused_once.get() {
             self.tree_focused_once.set(true);
-            if self.active.is_none() {
-                window.focus(&self.tree_focus, cx);
-            }
+            self.restore_focus(window, cx);
         }
         if !self.git_initialized.replace(true) {
             self.refresh_git(cx);
         }
-        // A bus-side project open has no window: hand the tree the focus on
-        // the next render (⌘O and the tree keys work right after opening).
+        // A bus-side project open has no window: hand the focus on the next
+        // render (⌘O and the tree keys work right after opening).
         if self.tree_focus_pending.replace(false) {
-            window.focus(&self.tree_focus, cx);
+            self.restore_focus(window, cx);
         }
         // The diff overlay opens from the bus (no window there); take the
         // focus on the next render so Esc lands on its Cancel handler.
@@ -1622,6 +1739,13 @@ impl Render for Workbench {
             .flex_col()
             .bg(theme::app_bg())
             .text_color(theme::fg())
+            // The fallback focus sink (see `root_focus`): keeps action
+            // dispatch alive whenever nothing else holds the focus.
+            .track_focus(&self.root_focus)
+            // Dock/tree resize drags (M7): the handles arm the drag; the move
+            // drives it; the release ends it and persists the layout.
+            .on_mouse_move(cx.listener(Self::on_drag_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_drag_end))
             .on_action(cx.listener(Self::on_open_file))
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_close_tab))
@@ -1634,6 +1758,8 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_find_in_files))
             .on_action(cx.listener(Self::on_show_diff))
             .on_action(cx.listener(Self::on_commit))
+            .on_action(cx.listener(Self::on_toggle_tree))
+            .on_action(cx.listener(Self::on_toggle_dock))
             .on_action(cx.listener(Self::on_cancel))
             // Double ⇧ gesture (modifier presses arrive as modifiers events).
             .on_modifiers_changed(cx.listener(Self::on_modifiers))
@@ -1646,7 +1772,8 @@ impl Render for Workbench {
                             .min_h_0()
                             .flex()
                             .flex_row()
-                            .child(self.render_tree(cx))
+                            .children(self.render_tree(cx))
+                            .child(self.render_tree_handle(cx))
                             .child(self.render_editor_area(cx)),
                     )
                     // The bottom dock: Run (M4) and Find in Files (M5) as pages —
@@ -1738,64 +1865,134 @@ impl Workbench {
 }
 
 impl Workbench {
-    fn render_tree(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The left dock tree; `None` while hidden (⌘1 / persisted layout).
+    fn render_tree(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.settings.layout.tree_visible {
+            return None;
+        }
         let project =
             self.host.as_ref().map(|host| host.name.clone()).unwrap_or_else(|| strings::NO_PROJECT.to_owned());
         let rows = self.tree.rows();
         let selected = self.tree.selected.clone();
 
-        div()
-            .w_64()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .border_r_1()
-            .border_color(theme::border())
-            .track_focus(&self.tree_focus)
-            .on_key_down(cx.listener(Self::on_tree_key))
-            .child(
-                div()
-                    .h_8()
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_size(px(12.))
-                    .text_color(theme::fg_muted())
-                    .child(SharedString::from(strings::TREE_HEADER))
-                    .child(div().font_weight(gpui::FontWeight::MEDIUM).text_color(theme::fg()).child(project)),
-            )
-            .child(div().id("tree-scroll").flex_1().min_h_0().overflow_y_scroll().py_1().text_size(px(13.)).children(
-                rows.into_iter().enumerate().map(|(index, row)| {
-                    let is_selected = selected.as_ref() == Some(&row.path);
-                    let indent = px(8.0 + 14.0 * row.depth as f32);
-                    // A changed file's name carries its git kind's color.
-                    let git_color = self.git_status.get(&row.path).and_then(|kind| theme::git_status_color(*kind));
+        Some(
+            div()
+                .w(px(self.settings.layout.tree_width))
+                .flex_none()
+                .flex()
+                .flex_col()
+                .border_r_1()
+                .border_color(theme::border())
+                .track_focus(&self.tree_focus)
+                .on_key_down(cx.listener(Self::on_tree_key))
+                .child(
                     div()
-                        .id(("tree-row", index))
-                        .h(px(24.0))
-                        .pr_2()
-                        .pl(indent)
+                        .h_8()
+                        .px_2()
                         .flex()
                         .items_center()
                         .gap_1()
-                        .when(is_selected, |this| this.bg(theme::selected_bg()))
-                        .hover(|this| this.bg(theme::raised_bg()))
-                        .on_click(cx.listener({
-                            let path = row.path.clone();
-                            let kind = row.kind;
-                            move |this, event: &ClickEvent, window, cx| {
-                                this.on_tree_row(path.clone(), kind, event, window, cx)
-                            }
-                        }))
-                        .child(row_icon(&row))
-                        .child(
+                        .text_size(px(12.))
+                        .text_color(theme::fg_muted())
+                        .child(SharedString::from(strings::TREE_HEADER))
+                        .child(div().font_weight(gpui::FontWeight::MEDIUM).text_color(theme::fg()).child(project)),
+                )
+                .child(
+                    div().id("tree-scroll").flex_1().min_h_0().overflow_y_scroll().py_1().text_size(px(13.)).children(
+                        rows.into_iter().enumerate().map(|(index, row)| {
+                            let is_selected = selected.as_ref() == Some(&row.path);
+                            let indent = px(8.0 + 14.0 * row.depth as f32);
+                            // A changed file's name carries its git kind's color.
+                            let git_color =
+                                self.git_status.get(&row.path).and_then(|kind| theme::git_status_color(*kind));
                             div()
-                                .when_some(git_color, |name, color| name.text_color(color))
-                                .child(SharedString::from(row.name)),
-                        )
-                }),
-            ))
+                                .id(("tree-row", index))
+                                .h(px(24.0))
+                                .pr_2()
+                                .pl(indent)
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .when(is_selected, |this| this.bg(theme::selected_bg()))
+                                .hover(|this| this.bg(theme::raised_bg()))
+                                .on_click(cx.listener({
+                                    let path = row.path.clone();
+                                    let kind = row.kind;
+                                    move |this, event: &ClickEvent, window, cx| {
+                                        this.on_tree_row(path.clone(), kind, event, window, cx)
+                                    }
+                                }))
+                                .child(row_icon(&row))
+                                .child(
+                                    div()
+                                        .when_some(git_color, |name, color| name.text_color(color))
+                                        .child(SharedString::from(row.name)),
+                                )
+                        }),
+                    ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The 4 px drag handle between tree and editor (M7): arms the width
+    /// drag.
+    fn render_tree_handle(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        div()
+            .w(px(4.0))
+            .h_full()
+            .flex_none()
+            .cursor_pointer()
+            .hover(|bar| bar.bg(theme::accent()))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_tree_handle_down))
+            .into_any_element()
+    }
+
+    /// Arms the tree-width drag (the move drives it from the window root).
+    fn on_tree_handle_down(&mut self, event: &gpui::MouseDownEvent, window: &mut Window, _: &mut Context<Self>) {
+        self.drag.set(Some(Drag::Tree {
+            start_x: f32::from(event.position.x),
+            start_width: self.settings.layout.tree_width,
+        }));
+        window.set_window_cursor_style(gpui::CursorStyle::ResizeLeftRight);
+    }
+
+    /// Arms the dock-height drag.
+    fn on_dock_handle_down(&mut self, event: &gpui::MouseDownEvent, window: &mut Window, _: &mut Context<Self>) {
+        self.drag.set(Some(Drag::Dock {
+            start_y: f32::from(event.position.y),
+            start_height: self.settings.layout.dock_height,
+        }));
+        window.set_window_cursor_style(gpui::CursorStyle::ResizeUpDown);
+    }
+
+    /// Drives an armed drag (the window root sees every move through the
+    /// children). The dock grows upward: dragging toward the top edge
+    /// enlarges it.
+    fn on_drag_move(&mut self, event: &gpui::MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(drag) = self.drag.get() else { return };
+        match drag {
+            Drag::Tree { start_x, start_width } => {
+                let width = start_width + (f32::from(event.position.x) - start_x);
+                self.settings.layout.tree_width =
+                    width.clamp(*settings::TREE_WIDTH_RANGE.start(), *settings::TREE_WIDTH_RANGE.end());
+            }
+            Drag::Dock { start_y, start_height } => {
+                let height = start_height - (f32::from(event.position.y) - start_y);
+                self.settings.layout.dock_height =
+                    height.clamp(*settings::DOCK_HEIGHT_RANGE.start(), *settings::DOCK_HEIGHT_RANGE.end());
+            }
+        }
+        cx.notify();
+    }
+
+    /// Ends the drag: release the cursor, persist the layout.
+    fn on_drag_end(&mut self, _: &gpui::MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.drag.take().is_some() {
+            window.set_window_cursor_style(gpui::CursorStyle::Arrow);
+            settings::save(&self.settings);
+            cx.notify();
+        }
     }
 
     // -- central tab stack ---------------------------------------------------------
@@ -1859,40 +2056,85 @@ impl Workbench {
 
     // -- bottom dock ---------------------------------------------------------------
 
-    /// The bottom dock: the M4 Run panel alone, the M5 Find panel alone, or
-    /// — when both exist — a two-tab page switch above the active one. The
-    /// M4 look (single panel, no header, 240 px) is preserved exactly while
-    /// Find has never opened.
+    /// The bottom dock: one tab per run (M7) plus the M5 Find page, above
+    /// the active page. With a single page the M4 look (that panel alone, no
+    /// tab bar, its own header) is preserved exactly. Hidden via ⌘4 or the
+    /// persisted layout; the height drags (the 4 px handle on top).
     fn render_dock(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        match (&self.run_panel, &self.find_panel) {
-            (None, None) => None,
-            (Some(run), None) => Some(self.dock_shell(240.0, None, run.clone())),
-            (None, Some(find)) => Some(self.dock_shell(240.0, None, find.clone())),
-            (Some(run), Some(find)) => {
-                let tabs = TabBar::new("dock-tabs")
-                    .selected_index(if self.dock_page == DockPage::Run { 0 } else { 1 })
-                    .on_click(cx.listener(|this, index: &usize, _, cx| {
-                        this.dock_page = if *index == 0 { DockPage::Run } else { DockPage::Find };
-                        cx.notify();
-                    }))
-                    .child(ComponentTab::new().label(strings::RUN_TITLE))
-                    .child(ComponentTab::new().label(strings::FIND_FILES_TITLE));
-                if self.dock_page == DockPage::Run {
-                    Some(self.dock_shell(276.0, Some(tabs), run.clone()))
-                } else {
-                    Some(self.dock_shell(276.0, Some(tabs), find.clone()))
-                }
-            }
+        if !self.settings.layout.dock_visible {
+            return None;
         }
+        let find = self.find_panel.clone();
+        self.clamp_dock_page();
+        let pages = self.runs.len() + usize::from(find.is_some());
+        let body = match self.dock_page {
+            DockPage::Run(index) if self.runs.get(index).is_some() => self.runs[index].clone().into_any_element(),
+            _ if find.is_some() => find.clone().unwrap().into_any_element(),
+            _ => return None,
+        };
+        if pages <= 1 {
+            return Some(self.dock_shell(cx, None, body));
+        }
+        // Multiple pages: the tab switch above the active one. Run tabs are
+        // closable (a live run stops first); Find is a permanent page.
+        let workbench = cx.entity().downgrade();
+        let mut children = Vec::new();
+        for (index, panel) in self.runs.iter().enumerate() {
+            let name = panel.read(cx).config_name.clone();
+            children.push(ComponentTab::new().label(name).selected(self.dock_page == DockPage::Run(index)).suffix(
+                Button::new(("dock-tab-close", index)).icon(IconName::Close).xsmall().ghost().on_click({
+                    let workbench = workbench.clone();
+                    move |_, _, cx| {
+                        workbench.update(cx, |this, cx| this.close_run_tab(index, cx)).ok();
+                    }
+                }),
+            ));
+        }
+        if find.is_some() {
+            children.push(ComponentTab::new().label(strings::FIND_FILES_TITLE));
+        }
+        let tabs = TabBar::new("dock-tabs")
+            .selected_index(match self.dock_page {
+                DockPage::Run(index) => index,
+                DockPage::Find => self.runs.len(),
+            })
+            .on_click(cx.listener(|this, index: &usize, _, cx| {
+                let runs = this.runs.len();
+                this.dock_page = if *index < runs { DockPage::Run(*index) } else { DockPage::Find };
+                cx.notify();
+            }))
+            .children(children);
+        Some(self.dock_shell(cx, Some(tabs), body))
     }
 
-    fn dock_shell(&self, height: f32, header: Option<TabBar>, body: impl IntoElement) -> gpui::AnyElement {
-        let mut shell =
-            div().h(px(height)).flex_none().min_h_0().flex().flex_col().border_t_1().border_color(theme::border());
+    fn dock_shell(&self, cx: &Context<Self>, header: Option<TabBar>, body: impl IntoElement) -> gpui::AnyElement {
+        let mut shell = div()
+            .h(px(self.settings.layout.dock_height))
+            .flex_none()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .border_t_1()
+            .border_color(theme::border());
+        if header.is_some() {
+            shell = shell.child(self.render_dock_handle(cx));
+        }
         if let Some(header) = header {
             shell = shell.child(header);
         }
         shell.child(div().flex_1().min_h_0().child(body)).into_any_element()
+    }
+
+    /// The 4 px drag handle above the dock (M7): arms the height drag.
+    fn render_dock_handle(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        div()
+            .h(px(4.0))
+            .w_full()
+            .flex_none()
+            .cursor_pointer()
+            .hover(|bar| bar.bg(theme::accent()))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_dock_handle_down))
+            .into_any_element()
     }
 
     // -- status bar ----------------------------------------------------------------
@@ -1936,9 +2178,8 @@ impl Workbench {
         }
         let mut right = div().flex().items_center().gap_3().text_size(px(12.));
         // The run indicator (running · elapsed, or the exit code), from the
-        // dock's own status.
-        if let Some(panel) = &self.run_panel {
-            let (text, color) = panel.read(cx).status();
+        // selected run tab (or the live one when the Find page shows).
+        if let Some((text, color)) = self.run_status(cx) {
             right = right.child(div().truncate().text_color(color).child(SharedString::from(text)));
         }
         // Language-server rows: name + status, colored by health.
