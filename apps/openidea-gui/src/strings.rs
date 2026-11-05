@@ -82,3 +82,17 @@ pub const TAB_PIN: &str = "Pin Tab";
 pub const TAB_UNPIN: &str = "Unpin Tab";
 pub const TAB_CLOSE: &str = "Close Tab";
 pub const TAB_REOPEN: &str = "Reopen Closed Tab";
+// Tree context menu / mutations (M7).
+pub const TREE_NEW_FILE: &str = "New File…";
+pub const TREE_NEW_FOLDER: &str = "New Folder…";
+pub const TREE_RENAME: &str = "Rename…";
+pub const TREE_DELETE: &str = "Delete…";
+pub const PROMPT_CONFIRM_HINT: &str = "⏎ confirm · Esc cancel";
+pub const DELETE_TITLE: &str = "Delete";
+pub const DELETE_BUTTON: &str = "Delete";
+pub const FS_CREATE_FAILED: &str = "Cannot create";
+pub const FS_RENAME_FAILED: &str = "Cannot rename";
+pub const FS_DELETE_FAILED: &str = "Delete failed";
+pub const DELETE_FILE_MESSAGE: &str = "Delete";
+pub const DELETE_FOLDER_MESSAGE: &str = "Delete";
+pub const DELETE_AND_CONTENTS: &str = "and everything inside it? The folder moves to the Trash.";

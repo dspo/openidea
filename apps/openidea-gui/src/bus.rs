@@ -97,6 +97,23 @@ pub enum BusMessage {
         organized: bool,
         error: Option<String>,
     },
+    /// A tree creation finished (M7; the ide-vfs call ran on the background
+    /// executor). A created file opens in a tab; both refresh the tree.
+    FsCreated {
+        path: PathBuf,
+        is_dir: bool,
+        error: Option<String>,
+    },
+    /// A tree rename finished; the renamed file's tab reopens at `to`.
+    FsRenamed {
+        from: PathBuf,
+        to: PathBuf,
+        error: Option<String>,
+    },
+    /// A tree delete (trash move) finished; the tree refreshes either way.
+    FsDeleted {
+        error: Option<String>,
+    },
 }
 
 /// The UI end of the event bus. Cheap to clone; `send` never blocks

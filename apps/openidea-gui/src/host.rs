@@ -193,6 +193,28 @@ impl Host {
         ide_vfs::read_dir(dir, &excludes())
     }
 
+    // -- tree mutations (M7: the file tree's context menu; all IO is ide-vfs)
+
+    /// Creates an empty file (and missing parents); never truncates.
+    pub fn create_file(&self, path: &Path) -> IdeResult<()> {
+        ide_vfs::create_file(path)
+    }
+
+    /// Creates a directory (and missing parents).
+    pub fn create_dir(&self, path: &Path) -> IdeResult<()> {
+        ide_vfs::create_dir(path)
+    }
+
+    /// Renames / moves; refuses to overwrite an existing target.
+    pub fn rename(&self, from: &Path, to: &Path) -> IdeResult<()> {
+        ide_vfs::rename(from, to)
+    }
+
+    /// Moves to the OS trash (recoverable); permanent only without a trash.
+    pub fn delete(&self, path: &Path) -> IdeResult<()> {
+        ide_vfs::delete(path)
+    }
+
     /// Opens (or re-opens) `path` as a document; the UI seeds its buffer from
     /// the returned text.
     pub fn open_document(&self, path: &Path) -> IdeResult<DocumentInfo> {
