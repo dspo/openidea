@@ -19,6 +19,10 @@ pub const MARKED_BG: u32 = (ACCENT << 8) | 0x2e;
 pub const SELECTION_BG: u32 = (ACCENT << 8) | 0x3c;
 /// Selected-row background in the file tree: the accent at ~22% alpha.
 pub const SELECTED_BG: u32 = (ACCENT << 8) | 0x38;
+/// In-file find matches (M5): the warm warning tone at ~19% alpha, the
+/// current match at ~33%.
+const FIND_BG: u32 = (WARNING << 8) | 0x30;
+const FIND_CURRENT_BG: u32 = (WARNING << 8) | 0x55;
 
 pub const FONT_FAMILY: &str = "Menlo";
 pub const FONT_SIZE: f32 = 14.0;
@@ -84,6 +88,13 @@ pub fn raised_bg() -> gpui::Hsla {
 }
 pub fn selected_bg() -> gpui::Hsla {
     rgba(SELECTED_BG).into()
+}
+/// An in-file find match (the current one paints [`find_current_bg`]).
+pub fn find_bg() -> gpui::Rgba {
+    rgba(FIND_BG)
+}
+pub fn find_current_bg() -> gpui::Rgba {
+    rgba(FIND_CURRENT_BG)
 }
 pub fn fg() -> gpui::Hsla {
     rgba((FG << 8) | 0xff).into()

@@ -57,3 +57,15 @@ pub const CODE_ACTIONS_UNAVAILABLE: &str = "Code actions unavailable";
 pub const CODE_ACTION_FAILED: &str = "Code action failed";
 pub const FORMAT_UNAVAILABLE: &str = "Format unavailable";
 pub const ALREADY_FORMATTED: &str = "Already formatted";
+// In-file find/replace (M5).
+pub const FIND_PLACEHOLDER: &str = "Find (⏎ next, ⇧⏎ previous)";
+pub const FIND_NO_MATCHES: &str = "No matches";
+pub const FIND_HINT: &str = "Type to find";
+pub const FIND_CASE: &str = "Aa";
+pub const REPLACE_PLACEHOLDER: &str = "Replace";
+pub const REPLACE_BUTTON: &str = "Replace";
+pub const REPLACE_ALL_BUTTON: &str = "All";
+// Find in Files (M5).
+pub const FIND_FILES_TITLE: &str = "Find in Files";
+pub const FIND_FILES_PLACEHOLDER: &str = "Search project (⏎)";
+pub const FIND_SEARCHING: &str = "searching…";

@@ -1,0 +1,275 @@
+//! The Find in Files dock page (M5): a query input over `ide_search::search`
+//! results grouped per file. The panel is display + input only — Enter sends
+//! `FindInFilesStart` through the bus, and the workbench snapshots the dirty
+//! open buffers and runs the search on the background executor (it owns the
+//! tabs, so it owns the overlay). The answer lands back through the bus once
+//! the run completes; rows open the file at the match (the editor highlights
+//! every hit on arrival). Project-wide replace stays built-later.
+
+use gpui::{
+    AppContext as _, ClickEvent, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
+    SharedString, StatefulInteractiveElement as _, Styled, UniformListScrollHandle, Window, div, px, uniform_list,
+};
+use gpui_component::input::{Input, InputEvent, InputState};
+use ide_search::{FileMatches, SearchSummary};
+
+use crate::bus::{Bus, BusMessage};
+use crate::strings;
+use crate::theme;
+
+/// One flattened list row (a file group header, or a match line).
+enum FindRow {
+    File(usize),
+    Line(usize, usize),
+}
+
+const LINE_HEIGHT: f32 = 20.0;
+
+pub struct FindPanel {
+    bus: Bus,
+    input: gpui::Entity<InputState>,
+    query: String,
+    /// The query the shown results answer to (rides along on `FindHit`, so
+    /// the editor can highlight every hit in the opened buffer).
+    last_query: String,
+    /// The last completed run's results, grouped per file.
+    files: Vec<FileMatches>,
+    summary: Option<SearchSummary>,
+    searching: bool,
+    /// Guards against stale answers when a new search starts first.
+    request: u32,
+    selected: usize,
+    scroll: UniformListScrollHandle,
+    /// The input's Change / PressEnter subscription, alive while the panel is.
+    _sub: Option<gpui::Subscription>,
+    focus: FocusHandle,
+}
+
+impl FindPanel {
+    pub fn new(bus: Bus, window: &mut Window, cx: &mut gpui::Context<Self>) -> Self {
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(strings::FIND_FILES_PLACEHOLDER));
+        let sub = Some(cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| match event {
+            InputEvent::PressEnter { .. } => this.start_search(cx),
+            InputEvent::Change => {
+                this.query = this.input.read(cx).value().to_string();
+            }
+            _ => {}
+        }));
+        Self {
+            bus,
+            input,
+            query: String::new(),
+            last_query: String::new(),
+            files: Vec::new(),
+            summary: None,
+            searching: false,
+            request: 0,
+            selected: 0,
+            scroll: UniformListScrollHandle::new(),
+            _sub: sub,
+            focus: cx.focus_handle(),
+        }
+    }
+
+    /// Enter: hand the query to the workbench through the bus. Cancellation
+    /// is implicit — a newer request drops the older answer.
+    pub fn start_search(&mut self, cx: &mut gpui::Context<Self>) {
+        let query = self.query.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        self.request += 1;
+        self.searching = true;
+        self.selected = 0;
+        self.last_query = query.clone();
+        eprintln!("[find] searching {query:?}");
+        self.bus.send(BusMessage::FindInFilesStart { request: self.request, query });
+        cx.notify();
+    }
+
+    /// The search finished: keep the answer only if its request is current.
+    pub fn finished(
+        &mut self,
+        request: u32,
+        files: Vec<FileMatches>,
+        summary: SearchSummary,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if request != self.request {
+            return;
+        }
+        self.files = files;
+        self.summary = Some(summary);
+        self.searching = false;
+        cx.notify();
+    }
+
+    /// The flattened row list behind the virtualized list.
+    fn rows(&self) -> Vec<FindRow> {
+        let mut rows = Vec::new();
+        for (group, file) in self.files.iter().enumerate() {
+            rows.push(FindRow::File(group));
+            for (line, _) in file.matches.iter().enumerate() {
+                rows.push(FindRow::Line(group, line));
+            }
+        }
+        rows
+    }
+
+    fn open_hit(&mut self, group: usize, line: usize, cx: &mut gpui::Context<Self>) {
+        let Some(file) = self.files.get(group) else { return };
+        let Some(hit) = file.matches.get(line) else { return };
+        let pos = ide_core::Pos::new(hit.line, hit.ranges.first().map_or(0, |(start, _)| *start));
+        self.selected = self
+            .rows()
+            .iter()
+            .position(|row| matches!(row, FindRow::Line(g, l) if *g == group && *l == line))
+            .unwrap_or(self.selected);
+        self.bus.send(BusMessage::FindHit { path: file.path.0.clone(), pos, query: self.last_query.clone() });
+        cx.notify();
+    }
+}
+
+impl Focusable for FindPanel {
+    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+/// One match's ranges drawn as accent runs inside the line text (UTF-16
+/// columns into `text`).
+fn render_line_text(text: &str, ranges: &[(u32, u32)]) -> gpui::AnyElement {
+    let mut row = div().flex().min_w_0();
+    let mut cursor = 0usize;
+    for (start, end) in ranges {
+        let (start, end) = (*start as usize, (*end as usize).max(*start as usize));
+        if start > cursor && start <= text.len() {
+            row = row.child(div().text_color(theme::fg()).child(SharedString::from(text[cursor..start].to_owned())));
+            cursor = start;
+        }
+        if end > cursor && end <= text.len() {
+            row = row.child(
+                div()
+                    .text_color(theme::accent())
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child(SharedString::from(text[cursor..end].to_owned())),
+            );
+            cursor = end;
+        }
+    }
+    if cursor < text.len() {
+        row = row.child(div().text_color(theme::fg()).truncate().child(SharedString::from(text[cursor..].to_owned())));
+    }
+    row.into_any_element()
+}
+
+impl Render for FindPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let rows = self.rows();
+        let count = rows.len();
+        let this = cx.entity().downgrade();
+        let status = if self.searching {
+            strings::FIND_SEARCHING.to_owned()
+        } else if let Some(summary) = &self.summary {
+            format!(
+                "{} matches in {} files · {} ms{}",
+                summary.matches,
+                summary.files,
+                summary.elapsed_ms,
+                if summary.limit_hit { " · limit" } else { "" }
+            )
+        } else {
+            strings::FIND_HINT.to_owned()
+        };
+        let header = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .h_8()
+            .border_b_1()
+            .border_color(theme::border())
+            .text_size(px(12.))
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme::fg())
+                    .child(SharedString::from(strings::FIND_FILES_TITLE)),
+            )
+            .child(div().min_w_16().child(Input::new(&self.input)))
+            .child(div().truncate().text_color(theme::fg_muted()).child(SharedString::from(status)));
+        let body = div().flex_1().min_h_0().child(
+            uniform_list("find-rows", count, move |range, _, cx| {
+                let Some(this) = this.upgrade() else { return Vec::new() };
+                let panel = this.read(cx);
+                range
+                    .map(|index| {
+                        let Some(row) = rows.get(index) else { return div().into_any_element() };
+                        match row {
+                            FindRow::File(group) => {
+                                let Some(file) = panel.files.get(*group) else {
+                                    return div().into_any_element();
+                                };
+                                div()
+                                    .h(px(LINE_HEIGHT))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_size(px(12.))
+                                    .bg(theme::app_bg())
+                                    .child(
+                                        div()
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(theme::fg())
+                                            .child(SharedString::from(file.rel_path.clone())),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(theme::fg_muted())
+                                            .child(SharedString::from(format!("{} matches", file.matches.len()))),
+                                    )
+                                    .into_any_element()
+                            }
+                            FindRow::Line(group, line) => {
+                                let Some(hit) = panel.files.get(*group).and_then(|file| file.matches.get(*line)) else {
+                                    return div().into_any_element();
+                                };
+                                let (group, line) = (*group, *line);
+                                div()
+                                    .id(("find-row", index))
+                                    .h(px(LINE_HEIGHT))
+                                    .pl(px(20.0))
+                                    .pr_2()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_size(px(12.))
+                                    .font_family(theme::FONT_FAMILY)
+                                    .on_click({
+                                        let this = this.clone();
+                                        move |_: &ClickEvent, _, cx| {
+                                            this.update(cx, |panel, cx| panel.open_hit(group, line, cx));
+                                        }
+                                    })
+                                    .hover(|row| row.bg(theme::raised_bg()))
+                                    .child(
+                                        div()
+                                            .w(px(36.0))
+                                            .flex_none()
+                                            .text_right()
+                                            .text_color(theme::fg_muted())
+                                            .child(SharedString::from((hit.line + 1).to_string())),
+                                    )
+                                    .child(render_line_text(&hit.text, &hit.ranges))
+                                    .into_any_element()
+                            }
+                        }
+                    })
+                    .collect()
+            })
+            .track_scroll(&self.scroll),
+        );
+        div().flex().flex_col().size_full().bg(theme::surface_bg()).child(header).child(body)
+    }
+}

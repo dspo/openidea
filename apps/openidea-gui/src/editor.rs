@@ -22,13 +22,14 @@ use std::time::Duration;
 
 use gpui::AppContext as _;
 use gpui::{
-    App, Bounds, Element, ElementId, Entity, FocusHandle, Focusable, GlobalElementId, InputHandler, InspectorElementId,
-    InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, Render, ScrollWheelEvent, ShapedLine, SharedString, Styled, TextAlign, TextRun,
-    UTF16Selection, UnderlineStyle, Window, fill, point, px, relative, rgba, size,
+    App, Bounds, ClickEvent, Element, ElementId, Entity, FocusHandle, Focusable, GlobalElementId, InputHandler,
+    InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent, ShapedLine, SharedString,
+    Styled, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, fill, point, px, relative, rgba, size,
 };
 use gpui_component::button::ButtonVariants as _;
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::{IconName, Sizable as _};
 use ide_core::{
     CancellationToken, ChangeSet, Diagnostic, DocId, IdeResult, Location, Pos, Severity, TextChange, WorkspaceEdit,
 };
@@ -46,6 +47,42 @@ use crate::theme;
 
 fn rgba_of(c: u32) -> gpui::Rgba {
     rgba((c << 8) | 0xff)
+}
+
+/// The find match cap (the count shows `10000+` past it).
+const MAX_FIND_MATCHES: usize = 10_000;
+
+/// Every occurrence of `needle` in `haystack` as UTF-16 ranges — literal,
+/// ascending, non-overlapping, case-folded unless `case_sensitive` (each
+/// char folds to its first lowercase form; the multi-char foldings of some
+/// locales are out of scope for code search).
+fn match_ranges(haystack: &str, needle: &str, case_sensitive: bool) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    if needle.is_empty() {
+        return out;
+    }
+    let fold = |c: char| if case_sensitive { c } else { c.to_lowercase().next().unwrap_or(c) };
+    let needle: Vec<char> = needle.chars().map(fold).collect();
+    // (folded char, UTF-16 start, UTF-16 width) per haystack char.
+    let mut chars = Vec::with_capacity(haystack.len());
+    let mut utf16 = 0usize;
+    for c in haystack.chars() {
+        chars.push((fold(c), utf16, c.len_utf16()));
+        utf16 += c.len_utf16();
+    }
+    let mut at = 0usize;
+    'scan: while at + needle.len() <= chars.len() {
+        for (offset, want) in needle.iter().enumerate() {
+            if chars[at + offset].0 != *want {
+                at += 1;
+                continue 'scan;
+            }
+        }
+        let last = &chars[at + needle.len() - 1];
+        out.push(chars[at].1..last.1 + last.2);
+        at += needle.len();
+    }
+    out
 }
 
 /// The document's indent policy: what Tab inserts and Enter keeps. Resolved
@@ -271,6 +308,10 @@ enum Cause {
     /// A live-template expansion: its own undo step (Esc/undo removes the
     /// whole expansion); the session's stops manage the cursors.
     Template,
+    /// Find & replace (⌘F): replace / replace-all batches, one undo step per
+    /// invocation (a whole-file rewrite must not merge into typing),
+    /// selections managed by the find flow.
+    Replace,
     /// Undo/redo/IME marked-text application: no undo entry, selections are
     /// managed by the caller.
     Mechanical,
@@ -476,6 +517,31 @@ struct CompletionPopup {
     replace_start: usize,
     selected: usize,
     is_incomplete: bool,
+}
+
+/// In-buffer find matches (M5 phase 6): the query with its case flag and the
+/// UTF-16 ranges it hits, recomputed on every query change and after every
+/// edit batch while present. Lives independently of the bar: a Find-in-Files
+/// hit arrival paints matches with no bar open (⌘F adopts the query).
+struct FindMatches {
+    query: String,
+    case_sensitive: bool,
+    ranges: Vec<Range<usize>>,
+    /// The match navigation points at (`ranges[current]` is the selection).
+    current: usize,
+    /// The cap stopped the scan (the count shows `10k+`).
+    capped: bool,
+}
+
+/// The open find bar (⌘F): the modal query input (rename-input pattern — it
+/// holds the focus while up), the replace row's input behind its toggle, and
+/// the query input's event subscription. Enter/Shift-Enter walk the matches
+/// through `PressEnter { shift }`; Esc closes and the pane takes back.
+struct FindBar {
+    query: Entity<InputState>,
+    replace: Entity<InputState>,
+    replace_visible: bool,
+    _sub: gpui::Subscription,
 }
 
 impl CompletionPopup {
@@ -700,6 +766,10 @@ pub struct EditorPane {
     hover_req_offset: Option<usize>,
     // Live templates (M5 phase 5): the active expansion session, if any.
     template: Option<TemplateSession>,
+    // Find & replace (M5 phase 6): the in-buffer match list and the open
+    // bar (the bar implies matches; matches may exist without the bar).
+    find_hits: Option<FindMatches>,
+    find_bar: Option<FindBar>,
     bus: Bus,
     /// F12 perf overlay counters (phase 7).
     hud: Hud,
@@ -766,6 +836,8 @@ impl EditorPane {
             hover_req_gen: 0,
             hover_req_offset: None,
             template: None,
+            find_hits: None,
+            find_bar: None,
             bus,
             hud: Hud::default(),
             created_at: std::time::Instant::now(),
@@ -1061,10 +1133,11 @@ impl EditorPane {
         let selections_before = std::mem::take(&mut self.selections);
         let selections_after = match cause {
             Cause::Typing | Cause::Delete | Cause::Paste => Selection::after_inserts(&changes),
-            // Mechanical/indent/format batches keep the caller's cursors:
-            // they are restored (undo/redo), ride along (indentation at line
-            // starts), stay put (format) or clamp (IME, patches) afterwards.
-            Cause::ImeCommit | Cause::Mechanical | Cause::Indent | Cause::Format | Cause::Template => {
+            // Mechanical/indent/format/replace batches keep the caller's
+            // cursors: they are restored (undo/redo), ride along (indentation
+            // at line starts), stay put (format, replace — the find flow
+            // re-selects what it wants) or clamp (IME, patches) afterwards.
+            Cause::ImeCommit | Cause::Mechanical | Cause::Indent | Cause::Format | Cause::Template | Cause::Replace => {
                 selections_before.clone()
             }
         };
@@ -1098,6 +1171,11 @@ impl EditorPane {
         self.after_edits(&byte_edits, cx);
         if self.template.is_some() {
             self.template_after_batch(&batch, cause);
+        }
+        // The find matches describe the text that just moved: recompute
+        // (navigation stays near where it pointed).
+        if self.find_hits.is_some() {
+            self.find_recompute(cx);
         }
         self.clamp_scroll_to_primary();
         cx.notify();
@@ -1429,6 +1507,10 @@ impl EditorPane {
             self.folds.clear();
             if let Some(highlighter) = self.highlighter.clone() {
                 self.schedule_parse(highlighter, cx);
+            }
+            // The find matches describe the replaced text: recompute.
+            if self.find_hits.is_some() {
+                self.find_recompute(cx);
             }
         }
     }
@@ -2053,6 +2135,199 @@ impl EditorPane {
         }
     }
 
+    // -- find & replace (M5 phase 6) -----------------------------------------
+    //
+    // ⌘F opens the bar (the query input holds focus, rename-input pattern):
+    // Enter/Shift-Enter walk the matches, ⌥⌘F (or the arrow button) reveals
+    // the replace row. Matches paint as translucent rects under the text and
+    // survive the bar closing (⌘F reopens with the query; Esc clears them) —
+    // which is also the shape a Find-in-Files hit arrival paints (the
+    // workbench calls show_find_hits, no bar).
+
+    /// ⌘F: opens the bar, seeding the query from the selection (≤ 200 chars)
+    /// or from the current match list (a Find-in-Files arrival adopts its
+    /// query). Already open: nothing (the input keeps the focus).
+    fn open_find(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        if self.find_bar.is_some() {
+            return;
+        }
+        self.close_completion(cx);
+        let seed = self.find_hits.as_ref().map_or_else(
+            || {
+                let (start, end) = self.selections.first().map_or((0, 0), |s| s.normalized());
+                if end > start && end - start <= 200 { self.buf.slice_utf16(start..end) } else { String::new() }
+            },
+            |hits| hits.query.clone(),
+        );
+        let query = cx.new(|cx| InputState::new(window, cx).placeholder(strings::FIND_PLACEHOLDER));
+        query.update(cx, |state, cx| state.set_value(seed.clone(), window, cx));
+        let replace = cx.new(|cx| InputState::new(window, cx).placeholder(strings::REPLACE_PLACEHOLDER));
+        // Single-line inputs emit PressEnter and propagate the keystroke, so
+        // the pane sees the Newline action too — swallowed in `command` while
+        // the bar is up; this subscription does the actual walking (it is the
+        // only place Shift-Enter is distinguishable).
+        let sub = cx.subscribe_in(&query, window, |this, _, event: &InputEvent, _, cx| match event {
+            InputEvent::Change => {
+                let text = this.find_bar.as_ref().map_or(String::new(), |bar| bar.query.read(cx).value().to_string());
+                if let Some(hits) = &mut this.find_hits {
+                    hits.query = text;
+                }
+                this.find_recompute(cx);
+            }
+            InputEvent::PressEnter { shift, .. } => this.find_step(if *shift { -1 } else { 1 }, cx),
+            _ => {}
+        });
+        let had_hits = self.find_hits.is_some();
+        if !had_hits {
+            self.find_hits =
+                Some(FindMatches { query: seed, case_sensitive: false, ranges: Vec::new(), current: 0, capped: false });
+        }
+        self.find_bar = Some(FindBar { query, replace, replace_visible: false, _sub: sub });
+        if !had_hits {
+            self.find_recompute(cx);
+        }
+        cx.notify();
+    }
+
+    /// Esc on the bar (or a click in the text): the bar closes, the focus
+    /// returns to the pane, the matches stay painted until Esc again.
+    fn close_find_bar(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        if self.find_bar.take().is_none() {
+            return;
+        }
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// Find-in-Files arrival: highlight every hit of `query` in this buffer.
+    /// The bar stays closed; ⌘F adopts the query (open_find's seed).
+    pub fn show_find_hits(&mut self, query: String, cx: &mut gpui::Context<Self>) {
+        let case_sensitive = self.find_hits.as_ref().is_some_and(|hits| hits.case_sensitive);
+        self.find_hits = Some(FindMatches { query, case_sensitive, ranges: Vec::new(), current: 0, capped: false });
+        self.find_recompute(cx);
+    }
+
+    /// Recomputes the match list from the query (literal, case-folded per the
+    /// toggle), line by line, capped. The current match stays the first one
+    /// at-or-after where it pointed (or the caret).
+    fn find_recompute(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(hits) = &mut self.find_hits else { return };
+        let previous = hits.ranges.get(hits.current).map(|range| range.start);
+        hits.ranges.clear();
+        hits.capped = false;
+        let query = hits.query.clone();
+        if !query.is_empty() {
+            'lines: for line in 0..self.buf.line_count() {
+                let span = self.buf.line_span(line);
+                let text = self.buf.slice_utf16(span.clone());
+                for hit in match_ranges(&text, &query, hits.case_sensitive) {
+                    hits.ranges.push(span.start + hit.start..span.start + hit.end);
+                    if hits.ranges.len() >= MAX_FIND_MATCHES {
+                        hits.capped = true;
+                        break 'lines;
+                    }
+                }
+            }
+        }
+        if hits.ranges.is_empty() {
+            hits.current = 0;
+        } else {
+            let from = previous.unwrap_or_else(|| self.selections.first().map_or(0, |s| s.head));
+            hits.current = hits.ranges.partition_point(|range| range.end <= from).min(hits.ranges.len() - 1);
+        }
+        cx.notify();
+    }
+
+    /// Enter / Shift-Enter: the current match becomes the selection (the
+    /// ordinary selection paint), scrolling into view; wrapping at the ends.
+    fn find_step(&mut self, delta: isize, cx: &mut gpui::Context<Self>) {
+        let Some(hits) = &mut self.find_hits else { return };
+        let len = hits.ranges.len() as isize;
+        if len == 0 {
+            return;
+        }
+        hits.current = ((hits.current as isize + delta).rem_euclid(len)) as usize;
+        let range = hits.ranges[hits.current].clone();
+        self.selections = vec![Selection::caret(range.start).with_head(range.end)];
+        self.clamp_scroll_to_primary();
+        cx.notify();
+    }
+
+    fn find_toggle_case(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(hits) = &mut self.find_hits else { return };
+        hits.case_sensitive = !hits.case_sensitive;
+        self.find_recompute(cx);
+    }
+
+    fn find_toggle_replace(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(bar) = &mut self.find_bar else { return };
+        bar.replace_visible = !bar.replace_visible;
+        cx.notify();
+    }
+
+    /// The replace row's text (empty without the bar — unreachable through
+    /// the UI, the buttons live in the bar).
+    fn find_replacement(&self, cx: &gpui::App) -> String {
+        self.find_bar.as_ref().map_or(String::new(), |bar| bar.replace.read(cx).value().to_string())
+    }
+
+    /// Replaces the current match (one [`Cause::Replace`] batch) and parks
+    /// the selection on the next match at-or-after the replaced range.
+    fn find_replace_one(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(range) = self.find_hits.as_ref().and_then(|hits| hits.ranges.get(hits.current).cloned()) else {
+            return;
+        };
+        let replacement = self.find_replacement(cx);
+        let change = TextChange { from: range.start as u32, to: range.end as u32, insert: replacement };
+        self.apply_edits(vec![change], Cause::Replace, cx);
+        // apply_edits recomputed the matches: advance past the replaced text.
+        if let Some(hits) = &mut self.find_hits {
+            if hits.ranges.is_empty() {
+                hits.current = 0;
+            } else {
+                hits.current = hits.ranges.partition_point(|hit| hit.end <= range.end).min(hits.ranges.len() - 1);
+            }
+        }
+        if let Some(range) = self.find_hits.as_ref().and_then(|hits| hits.ranges.get(hits.current).cloned()) {
+            self.selections = vec![Selection::caret(range.start).with_head(range.end)];
+        }
+        cx.notify();
+    }
+
+    /// Replaces every match in one batch (its own undo step removes the
+    /// whole rewrite).
+    fn find_replace_all(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(hits) = self.find_hits.as_ref() else { return };
+        if hits.ranges.is_empty() {
+            return;
+        }
+        let replacement = self.find_replacement(cx);
+        let changes = hits
+            .ranges
+            .iter()
+            .map(|range| TextChange { from: range.start as u32, to: range.end as u32, insert: replacement.clone() })
+            .collect();
+        self.apply_edits(changes, Cause::Replace, cx);
+        if let Some(hits) = &mut self.find_hits {
+            hits.current = 0;
+        }
+        cx.notify();
+    }
+
+    /// The count label: `n of m`, `m` with a `+` when the cap stopped the
+    /// scan, the hint / no-matches text for the degenerate states.
+    fn find_count_label(&self) -> String {
+        let Some(hits) = &self.find_hits else { return String::new() };
+        if hits.query.is_empty() {
+            return strings::FIND_HINT.to_owned();
+        }
+        if hits.ranges.is_empty() {
+            return strings::FIND_NO_MATCHES.to_owned();
+        }
+        let total = if hits.capped { format!("{}+", MAX_FIND_MATCHES) } else { hits.ranges.len().to_string() };
+        format!("{} of {}", hits.current + 1, total)
+    }
+
     // -- completion (M3 phase 4) ---------------------------------------------
     //
     // Typing schedules a debounced LSP request (immediately for a server
@@ -2441,6 +2716,17 @@ impl EditorPane {
                 _ => return,
             }
         }
+        // The find bar is modal like the rename input: the query input owns
+        // printable keys, arrows and Enter (its PressEnter { shift }
+        // subscription walks the matches, so the propagated Newline and the
+        // rest of the commands are swallowed here); Esc closes and the focus
+        // returns to the pane.
+        if self.find_bar.is_some() {
+            if let Command::Cancel = cmd {
+                self.close_find_bar(window, cx);
+            }
+            return;
+        }
         // The jump list owns navigation and confirm like the completion popup.
         if self.jump.is_some() {
             match cmd {
@@ -2560,6 +2846,11 @@ impl EditorPane {
                 if self.template.take().is_some() {
                     cx.notify();
                 }
+                // Esc with the bar closed clears the find highlights (the
+                // second Esc of the IDEA rhythm).
+                if self.find_hits.take().is_some() {
+                    cx.notify();
+                }
                 self.collapse_cursors(cx)
             }
             Command::ToggleHud => unreachable!("handled above"),
@@ -2649,6 +2940,11 @@ impl EditorPane {
             self.drag.set(Some(Drag::ScrollH { grab: geometry.hscroll.thumb.size.width / 2.0 }));
             cx.notify();
             return;
+        }
+        // A click in the text area closes the find bar (clicks inside the bar
+        // itself stop propagation before reaching here).
+        if self.find_bar.take().is_some() {
+            window.focus(&self.focus, cx);
         }
         self.template = None;
         let display_row = self.row_at(&geometry, ev.position.y);
@@ -3202,6 +3498,8 @@ impl Render for EditorPane {
             .children(self.render_jump_list(cx))
             // Quick-fix menu (⌥⏎).
             .children(self.render_code_actions(cx))
+            // Find bar (⌘F) with its replace row.
+            .children(self.render_find_bar(window, cx))
             // Rename: input overlay, then the workspace-edit preview.
             .children(self.render_rename(window, cx))
             .on_action(cx.listener(|this, _: &acts::GotoDefinition, _, cx| this.goto_definition(cx)))
@@ -3209,6 +3507,8 @@ impl Render for EditorPane {
             .on_action(cx.listener(|this, _: &acts::Rename, window, cx| this.start_rename(window, cx)))
             .on_action(cx.listener(|this, _: &acts::CodeActions, _, cx| this.request_code_actions(cx)))
             .on_action(cx.listener(|this, _: &acts::FormatDocument, _, cx| this.format_document(cx)))
+            .on_action(cx.listener(|this, _: &acts::Find, window, cx| this.open_find(window, cx)))
+            .on_action(cx.listener(|this, _: &acts::ToggleReplace, _, cx| this.find_toggle_replace(cx)))
             // Navigation/refactoring handlers arrive in later M3 phases.
             .child(EditorElement { view: cx.entity() })
     }
@@ -3255,6 +3555,108 @@ impl EditorPane {
 
     /// The rename overlays: an input box over the caret (Input) or a
     /// workspace-edit preview with Apply / Cancel (Preview).
+    /// The find bar (⌘F): the query row (input, count, case toggle,
+    /// previous/next, replace toggle, close) plus the replace row behind the
+    /// toggle. Parked under the editor's top edge, right-aligned; clicks
+    /// inside stop propagation so they never place a caret.
+    fn render_find_bar(&self, window: &mut Window, cx: &mut gpui::Context<Self>) -> Option<gpui::AnyElement> {
+        let bar = self.find_bar.as_ref()?;
+        let case = self.find_hits.as_ref().is_some_and(|hits| hits.case_sensitive);
+        // The input keeps focus while the overlay is up.
+        let handle = bar.query.read(cx).presentation().focus_handle().clone();
+        if window.focused(cx).is_none_or(|f| f != handle) {
+            window.focus(&handle, cx);
+        }
+        let case_button = {
+            let button = gpui_component::button::Button::new("find-case").label(strings::FIND_CASE).xsmall().ghost();
+            if case { button.text_color(theme::accent()) } else { button }
+        };
+        let query_row = gpui::div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(gpui::div().w(px(220.0)).child(Input::new(&bar.query)))
+            .child(
+                gpui::div()
+                    .min_w(px(84.0))
+                    .max_w(px(140.0))
+                    .truncate()
+                    .text_size(px(11.))
+                    .text_color(theme::fg_muted())
+                    .child(SharedString::from(self.find_count_label())),
+            )
+            .child(case_button.on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.find_toggle_case(cx))))
+            .child(
+                gpui_component::button::Button::new("find-prev")
+                    .icon(IconName::ChevronUp)
+                    .xsmall()
+                    .ghost()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.find_step(-1, cx))),
+            )
+            .child(
+                gpui_component::button::Button::new("find-next")
+                    .icon(IconName::ChevronDown)
+                    .xsmall()
+                    .ghost()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.find_step(1, cx))),
+            )
+            .child(
+                gpui_component::button::Button::new("find-toggle-replace")
+                    .icon(IconName::Replace)
+                    .xsmall()
+                    .ghost()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.find_toggle_replace(cx))),
+            )
+            .child(
+                gpui_component::button::Button::new("find-close")
+                    .icon(IconName::Close)
+                    .xsmall()
+                    .ghost()
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.close_find_bar(window, cx))),
+            );
+        let mut body = gpui::div().flex().flex_col().gap_1().child(query_row);
+        if bar.replace_visible {
+            body = body.child(
+                gpui::div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(gpui::div().w(px(220.0)).child(Input::new(&bar.replace)))
+                    .child(
+                        gpui_component::button::Button::new("find-replace")
+                            .label(strings::REPLACE_BUTTON)
+                            .xsmall()
+                            .ghost()
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.find_replace_one(cx))),
+                    )
+                    .child(
+                        gpui_component::button::Button::new("find-replace-all")
+                            .label(strings::REPLACE_ALL_BUTTON)
+                            .xsmall()
+                            .ghost()
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.find_replace_all(cx))),
+                    ),
+            );
+        }
+        Some(
+            gpui::div()
+                .absolute()
+                .top(px(theme::TEXT_INSET))
+                .right(px(theme::SCROLLBAR_SIZE + 12.0))
+                .border_1()
+                .border_color(theme::border())
+                .bg(theme::raised_bg())
+                .p_2()
+                .flex()
+                .flex_col()
+                .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _: &mut Window, cx: &mut gpui::App| {
+                    cx.stop_propagation()
+                })
+                .child(body)
+                .into_any_element(),
+        )
+    }
+
     fn render_rename(&self, window: &mut Window, cx: &mut gpui::Context<Self>) -> Option<gpui::AnyElement> {
         let geometry = self.geometry.get()?;
         match &self.rename {
@@ -3614,6 +4016,9 @@ struct PrepaintState {
     carets: Vec<Bounds<Pixels>>,
     /// Selection rectangles for the visible rows (painted under the text).
     selection_rects: Vec<Bounds<Pixels>>,
+    /// Find match rectangles for the visible rows (painted under the
+    /// selections), each with its "current" flag (stronger tint).
+    find_rects: Vec<(Bounds<Pixels>, bool)>,
     /// Gutter chevron rows: (display row, already folded).
     chevrons: Vec<(u32, bool)>,
     /// Gutter diagnostic marks: (display row, strongest severity on the line).
@@ -4078,6 +4483,38 @@ impl Element for EditorElement {
             }
         }
 
+        // Find matches for the visible rows (the sorted ranges make each
+        // row's slice a partition point plus a short run).
+        let mut find_rects = Vec::new();
+        if let Some(hits) = &pane.find_hits
+            && !hits.ranges.is_empty()
+        {
+            for display in first..last {
+                let (row, placeholder) = pane.resolve_display(display);
+                if placeholder.is_some() {
+                    continue;
+                }
+                let span = pane.buf.line_span(row);
+                let first_hit = hits.ranges.partition_point(|range| range.end <= span.start);
+                let y = origin.y + line_height * (display as f32 - scroll);
+                for (index, range) in hits.ranges[first_hit..].iter().enumerate() {
+                    if range.start >= span.end {
+                        break;
+                    }
+                    let line_text = pane.buf.slice_utf16(span.clone());
+                    let local_start = range.start.clamp(span.start, span.end) - span.start;
+                    let local_end = range.end.clamp(span.start, span.end) - span.start;
+                    let x0 = x_at_utf16(window, &line_text, local_start, font_size);
+                    let x1 = x_at_utf16(window, &line_text, local_end, font_size);
+                    let left = origin.x + x0 - px(scroll_x);
+                    find_rects.push((
+                        Bounds::new(point(left, y), size((x1 - x0).max(px(2.0)), line_height)),
+                        first_hit + index == hits.current,
+                    ));
+                }
+            }
+        }
+
         // Scrollbar frames (published for hit-testing and drag mapping;
         // painting happens in the paint phase).
         let margin = px(2.0);
@@ -4144,6 +4581,7 @@ impl Element for EditorElement {
             rows,
             carets,
             selection_rects,
+            find_rects,
             chevrons,
             diag_marks,
             caret_line: caret_buffer_line,
@@ -4174,6 +4612,10 @@ impl Element for EditorElement {
             // Selections under the text, then the rows (shifted left by the
             // horizontal scroll), then the gutter (repainted over any text
             // scrolled under it), then the carets and the scrollbars.
+            for (rect, current) in &prepaint.find_rects {
+                let color = if *current { theme::find_current_bg() } else { theme::find_bg() };
+                window.paint_quad(fill(*rect, color));
+            }
             for rect in &prepaint.selection_rects {
                 window.paint_quad(fill(*rect, rgba_of(theme::SELECTION_BG)));
             }
@@ -4621,6 +5063,20 @@ mod tests {
         assert_eq!(buf.line_span(0), 0..3);
         assert_eq!(buf.line_span(1), 4..7);
         assert_eq!(buf.slice_utf16(0..buf.utf16_len()), "abc\ndef");
+    }
+
+    #[test]
+    fn match_ranges_folds_case_and_counts_utf16() {
+        assert_eq!(match_ranges("ab Ab aB AB", "ab", false), vec![0..2, 3..5, 6..8, 9..11]);
+        assert_eq!(match_ranges("ab Ab aB AB", "ab", true), vec![0..2]);
+        // Non-overlapping, ascending, greedy-left.
+        assert_eq!(match_ranges("aaaa", "aa", true), vec![0..2, 2..4]);
+        // UTF-16: the astral-plane char is two code units, so the first hit
+        // starts at 2, not 1.
+        assert_eq!(match_ranges("𝕊x x", "x", true), vec![2..3, 4..5]);
+        // No self-overlap at the boundary; empty needle finds nothing.
+        assert!(match_ranges("abc", "", true).is_empty());
+        assert!(match_ranges("", "abc", true).is_empty());
     }
 
     #[test]

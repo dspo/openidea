@@ -2386,7 +2386,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7518b930f6aeb75e871d32ce873c2ae46e35cef19b5a0b039d4337f651d897cd"
 dependencies = [
  "bstr",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -3555,6 +3555,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "grep-matcher"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9417543f4870fc8f1c8e1af870afae2431007626d9e703fce6471c468d33847"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "grep-regex"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ce0c256c3ad82bcc07b812c15a45ec1d398122e8e15124f96695234db7112ef"
+dependencies = [
+ "bstr",
+ "grep-matcher",
+ "log",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
+name = "grep-searcher"
+version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72348823a0eafc4bc2e9051064f28b5b42cc100b571b3a35d67918d711efcbc6"
+dependencies = [
+ "bstr",
+ "encoding_rs",
+ "encoding_rs_io",
+ "grep-matcher",
+ "log",
+ "memchr",
+ "memmap2",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4108,6 +4145,23 @@ dependencies = [
  "toml_edit 0.25.18+spec-1.1.0",
  "tracing",
  "zip",
+]
+
+[[package]]
+name = "ide-search"
+version = "0.1.35"
+dependencies = [
+ "globset",
+ "grep-matcher",
+ "grep-regex",
+ "grep-searcher",
+ "ide-core",
+ "ide-vfs",
+ "ignore",
+ "memchr",
+ "serde",
+ "specta",
+ "tracing",
 ]
 
 [[package]]
@@ -5632,6 +5686,7 @@ dependencies = [
  "ide-language",
  "ide-lsp",
  "ide-run",
+ "ide-search",
  "ide-text",
  "ide-vcs",
  "ide-vfs",
