@@ -19,49 +19,57 @@ tests) when committed.
 
 ## 1. Completion root cause + the Go completion face
 
-M5's probe: gopls logged `no completions found … package completions: invalid
-position for package completion: cursor after expression` and the popup never
-opened at member access.
+**Probed and settled** (raw stdio session replicating `caps.rs` exactly, on the
+scratch module): after `fmt.` gopls returns **29 items, all 29 snippet-format**
+(`insertTextFormat: 2`, e.g. `newText: "Println(${1:})"`); even plain keyword
+completions arrive as snippets (`main()`). The M5 `package completions:
+invalid position` line is gopls's auxiliary *unimported-package* completion
+path logging a harmless miss — it never fires at a valid selector position and
+was a red herring. The real defect was ours: the M3 popup dropped every
+`is_snippet` item and closed when all were snippets — which is every gopls
+member access. rust-analyzer only ever looked healthy because it mixes plain
+items in. (Probe-side lesson, recorded for future sessions: a raw JSON-RPC
+peer **must answer server-to-client requests** — gopls's x/tools jsonrpc2
+dispatch serializes behind an unanswered `window/workDoneProgress/create` and
+the connection appears dead.)
 
-Two layers to separate before touching anything:
-
-- **Server layer** (probe first): a raw stdio session with our exact initialize
-  params, a valid Go module, completion requests after `fmt.` — items expected.
-  The `package completions: invalid position` line is expected to be gopls's
-  *auxiliary* unimported-package completion path logging a harmless miss, not
-  the reason the list was empty.
-- **Client layer** (the suspect): we advertise `snippetSupport: true`, so gopls
-  answers member-access completions almost entirely as snippet-format items
-  (`insertTextFormat: 2`). The M3 popup **filters every `is_snippet` item out**
-  (`CompletionPopup::filtered`) and `completion_ready` closes the popup when
-  *all* items are snippets — which for gopls is every member access. The same
-  popup over rust-analyzer showed *something* because rust-analyzer mixes plain
-  items in. The "empty completion" was our filter, not gopls.
-
-Fix, in the app only:
+Fix, in the app only (committed before the live pass):
 
 - `templates.rs` grows a pure `lsp_snippet_to_expansion(body) -> Expansion`:
-  the LSP snippet grammar (`$1`, `${1:name}`, `${1|a,b|}`, choice lists,
-  `\` escapes) parsed into the same `Expansion { text, stops }` model the live
-  templates already drive, so accepting a gopls completion lands with the
-  existing **linked tab stops** (Tab walks, typing mirrors). Unit tested.
-- `CompletionPopup::filtered` keeps snippet items; `completion_accept` routes a
-  snippet item through the template session path (one `Cause::Template` batch,
-  linked occurrences) and a plain item through the old path. `Esc`/motion
-  behavior unchanged.
+  the LSP snippet grammar (`$1`, `${1:name}`, `${1|a,b|}` comma choices with
+  the terminating pipe, `$0`, `\` escapes) parsed into the same
+  `Expansion { text, stops }` model the live templates already drive, so
+  accepting a gopls completion lands with the existing **linked tab stops**
+  (Tab walks, typing mirrors). Unit tested (`Println(${1:})`,
+  `Printf(${1:format}, ${2:})`, choice lists, escapes, no-placeholder →
+  `None`).
+- `CompletionPopup::filtered` keeps snippet items; `completion_ready` closes
+  only on a truly empty list; `completion_accept` routes a snippet item through
+  the template session path (one `Cause::Template` batch, linked occurrences,
+  the final caret closing) and a plain item through the old path.
 - Popup polish for Go comes free through data already converted by `ide-lsp`:
   `labelDetails.description` (`fmt` on `Println`) and `detail` rows render
   since M3; `additionalTextEdits` (the import addition for an unimported
-  package suggestion) already applies in `completion_accept`.
+  package suggestion) already applies in `completion_accept` — and now also
+  shifts the snippet stops when it lands before them.
 
-**References/rename re-drive**: the M5 miss was a probe artifact to re-check,
-not a known defect — `ide-lsp`'s references/rename already widen beyond the
-server's scope via the candidates hook; the app's `host.rs` installs the
-apply-edit hook but **no candidates hook**, so widening silently degrades to
-the server's own scope. gopls's scope is the whole module (fine for Go), but
-the hook is one `ProjectIndex`-worded closure; wire it and re-drive
-cross-file usages + rename on the scratch project (rust-analyzer comparison
-included).
+**References/rename re-drive**: the same probe answers `NewStore` references
+cross-package (declaration in store.go + usage in main.go) and `prepareRename`
+with a placeholder, so the server face is healthy; the M5 miss was the app's
+driving, not the data. The app never installed `set_candidates_hook`, so
+references/rename silently lost the beyond-scope widening the Tauri host has —
+wired now in `host.rs` (`ide_search::files_with_word` over the server root,
+open-document overlays through `Documents::search_text_of`).
+
+**Environment record for the live pass**: this milestone's session ran with
+`CGSSessionScreenIsLocked = Yes` (same wall M5 hit for clicks). Synthetic
+keyboard events are fenced (navigation keys stop reaching the app; printable
+keys double-insert through both the IME and the raw fallback), while
+window-scoped captures work whenever the display is awake (`caffeinate -u`
+first; the sandboxed shell also needs `dangerouslyDisableSandbox` for
+screencapture). Consequence: interactive popup evidence moves to the manual
+checklist, and the LSP data face is verified through raw-protocol probes
+instead.
 
 ## 2. Organize imports on save
 
