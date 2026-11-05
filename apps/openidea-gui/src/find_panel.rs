@@ -71,6 +71,13 @@ impl FindPanel {
         }
     }
 
+    /// The query input's focus handle: ⇧⌘F hands it the focus so the search
+    /// starts with typing, no click (the IDE rhythm; re-pressing ⇧⌘F with
+    /// the page open returns there).
+    pub fn query_focus(&self, cx: &gpui::App) -> gpui::FocusHandle {
+        self.input.read(cx).presentation().focus_handle().clone()
+    }
+
     /// Enter: hand the query to the workbench through the bus. Cancellation
     /// is implicit — a newer request drops the older answer.
     pub fn start_search(&mut self, cx: &mut gpui::Context<Self>) {
