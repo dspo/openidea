@@ -59,6 +59,28 @@ pub enum BusMessage {
     CommitDone {
         result: IdeResult<String>,
     },
+    /// ⇧⌘F (M5): the Find panel asked for a project search; the workbench
+    /// snapshots the dirty open buffers (their text wins over the disk) and
+    /// runs `ide_search::search` on the background executor.
+    FindInFilesStart {
+        request: u32,
+        query: String,
+    },
+    /// A Find-in-Files run finished; `request` lets the panel drop stale
+    /// answers (a newer Enter supersedes an older run).
+    FindInFilesDone {
+        request: u32,
+        files: Vec<ide_search::FileMatches>,
+        summary: ide_search::SearchSummary,
+    },
+    /// A Find-in-Files row was clicked: open (or activate) the file, place
+    /// the caret at the hit, and highlight every hit of the query in the
+    /// buffer (the find bar stays closed).
+    FindHit {
+        path: PathBuf,
+        pos: Pos,
+        query: String,
+    },
 }
 
 /// The UI end of the event bus. Cheap to clone; `send` never blocks

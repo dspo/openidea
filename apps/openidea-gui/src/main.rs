@@ -11,6 +11,7 @@ mod bus;
 mod diff_view;
 mod editor;
 mod file_tree;
+mod find_panel;
 mod fuzzy;
 mod highlight;
 mod host;
@@ -32,10 +33,10 @@ use gpui_kit_assets::AllAssets;
 use crate::actions::{
     Cancel, CloseTab, CodeActions, Commit, CursorDocEnd, CursorDocStart, CursorDown, CursorLeft, CursorLineEnd,
     CursorLineHome, CursorRight, CursorUp, CursorWordLeft, CursorWordRight, DeleteBackward, DeleteForward,
-    DeleteWordBackward, DeleteWordForward, FindUsages, FormatDocument, GoToFile, GotoDefinition, Newline, OpenFile,
-    OutdentLine, Paste, Quit, Redo, Rename, Run, Save, SelectDocEnd, SelectDocStart, SelectDown, SelectLeft,
-    SelectLineEnd, SelectLineHome, SelectRight, SelectUp, SelectWordLeft, SelectWordRight, ShowDiff, StopRun,
-    TabIndent, TogglePerfHud, Undo,
+    DeleteWordBackward, DeleteWordForward, Find, FindInFiles, FindUsages, FormatDocument, GoToFile, GotoDefinition,
+    Newline, OpenFile, OutdentLine, Paste, Quit, Redo, Rename, Run, Save, SelectDocEnd, SelectDocStart, SelectDown,
+    SelectLeft, SelectLineEnd, SelectLineHome, SelectRight, SelectUp, SelectWordLeft, SelectWordRight, ShowDiff,
+    StopRun, TabIndent, TogglePerfHud, ToggleReplace, Undo,
 };
 use crate::actions::{SelectNext, SelectPrev};
 use crate::bus::Bus;
@@ -117,6 +118,10 @@ fn main() {
                     KeyBinding::new("ctrl-cmd-r", StopRun, None),
                     KeyBinding::new("ctrl-d", ShowDiff, None),
                     KeyBinding::new("cmd-k", Commit, None),
+                    // M5: in-file find (⌘F) and Find in Files (⇧⌘F).
+                    KeyBinding::new("cmd-f", Find, Some("Editor")),
+                    KeyBinding::new("alt-cmd-f", ToggleReplace, Some("Editor")),
+                    KeyBinding::new("shift-cmd-f", FindInFiles, None),
                     // Escape cancels panels/popups first (whatever has focus),
                     // then collapses the editor's own state.
                     KeyBinding::new("escape", Cancel, None),

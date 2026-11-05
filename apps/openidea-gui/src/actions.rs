@@ -10,12 +10,31 @@ use gpui::actions;
 
 actions!(
     workbench,
-    [OpenFile, Save, CloseTab, Undo, Redo, Quit, Cancel, GoToFile, SearchEverywhere, Run, StopRun, ShowDiff, Commit,]
+    [
+        OpenFile,
+        Save,
+        CloseTab,
+        Undo,
+        Redo,
+        Quit,
+        Cancel,
+        GoToFile,
+        SearchEverywhere,
+        Run,
+        StopRun,
+        ShowDiff,
+        Commit,
+        FindInFiles,
+    ]
 );
 
 // Palette plumbing (⇧⌘O / double-⇧ popup): deliberately not in REGISTRY —
 // these are the list's own keys, not user-invocable commands.
 actions!(palette, [SelectPrev, SelectNext]);
+
+// The find bar's own keys (⌥⌘F reveals the replace row): user-invocable only
+// while the bar is up, so the bar's buttons stay the discoverable face.
+actions!(editor, [ToggleReplace]);
 
 actions!(
     editor,
@@ -54,6 +73,7 @@ actions!(
         Rename,
         CodeActions,
         FormatDocument,
+        Find,
     ]
 );
 
@@ -85,6 +105,7 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("workbench::CloseTab", "Close Tab", "File", "⌘W"),
     action_info!("workbench::GoToFile", "Go to File", "Navigate", "⇧⌘O"),
     action_info!("workbench::SearchEverywhere", "Search Everywhere", "Navigate", "Double ⇧"),
+    action_info!("workbench::FindInFiles", "Find in Files", "Edit", "⇧⌘F"),
     action_info!("workbench::Run", "Run…", "Run", "⌃R"),
     action_info!("workbench::StopRun", "Stop Run", "Run", "⌃⌘R"),
     action_info!("workbench::ShowDiff", "Show Diff", "Git", "⌃D"),
@@ -99,6 +120,7 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("editor::Rename", "Rename…", "Refactor", "⇧F6"),
     action_info!("editor::CodeActions", "Quick Fix…", "Refactor", "⌥⏎"),
     action_info!("editor::FormatDocument", "Format Document", "Code", "⌘⌥L"),
+    action_info!("editor::Find", "Find…", "Edit", "⌘F"),
     action_info!("editor::TogglePerfHud", "Toggle Perf HUD", "View", "F12"),
 ];
 

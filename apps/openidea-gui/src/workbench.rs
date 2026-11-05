@@ -33,16 +33,24 @@ use ide_vfs::EntryKind;
 
 use crate::actions as acts;
 use crate::actions::{
-    Cancel, CloseTab, GoToFile, OpenFile, Redo, Run, Save, SearchEverywhere, ShowDiff, StopRun, Undo,
+    Cancel, CloseTab, FindInFiles, GoToFile, OpenFile, Redo, Run, Save, SearchEverywhere, ShowDiff, StopRun, Undo,
 };
 use crate::bus::{Bus, BusMessage};
 use crate::diff_view::{self, DiffLine};
 use crate::editor::EditorPane;
 use crate::file_tree::{FileTree, Row};
+use crate::find_panel::FindPanel;
 use crate::fuzzy;
 use crate::host::Host;
 use crate::run_panel::{RunPanel, stream_of};
 use crate::{strings, theme};
+
+/// The bottom dock's active page when both panels exist (M5).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DockPage {
+    Run,
+    Find,
+}
 
 /// One open file: the editor pane, its document in the backend, and the two
 /// flags the chrome shows. The pane pushes its edits to the backend live, so
@@ -160,6 +168,12 @@ pub struct Workbench {
     /// The Run dock (M4), from the first run until the project closes: one
     /// run at a time, output streaming through the bus.
     run_panel: Option<Entity<RunPanel>>,
+    /// The Find-in-Files dock page (M5), from the first ⇧⌘F until the
+    /// project closes; searches run through the bus (the workbench owns the
+    /// dirty-buffer snapshot).
+    find_panel: Option<Entity<FindPanel>>,
+    /// The dock's active page when both panels exist.
+    dock_page: DockPage,
     /// Git working-tree kind per absolute path (working-tree kind wins, the
     /// staged one when the tree is clean), and the current branch. Refreshed
     /// on the background executor (M4).
@@ -211,6 +225,8 @@ impl Workbench {
             picker: None,
             picker_sub: None,
             run_panel: None,
+            find_panel: None,
+            dock_page: DockPage::Run,
             git_status: HashMap::new(),
             git_branch: None,
             git_refreshing: Cell::new(false),
@@ -353,6 +369,17 @@ impl Workbench {
             }
             cx.notify();
         }
+    }
+
+    /// ⇧⌘F: opens (or just surfaces) the Find-in-Files dock page. The panel
+    /// is created once per project; every Enter re-runs the search through
+    /// the bus with a fresh dirty-buffer snapshot.
+    fn on_find_in_files(&mut self, _: &FindInFiles, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find_panel.is_none() {
+            self.find_panel = Some(cx.new(|cx| FindPanel::new(self.bus.clone(), window, cx)));
+        }
+        self.dock_page = DockPage::Find;
+        cx.notify();
     }
 
     /// ⌃D: the diff overlay for the changed file at hand — the tree's
@@ -739,6 +766,7 @@ impl Workbench {
         }
         let name = config.name.clone();
         self.run_panel = Some(cx.new(|cx| RunPanel::new(host.clone(), name.clone(), cx)));
+        self.dock_page = DockPage::Run;
         let bus = self.bus.clone();
         let on_output = {
             let bus = bus.clone();
@@ -1041,6 +1069,77 @@ impl Workbench {
                 }
                 cx.notify();
             }
+            BusMessage::FindInFilesStart { request, query } => {
+                // Snapshot the dirty open buffers once (their text wins over
+                // the disk for this run), then search the project on the
+                // background executor. The answer lands through the bus.
+                let Some(host) = self.host.clone() else {
+                    if let Some(panel) = &self.find_panel {
+                        panel.update(cx, |panel, cx| {
+                            panel.finished(request, Vec::new(), ide_search::SearchSummary::default(), cx)
+                        });
+                    }
+                    self.message = Some((NotifyLevel::Warning, strings::NO_PROJECT.to_owned()));
+                    cx.notify();
+                    return;
+                };
+                let overlays: std::collections::HashMap<PathBuf, String> = self
+                    .tabs
+                    .iter()
+                    .filter(|tab| tab.dirty)
+                    .map(|tab| (tab.path.clone(), tab.pane.read(cx).buffer_text()))
+                    .collect();
+                let bus = self.bus.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        let files = std::sync::Mutex::new(Vec::new());
+                        let cancel = ide_core::CancellationToken::new();
+                        let overlay = |path: &std::path::Path| overlays.get(path).cloned();
+                        let search = ide_search::SearchQuery {
+                            pattern: query.clone(),
+                            is_regex: false,
+                            case_sensitive: false,
+                            whole_word: false,
+                            include: Vec::new(),
+                            exclude: Vec::new(),
+                            scope: ide_search::SearchScope::Project,
+                            max_matches: 10_000,
+                            context: Default::default(),
+                        };
+                        let summary = ide_search::search(&host.root, &search, &overlay, &cancel, &|file| {
+                            files.lock().expect("find files lock").push(file)
+                        });
+                        let summary = summary.unwrap_or_default();
+                        eprintln!(
+                            "[find] {query:?}: {} files / {} matches in {} ms{}",
+                            summary.files,
+                            summary.matches,
+                            summary.elapsed_ms,
+                            if summary.limit_hit { " (limit)" } else { "" }
+                        );
+                        let files = files.into_inner().expect("find files lock");
+                        bus.send(BusMessage::FindInFilesDone { request, files, summary });
+                    })
+                    .detach();
+            }
+            BusMessage::FindInFilesDone { request, files, summary } => {
+                if let Some(panel) = &self.find_panel {
+                    panel.update(cx, |panel, cx| panel.finished(request, files, summary, cx));
+                }
+                cx.notify();
+            }
+            BusMessage::FindHit { path, pos, query } => {
+                self.open_path(&path, cx);
+                if let Some(tab) = self.tabs.iter().find(|tab| tab.path == path) {
+                    tab.pane.update(cx, |pane, cx| {
+                        pane.jump_to_offset(pos, cx);
+                        pane.show_find_hits(query, cx);
+                    });
+                }
+                // The bus pump has no window; the next render restores focus.
+                self.restore_focus_pending.set(true);
+                cx.notify();
+            }
             BusMessage::Ide(IdeEvent::RunExited { run, code }) => {
                 eprintln!("[run] exited {run} code {code:?}");
                 let mine = self.run_panel.as_ref().is_some_and(|panel| panel.read(cx).run_id == Some(run));
@@ -1249,6 +1348,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_search_everywhere))
             .on_action(cx.listener(Self::on_run))
             .on_action(cx.listener(Self::on_stop_run))
+            .on_action(cx.listener(Self::on_find_in_files))
             .on_action(cx.listener(Self::on_show_diff))
             .on_action(cx.listener(Self::on_commit))
             // Double ⇧ gesture (modifier presses arrive as modifiers events).
@@ -1262,14 +1362,9 @@ impl Render for Workbench {
                     .child(self.render_tree(cx))
                     .child(self.render_editor_area(cx)),
             )
-            // The Run dock sits between the editor area and the status bar,
-            // from the first run onward (one run at a time; hiding it is an
-            // M4 leftover).
-            .when_some(self.run_panel.clone(), |area, panel| {
-                area.child(
-                    div().h(px(240.0)).flex_none().min_h_0().border_t_1().border_color(theme::border()).child(panel),
-                )
-            })
+            // The bottom dock: Run (M4) and Find in Files (M5) as pages —
+            // the M4 single-panel look when only one exists.
+            .children(self.render_dock(cx))
             .child(self.render_status(cx))
             .children(self.render_picker(cx))
             .children(self.render_diff(cx))
@@ -1397,6 +1492,44 @@ impl Workbench {
                     }),
                 )
             }))
+    }
+
+    // -- bottom dock ---------------------------------------------------------------
+
+    /// The bottom dock: the M4 Run panel alone, the M5 Find panel alone, or
+    /// — when both exist — a two-tab page switch above the active one. The
+    /// M4 look (single panel, no header, 240 px) is preserved exactly while
+    /// Find has never opened.
+    fn render_dock(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        match (&self.run_panel, &self.find_panel) {
+            (None, None) => None,
+            (Some(run), None) => Some(self.dock_shell(240.0, None, run.clone())),
+            (None, Some(find)) => Some(self.dock_shell(240.0, None, find.clone())),
+            (Some(run), Some(find)) => {
+                let tabs = TabBar::new("dock-tabs")
+                    .selected_index(if self.dock_page == DockPage::Run { 0 } else { 1 })
+                    .on_click(cx.listener(|this, index: &usize, _, cx| {
+                        this.dock_page = if *index == 0 { DockPage::Run } else { DockPage::Find };
+                        cx.notify();
+                    }))
+                    .child(ComponentTab::new().label(strings::RUN_TITLE))
+                    .child(ComponentTab::new().label(strings::FIND_FILES_TITLE));
+                if self.dock_page == DockPage::Run {
+                    Some(self.dock_shell(276.0, Some(tabs), run.clone()))
+                } else {
+                    Some(self.dock_shell(276.0, Some(tabs), find.clone()))
+                }
+            }
+        }
+    }
+
+    fn dock_shell(&self, height: f32, header: Option<TabBar>, body: impl IntoElement) -> gpui::AnyElement {
+        let mut shell =
+            div().h(px(height)).flex_none().min_h_0().flex().flex_col().border_t_1().border_color(theme::border());
+        if let Some(header) = header {
+            shell = shell.child(header);
+        }
+        shell.child(div().flex_1().min_h_0().child(body)).into_any_element()
     }
 
     // -- status bar ----------------------------------------------------------------
