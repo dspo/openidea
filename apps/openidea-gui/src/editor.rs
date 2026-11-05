@@ -30,6 +30,7 @@ use gpui::{
 };
 use gpui_component::button::ButtonVariants as _;
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::menu::ContextMenuExt as _;
 use gpui_component::{IconName, Sizable as _};
 use ide_core::{
     CancellationToken, ChangeSet, Diagnostic, DocId, IdeResult, Location, Pos, Severity, TextChange, WorkspaceEdit,
@@ -3933,6 +3934,7 @@ impl Render for EditorPane {
             self.focused_once.set(true);
             window.focus(&self.focus, cx);
         }
+        let focus = self.focus.clone();
         // Every editor behaviour is an action (bindings in `main.rs`); the
         // handlers funnel through `command`. Verbose on purpose: gpui's
         // `on_action` is typed per action, and macros cannot sit mid-chain.
@@ -4054,6 +4056,19 @@ impl Render for EditorPane {
             .on_action(cx.listener(|this, _: &acts::ToggleInlayHints, _, cx| this.toggle_inlays(cx)))
             .on_action(cx.listener(|this, _: &acts::Find, window, cx| this.open_find(window, cx)))
             .on_action(cx.listener(|this, _: &acts::ToggleReplace, _, cx| this.find_toggle_replace(cx)))
+            // The right-click menu (M7): the existing actions as entries,
+            // dispatched into this pane's own handlers through its focus —
+            // one source of truth, no second implementation.
+            .context_menu(move |menu, _, _| {
+                menu.action_context(focus.clone())
+                    .menu("Go to Definition", Box::new(acts::GotoDefinition))
+                    .menu("Find Usages", Box::new(acts::FindUsages))
+                    .menu("Rename…", Box::new(acts::Rename))
+                    .separator()
+                    .menu("Quick Fix…", Box::new(acts::CodeActions))
+                    .menu("Format Document", Box::new(acts::FormatDocument))
+                    .menu("Organize Imports", Box::new(acts::OrganizeImports))
+            })
             // Navigation/refactoring handlers arrive in later M3 phases.
             .child(EditorElement { view: cx.entity() })
     }

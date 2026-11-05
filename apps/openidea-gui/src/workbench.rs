@@ -161,6 +161,32 @@ struct CommitFlow {
     files: Vec<CommitFile>,
 }
 
+/// What the tree prompt asks (M7): a new file / folder to create in `dir`,
+/// or a rename of `renaming`.
+#[derive(Clone, Copy)]
+enum TreePromptKind {
+    NewFile,
+    NewFolder,
+    Rename,
+}
+
+/// The tree prompt overlay: a one-line name input over the tree mutation
+/// context. Enter confirms through ide-vfs, Esc cancels.
+struct TreePrompt {
+    kind: TreePromptKind,
+    /// The directory a new file/folder lands in, or the file being renamed.
+    target: PathBuf,
+    input: Entity<InputState>,
+}
+
+/// The delete confirmation (M7): deleting moves to the OS trash, but the
+/// dialog says what goes.
+struct TreeConfirm {
+    path: PathBuf,
+    is_dir: bool,
+    name: String,
+}
+
 pub struct Workbench {
     host: Option<Arc<Host>>,
     /// The persisted settings (recents, layout, font size) — saved on change.
@@ -230,6 +256,14 @@ pub struct Workbench {
     commit: Option<CommitFlow>,
     /// The message input's PressEnter subscription, alive while the overlay is.
     commit_sub: Option<gpui::Subscription>,
+    /// The tree prompt overlay (M7 context menu: new file / folder, rename)
+    /// and its Enter subscription. The input takes the focus once rendered
+    /// (the pending seed below).
+    tree_prompt: Option<TreePrompt>,
+    tree_prompt_sub: Option<gpui::Subscription>,
+    tree_prompt_focus_pending: Cell<bool>,
+    /// The delete confirmation overlay (M7).
+    tree_confirm: Option<TreeConfirm>,
     /// Set when a bus message closed an overlay: the next render hands the
     /// focus back to the editor (or the tree).
     restore_focus_pending: Cell<bool>,
@@ -284,6 +318,10 @@ impl Workbench {
             diff_focus_pending: Cell::new(false),
             commit: None,
             commit_sub: None,
+            tree_prompt: None,
+            tree_prompt_sub: None,
+            tree_prompt_focus_pending: Cell::new(false),
+            tree_confirm: None,
             restore_focus_pending: Cell::new(false),
             last_shift: Cell::new(None),
             shift_held: Cell::new(false),
@@ -1524,6 +1562,50 @@ impl Workbench {
                 self.restore_focus_pending.set(true);
                 cx.notify();
             }
+            BusMessage::FsCreated { path, is_dir, error } => {
+                match error {
+                    None => {
+                        if !is_dir {
+                            self.open_path(&path, cx);
+                        }
+                    }
+                    Some(message) => {
+                        self.message = Some((
+                            NotifyLevel::Error,
+                            format!("{} {}: {}", strings::FS_CREATE_FAILED, file_name(&path), message),
+                        ));
+                    }
+                }
+                if let Some(host) = &self.host {
+                    self.tree.refresh(host);
+                }
+                cx.notify();
+            }
+            BusMessage::FsRenamed { from, to, error } => {
+                match error {
+                    None => self.open_path(&to, cx),
+                    Some(message) => {
+                        self.message = Some((
+                            NotifyLevel::Error,
+                            format!("{} {}: {}", strings::FS_RENAME_FAILED, file_name(&from), message),
+                        ));
+                    }
+                }
+                if let Some(host) = &self.host {
+                    self.tree.refresh(host);
+                }
+                cx.notify();
+            }
+            BusMessage::FsDeleted { error } => {
+                if let Some(message) = error {
+                    self.message = Some((NotifyLevel::Error, format!("{}: {}", strings::FS_DELETE_FAILED, message)));
+                }
+                if let Some(host) = &self.host {
+                    self.tree.refresh(host);
+                }
+                self.refresh_git(cx);
+                cx.notify();
+            }
             BusMessage::Ide(IdeEvent::RunExited { run, code }) => {
                 eprintln!("[run] exited {run} code {code:?}");
                 let mine = self.runs.iter().find(|panel| panel.read(cx).run_id == Some(run)).cloned();
@@ -1645,6 +1727,193 @@ impl Workbench {
             _ => {}
         }
     }
+
+    // -- tree mutations (M7 context menu; all IO through ide-vfs) ----------
+
+    /// The directory a new file/folder lands in: the row itself for a
+    /// directory, its parent for a file.
+    fn target_dir(row_path: &Path, is_dir: bool) -> PathBuf {
+        if is_dir {
+            row_path.to_path_buf()
+        } else {
+            row_path.parent().map(Path::to_path_buf).unwrap_or_else(|| row_path.to_path_buf())
+        }
+    }
+
+    /// Opens the New File prompt for `dir`.
+    fn begin_new_file(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_tree_prompt(TreePromptKind::NewFile, dir, window, cx);
+    }
+
+    /// Opens the New Folder prompt for `dir`.
+    fn begin_new_folder(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_tree_prompt(TreePromptKind::NewFolder, dir, window, cx);
+    }
+
+    /// Opens the Rename prompt prefilled with the file's current name.
+    fn begin_rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_tree_prompt(TreePromptKind::Rename, path, window, cx);
+    }
+
+    fn open_tree_prompt(&mut self, kind: TreePromptKind, target: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tree_prompt.is_some() || self.tree_confirm.is_some() {
+            return;
+        }
+        let input = cx.new(|cx| InputState::new(window, cx));
+        // Rename prefills the current name (typing replaces it).
+        if matches!(kind, TreePromptKind::Rename) {
+            let name = target.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            input.update(cx, |state, cx| state.set_value(name, window, cx));
+        }
+        self.tree_prompt = Some(TreePrompt { kind, target, input: input.clone() });
+        self.tree_prompt_sub = Some(cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                this.tree_prompt_confirm(window, cx);
+            }
+        }));
+        self.tree_prompt_focus_pending.set(true);
+        cx.notify();
+    }
+
+    /// Closes the prompt without a mutation (Esc or the ✕).
+    fn close_tree_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tree_prompt.take().is_none() {
+            return;
+        }
+        self.tree_prompt_sub.take();
+        self.restore_focus(window, cx);
+        cx.notify();
+    }
+
+    /// Enter in the tree prompt: run the ide-vfs mutation on the background
+    /// executor. Creation answers through `FsCreated` (a file opens in a
+    /// tab); rename saves the dirty buffer first, detaches its tab without
+    /// touching the ⌘⇧T stack, and `FsRenamed` reopens the new path.
+    fn tree_prompt_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = self.tree_prompt.take() else { return };
+        self.tree_prompt_sub.take();
+        self.restore_focus(window, cx);
+        let name = prompt.input.read(cx).value().trim().to_string();
+        let Some(host) = self.host.clone() else { return };
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            cx.notify();
+            return;
+        }
+        let bus = self.bus.clone();
+        match prompt.kind {
+            TreePromptKind::NewFile => {
+                let path = prompt.target.join(&name);
+                cx.background_executor()
+                    .spawn(async move {
+                        let error = host.create_file(&path).err().map(|e| e.message);
+                        bus.send(BusMessage::FsCreated { path, is_dir: false, error });
+                    })
+                    .detach();
+            }
+            TreePromptKind::NewFolder => {
+                let path = prompt.target.join(&name);
+                cx.background_executor()
+                    .spawn(async move {
+                        let error = host.create_dir(&path).err().map(|e| e.message);
+                        bus.send(BusMessage::FsCreated { path, is_dir: true, error });
+                    })
+                    .detach();
+            }
+            TreePromptKind::Rename => {
+                let to = prompt.target.parent().map(|dir| dir.join(&name)).unwrap_or_else(|| prompt.target.clone());
+                if to == prompt.target {
+                    cx.notify();
+                    return;
+                }
+                // A dirty buffer is saved first: after the rename the tab
+                // reopens from the new path with everything the user typed.
+                if let Some(index) = self.tabs.iter().position(|tab| tab.path == prompt.target)
+                    && self.tabs[index].dirty
+                    && let Err(e) = host.save_document(self.tabs[index].doc)
+                {
+                    self.message = Some((
+                        NotifyLevel::Error,
+                        format!("{} {}: {}", strings::SAVE_FAILED, file_name(&prompt.target), e.message),
+                    ));
+                    cx.notify();
+                    return;
+                }
+                self.detach_tab_at(&prompt.target, cx);
+                let (from, host2) = (prompt.target.clone(), host.clone());
+                cx.background_executor()
+                    .spawn(async move {
+                        let error = host2.rename(&from, &to).err().map(|e| e.message);
+                        bus.send(BusMessage::FsRenamed { from, to, error });
+                    })
+                    .detach();
+            }
+        }
+        cx.notify();
+    }
+
+    /// Detaches the tab of `path` (no ⌘⇧T entry): the rename and delete
+    /// flows' tab half. `close_tab` is the ⌘W face; this is the model half.
+    fn detach_tab_at(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(index) = self.tabs.iter().position(|tab| tab.path == path) else { return };
+        let tab = self.tabs.remove(index);
+        if let Some(host) = &self.host {
+            host.close_document(tab.doc);
+        }
+        self.active = match self.tabs.len() {
+            0 => None,
+            len => Some(self.active.map_or(len - 1, |active| active.min(len - 1))),
+        };
+        cx.notify();
+    }
+
+    /// Closes every tab under `path` (a deleted or renamed directory's
+    /// affected files), without ⌘⇧T entries.
+    fn detach_tabs_under(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let affected: Vec<PathBuf> =
+            self.tabs.iter().map(|tab| tab.path.clone()).filter(|p| p.starts_with(path)).collect();
+        for p in affected {
+            self.detach_tab_at(&p, cx);
+        }
+    }
+
+    /// Opens the delete confirmation for a row.
+    fn begin_delete(&mut self, path: PathBuf, is_dir: bool, cx: &mut Context<Self>) {
+        if self.tree_prompt.is_some() || self.tree_confirm.is_some() {
+            return;
+        }
+        self.tree_confirm = Some(TreeConfirm { is_dir, name: file_name(&path), path });
+        cx.notify();
+    }
+
+    fn close_tree_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tree_confirm.take().is_none() {
+            return;
+        }
+        self.restore_focus(window, cx);
+        cx.notify();
+    }
+
+    /// The dialog's Delete button: close affected tabs, then move the path
+    /// to the OS trash on the background executor (`FsDeleted` lands after).
+    fn tree_confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(confirm) = self.tree_confirm.take() else { return };
+        self.restore_focus(window, cx);
+        let Some(host) = self.host.clone() else { return };
+        self.detach_tabs_under(&confirm.path, cx);
+        let bus = self.bus.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let error = host.delete(&confirm.path).err().map(|e| e.message);
+                bus.send(BusMessage::FsDeleted { error });
+            })
+            .detach();
+        cx.notify();
+    }
+}
+
+/// The display-quoted name the dialogs show.
+fn quoted(name: &str) -> String {
+    format!("“{name}”")
 }
 
 fn file_name(path: &Path) -> String {
@@ -1765,6 +2034,12 @@ impl Render for Workbench {
         if self.tree_focus_pending.replace(false) {
             self.restore_focus(window, cx);
         }
+        // The tree prompt (context menu) takes the focus once rendered.
+        if self.tree_prompt_focus_pending.replace(false)
+            && let Some(prompt) = &self.tree_prompt
+        {
+            window.focus(&prompt.input.read(cx).presentation().focus_handle().clone(), cx);
+        }
         // The diff overlay opens from the bus (no window there); take the
         // focus on the next render so Esc lands on its Cancel handler.
         if self.diff_focus_pending.replace(false) {
@@ -1832,6 +2107,8 @@ impl Render for Workbench {
             .children(self.render_picker(cx))
             .children(self.render_diff(cx))
             .children(self.render_commit(cx))
+            .children(self.render_tree_prompt(cx))
+            .children(self.render_tree_confirm(cx))
     }
 }
 
@@ -1953,6 +2230,14 @@ impl Workbench {
                             // A changed file's name carries its git kind's color.
                             let git_color =
                                 self.git_status.get(&row.path).and_then(|kind| theme::git_status_color(*kind));
+                            // The row's context menu (M7): new file / folder
+                            // target the row's directory, rename / delete
+                            // the row itself (the root row hides the latter
+                            // two). All IO goes through ide-vfs (Host).
+                            let is_root = self.host.as_ref().is_some_and(|host| row.path == host.root);
+                            let workbench = cx.entity().downgrade();
+                            let row_path = row.path.clone();
+                            let is_dir = row.kind == EntryKind::Dir;
                             div()
                                 .id(("tree-row", index))
                                 .h(px(24.0))
@@ -1970,12 +2255,58 @@ impl Workbench {
                                         this.on_tree_row(path.clone(), kind, event, window, cx)
                                     }
                                 }))
+                                .context_menu(move |menu, _, _| {
+                                    let menu = menu
+                                        .item(PopupMenuItem::new(strings::TREE_NEW_FILE).on_click({
+                                            let workbench = workbench.clone();
+                                            let dir = Workbench::target_dir(&row_path, is_dir);
+                                            move |_, window, cx| {
+                                                workbench
+                                                    .update(cx, |this, cx| this.begin_new_file(dir.clone(), window, cx))
+                                                    .ok();
+                                            }
+                                        }))
+                                        .item(PopupMenuItem::new(strings::TREE_NEW_FOLDER).on_click({
+                                            let workbench = workbench.clone();
+                                            let dir = Workbench::target_dir(&row_path, is_dir);
+                                            move |_, window, cx| {
+                                                workbench
+                                                    .update(cx, |this, cx| {
+                                                        this.begin_new_folder(dir.clone(), window, cx)
+                                                    })
+                                                    .ok();
+                                            }
+                                        }));
+                                    if is_root {
+                                        return menu;
+                                    }
+                                    menu.separator()
+                                        .item(PopupMenuItem::new(strings::TREE_RENAME).on_click({
+                                            let workbench = workbench.clone();
+                                            let path = row_path.clone();
+                                            move |_, window, cx| {
+                                                workbench
+                                                    .update(cx, |this, cx| this.begin_rename(path.clone(), window, cx))
+                                                    .ok();
+                                            }
+                                        }))
+                                        .item(PopupMenuItem::new(strings::TREE_DELETE).on_click({
+                                            let workbench = workbench.clone();
+                                            let path = row_path.clone();
+                                            move |_, _, cx| {
+                                                workbench
+                                                    .update(cx, |this, cx| this.begin_delete(path.clone(), is_dir, cx))
+                                                    .ok();
+                                            }
+                                        }))
+                                })
                                 .child(row_icon(&row))
                                 .child(
                                     div()
                                         .when_some(git_color, |name, color| name.text_color(color))
                                         .child(SharedString::from(row.name)),
                                 )
+                                .into_any_element()
                         }),
                     ),
                 )
@@ -2723,6 +3054,178 @@ impl Workbench {
     }
 }
 
+// -- tree prompt + delete confirmation (M7 context-menu mutations) -------------
+
+impl Workbench {
+    /// The one-line prompt over a New File / New Folder / Rename context
+    /// action. Enter confirms (through ide-vfs), Esc cancels.
+    fn render_tree_prompt(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let prompt = self.tree_prompt.as_ref()?;
+        let title = match prompt.kind {
+            TreePromptKind::NewFile => strings::TREE_NEW_FILE,
+            TreePromptKind::NewFolder => strings::TREE_NEW_FOLDER,
+            TreePromptKind::Rename => strings::TREE_RENAME,
+        };
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::black().opacity(0.35))
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close_tree_prompt(window, cx)))
+                .child(
+                    div()
+                        .w(px(420.0))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(theme::border())
+                        .rounded(px(6.0))
+                        .bg(theme::raised_bg())
+                        .key_context("TreePrompt")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            |_: &gpui::MouseDownEvent, _: &mut Window, cx: &mut gpui::App| cx.stop_propagation(),
+                        )
+                        .on_action(cx.listener(|this, _: &Cancel, window, cx| this.close_tree_prompt(window, cx)))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .h_8()
+                                .border_b_1()
+                                .border_color(theme::border())
+                                .text_size(px(12.))
+                                .child(
+                                    div()
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme::fg())
+                                        .child(SharedString::from(title)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_color(theme::fg_muted())
+                                        .child(SharedString::from(prompt.target.display().to_string())),
+                                ),
+                        )
+                        .child(div().px_2().py_2().child(Input::new(&prompt.input)))
+                        .child(
+                            div()
+                                .px_3()
+                                .pb_2()
+                                .text_size(px(11.))
+                                .text_color(theme::fg_muted())
+                                .child(SharedString::from(strings::PROMPT_CONFIRM_HINT)),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The delete confirmation: says what moves to the trash; a dirty open
+    /// buffer's unsaved edits go with it (the dialog is the confirmation).
+    fn render_tree_confirm(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let confirm = self.tree_confirm.as_ref()?;
+        let message = if confirm.is_dir {
+            format!("{} {} {}", strings::DELETE_FOLDER_MESSAGE, quoted(&confirm.name), strings::DELETE_AND_CONTENTS)
+        } else {
+            format!("{} {}?", strings::DELETE_FILE_MESSAGE, quoted(&confirm.name))
+        };
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::black().opacity(0.35))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.close_tree_confirm(window, cx)),
+                )
+                .child(
+                    div()
+                        .w(px(420.0))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(theme::border())
+                        .rounded(px(6.0))
+                        .bg(theme::raised_bg())
+                        .key_context("TreeConfirm")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            |_: &gpui::MouseDownEvent, _: &mut Window, cx: &mut gpui::App| cx.stop_propagation(),
+                        )
+                        .on_action(cx.listener(|this, _: &Cancel, window, cx| this.close_tree_confirm(window, cx)))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .h_8()
+                                .border_b_1()
+                                .border_color(theme::border())
+                                .text_size(px(12.))
+                                .child(
+                                    div()
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme::fg())
+                                        .child(SharedString::from(strings::DELETE_TITLE)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .text_size(px(12.))
+                                .text_color(theme::fg())
+                                .child(SharedString::from(message)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .py_2()
+                                .border_t_1()
+                                .border_color(theme::border())
+                                .child(
+                                    Button::new("tree-confirm-cancel")
+                                        .label(strings::CANCEL)
+                                        .xsmall()
+                                        .ghost()
+                                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                            this.close_tree_confirm(window, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("tree-confirm-delete")
+                                        .label(strings::DELETE_BUTTON)
+                                        .xsmall()
+                                        .secondary()
+                                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                            this.tree_confirm_delete(window, cx)
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
 fn row_icon(row: &Row) -> gpui::AnyElement {
     match row.kind {
         EntryKind::Dir => {
@@ -2749,5 +3252,13 @@ mod closed_tab_tests {
         push_closed(&mut stack, PathBuf::from("/tmp/m7-tab-0"));
         assert_eq!(stack[0], PathBuf::from("/tmp/m7-tab-0"));
         assert_eq!(stack.len(), CLOSED_TAB_CAP);
+    }
+
+    #[test]
+    fn tree_prompt_targets_the_rows_directory() {
+        // A directory row receives the new entry itself; a file row's parent
+        // does. A parentless row falls back to its own (relative) path.
+        assert_eq!(Workbench::target_dir(Path::new("/p/internal"), true), PathBuf::from("/p/internal"));
+        assert_eq!(Workbench::target_dir(Path::new("/p/internal/store.go"), false), PathBuf::from("/p/internal"));
     }
 }
