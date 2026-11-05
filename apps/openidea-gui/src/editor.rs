@@ -2617,8 +2617,18 @@ impl EditorPane {
     /// the marked range) or inserts at the primary cursor.
     fn ime_commit(&mut self, range_utf16: Option<Range<usize>>, text: &str, cx: &mut gpui::Context<Self>) {
         self.hud.note_input();
-        let caret = self.selections.first().map_or(0, |s| s.head);
-        let base = range_utf16.clone().or_else(|| self.buf.marked.clone()).unwrap_or(caret..caret);
+        // The commit replaces what the pane holds selected. An empty IME
+        // range (plain `insertText`, macOS commits per character) with no
+        // marked text means the primary selection is the composed range —
+        // falling back to a bare caret here made a template stop's selected
+        // occurrence keep its default text while the commit appended after
+        // it (found driving the M5 exit loop).
+        let base = range_utf16.clone().or_else(|| self.buf.marked.clone()).unwrap_or_else(|| {
+            self.selections.first().map_or(0..0, |s| {
+                let (start, end) = s.normalized();
+                start..end
+            })
+        });
         self.buf.marked = None;
         // A live template's active stop: the commit mirrors to every linked
         // occurrence (the other cursors froze during composition).
