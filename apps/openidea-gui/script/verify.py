@@ -33,7 +33,9 @@ APP_TITLE = "OpenIDEA"
 # Keycodes (macOS virtual keys) for everything we post.
 KEY = {
     "f12": 111,
+    "f6": 97,
     "v": 9,
+    "z": 6,
     "f": 3,
     "o": 31,
     "w": 13,
@@ -52,6 +54,7 @@ KEY = {
     "right": 124,
     "left": 123,
     "cmd_down": 125,
+    "cmd_up": 126,
     "period": 47,
     "comma": 43,
     "backspace": 51,
@@ -97,10 +100,13 @@ class Session:
             env["OPENIDEA_GUI_OPEN"] = self.open_file
         env.pop("OPENIDEA_GUI_TEST_PANIC", None)
         env.update(self.extra_env)
-        # A scripted session's store starts clean; its transcript is this
-        # run's only (truncate, never append — the samplers parse it whole).
+        # A scripted session's own store starts clean (truncate, never
+        # append — the samplers parse it whole). A store handed in through
+        # extra_env (the session-restore and crash-toast legs) is SHARED —
+        # wiping it would erase the state those legs exist to read.
         store = Path(env["OPENIDEA_GUI_SETTINGS_DIR"])
-        if store.exists():
+        owns_store = store == Path(self.outdir) / f"{self.name}-settings"
+        if owns_store and store.exists():
             for f in store.iterdir():
                 f.unlink()
         self._transcript = open(self.transcript_path, "wb", buffering=0)
@@ -400,13 +406,15 @@ def run_smoke(binary, project, open_file, outdir, name):
         s.start(wait_markers=("first paint",), timeout=120)
         time.sleep(2.0)
 
-        def capture(state, marker, keys=(), paste_text=None, settle=1.0):
-            if marker:
-                s.wait_transcript(re.escape(marker), timeout=30)
+        def capture(state, marker, keys=(), paste_text=None, settle=1.0, keys_after=()):
             for k, flags in keys:
                 s.post_key(k, flags)
             if paste_text:
                 s.paste(paste_text)
+            for k, flags in keys_after:
+                s.post_key(k, flags)
+            if marker:
+                s.wait_transcript(re.escape(marker), timeout=30)
             time.sleep(settle)
             ok = s.screenshot(s.outdir / f"{name}-{state}.png")
             states.append({"state": state, "shot": ok})
@@ -414,7 +422,7 @@ def run_smoke(binary, project, open_file, outdir, name):
 
         capture("01-opened", None)
         capture("02-hud", None, keys=[("f12", 0)])
-        capture("03-find-bar", "searching", keys=[("f", FLAG_CMD)], paste_text="Render")
+        capture("03-find-in-files", "searching", keys=[("f", FLAG_SHIFT | FLAG_CMD)], paste_text="Render", keys_after=[("enter", 0)])
         s.post_key("escape")  # find bar closed, editor focused
         time.sleep(0.4)
         capture("04-settings", None, keys=[("comma", FLAG_CMD)])

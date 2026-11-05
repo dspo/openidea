@@ -226,7 +226,7 @@ fn main() {
                 // The persisted settings (recents, layout, font size) load once;
                 // the workbench owns the value and saves on change. The editor
                 // font size feeds the theme before any view renders.
-                let app_settings = settings::load();
+                let mut app_settings = settings::load();
                 theme::set_font_size(app_settings.font_size);
                 // The manager must be constructed inside the runtime's context so
                 // it captures this handle for its background tasks.
@@ -246,6 +246,15 @@ fn main() {
                         }
                     })
                 };
+                // The startup-opened project lands in the recents too (M8):
+                // only the folder-picker flow pushed a recent, so a project
+                // reached through the env or the cwd fallback never appeared
+                // in ⌘O's list — and the bare relaunch (which picks from the
+                // recents, then restores the session) had nothing to pick.
+                if let Some(root) = &host {
+                    settings::push_recent(&mut app_settings.recent_projects, &root.root);
+                    settings::save(&app_settings);
+                }
                 let workbench = cx.new(|cx| Workbench::new(host.clone(), bus.clone(), app_settings, cx));
                 // The Quit action persists the session (tabs + carets) on the
                 // graceful path (M8); registered here so it can reach the
