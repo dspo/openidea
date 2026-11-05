@@ -2906,8 +2906,14 @@ impl EditorPane {
             eprintln!("[key] passthrough while composing: {}", ks.key);
             return;
         }
-        if self.rename.is_some() {
-            return; // the rename flow is modal; typing belongs to its input
+        if self.rename.is_some() || self.find_bar.is_some() {
+            // A modal input (rename, the find bar's query) owns typing. The
+            // input handles most keys, but the ones it handles-and-propagates
+            // (Enter on a single line) land here with the pane's selections
+            // still set — find navigation even parks them on a match range —
+            // and typing then rewrote the buffer at the match (found driving
+            // the M5 exit loop).
+            return;
         }
         if ks.modifiers.platform || ks.modifiers.alt || ks.modifiers.control {
             return;

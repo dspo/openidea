@@ -203,11 +203,20 @@ fn resolve(captures: Vec<(Range<usize>, Kind)>, len: usize) -> Vec<(Range<usize>
 /// — only called when a source lands, never per frame.
 pub fn overlay(base: &[(Range<usize>, Kind)], extra: &[(Range<usize>, Kind)], len: usize) -> Vec<(Range<usize>, Kind)> {
     let mut painted: Vec<Option<Kind>> = vec![None; len];
+    // A span past the grid is a desync (stale answer racing an edit batch):
+    // clamp/drop instead of panicking the render loop.
+    let fill = |painted: &mut Vec<Option<Kind>>, range: &Range<usize>, kind: Kind| {
+        let start = range.start.min(len);
+        let end = range.end.min(len);
+        if start < end {
+            painted[start..end].fill(Some(kind));
+        }
+    };
     for (range, kind) in base {
-        painted[range.clone()].fill(Some(*kind));
+        fill(&mut painted, range, *kind);
     }
     for (range, kind) in extra {
-        painted[range.clone()].fill(Some(*kind));
+        fill(&mut painted, range, *kind);
     }
     let mut out: Vec<(Range<usize>, Kind)> = Vec::new();
     let mut i = 0;
@@ -327,6 +336,16 @@ const RUST_HIGHLIGHTS: &str = r#"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_clamps_spans_past_the_grid() {
+        let base = vec![(0..3, Kind::Keyword)];
+        let extra = vec![(2..5, Kind::String), (10..13, Kind::Comment)];
+        // len 4: the 2..5 span clamps, the 10..13 span drops — no panic.
+        let got = overlay(&base, &extra, 4);
+        // The clamped extra span wins where it overlaps the base one.
+        assert_eq!(got, vec![(0..2, Kind::Keyword), (2..4, Kind::String)]);
+    }
 
     fn rust() -> Arc<Highlighter> {
         Highlighter::for_language(&LanguageId::new("rust")).expect("rust grammar + query")
