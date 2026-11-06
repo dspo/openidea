@@ -20,8 +20,10 @@ UI 与习惯一致性。** 本期聚焦：①IDEA 习惯面（键位/菜单/工�
    （gopls semanticTokens / inlay hints 开关）。**M9 将把 go.toml 两行回迁 app 侧**
    （LSP server options 覆盖层），恢复 `languages/` 与上游零 diff。
 3. **上游同步是周期性工作**：fork 基点已落后 upstream/main（ide-vcs log/history、
-   ide-lsp、ide-workspace 等大改）。**每里程碑 phase 0 = 同步 upstream/main**；
-   首次同步（M9 phase 0）工作量最大。同步冲突与修复一律发生在 app 侧。
+   ide-lsp、ide-workspace 等大改）。**每里程碑 phase 0 = rebase onto
+   upstream/main（禁止 merge commit）**；首次同步（M9 phase 0）工作量最大。
+   同步冲突与修复一律发生在 app 侧，rebase 后以「树不变证明」收尾（rebase 前
+   后树 diff 恰为新上游增量，fork 侧内容零变化）。
 4. **防腐层（adapter）纪律**：UI 代码不得散点 `use ide_*`——后端访问统一经 app 内
    `host.rs`/service 层收敛，上游 API 变动的波及面集中到一处文件集。
 5. 后端改动默认禁止；此前计划中「related-information 需改 ide-core/ide-lsp」一项
