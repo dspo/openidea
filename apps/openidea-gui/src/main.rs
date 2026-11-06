@@ -23,6 +23,8 @@ mod keymap_data;
 mod markdown;
 mod navigation;
 mod perf;
+mod reconcile;
+mod reconcile_data;
 mod run_panel;
 mod semantic;
 mod settings;

@@ -161,6 +161,7 @@ pub static BINDINGS: &[Binding] = &[
     binding!("ctrl-tab", "workbench::Switcher", None, Some("navigate.switcher")),
     binding!("ctrl-shift-tab", "workbench::SwitcherBack", None, Some("navigate.switcherBack")),
     binding!("cmd-l", "workbench::GotoLine", None, Some("navigate.gotoLine")),
+    binding!("shift-cmd-a", "workbench::FindAction", None, Some("navigate.findAction")),
     binding!("shift-cmd-backspace", "workbench::LastEditLocation", None, Some("navigate.lastEditLocation")),
     binding!("alt-cmd-b", "editor::GotoImplementation", Some("Editor"), Some("navigate.implementation")),
     binding!("shift-cmd-b", "editor::GotoTypeDeclaration", Some("Editor"), Some("navigate.typeDeclaration")),

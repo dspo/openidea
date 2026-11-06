@@ -45,6 +45,7 @@ actions!(
         SwitcherPrev,
         GotoLine,
         LastEditLocation,
+        FindAction,
     ]
 );
 
@@ -158,6 +159,7 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("editor::GotoDefinition", "Go to Definition", "Navigate", "⌘B"),
     action_info!("workbench::GoToFile", "Go to File", "Navigate", "⇧⌘O"),
     action_info!("workbench::GotoLine", "Go to Line:Column…", "Navigate", "⌘L"),
+    action_info!("workbench::FindAction", "Find Action…", "Navigate", "⌘⇧A"),
     action_info!("workbench::RecentFiles", "Recent Files", "Navigate", "⌘E"),
     action_info!("workbench::RecentLocations", "Recent Locations", "Navigate", "⌘⇧E"),
     action_info!("workbench::NavigateBack", "Back", "Navigate", "⌘["),
