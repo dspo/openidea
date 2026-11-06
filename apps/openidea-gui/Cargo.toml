@@ -29,7 +29,11 @@ gpui = { package = "gpui-pre", version = "=0.3.9" }
 # runtime_shaders compiles the Metal shaders at first launch instead of
 # offline in the build script — the same feature set manox-app runs, and it
 # avoids requiring the separately-downloadable Xcode Metal Toolchain here.
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["font-kit", "runtime_shaders"] }
+# wayland: the Linux windowing backend. Opt-in on gpui-pre-platform —
+# without it the Linux build silently starts the platform headless
+# (select_backend has no compiled-in branch and window creation never
+# happens). x11 is deliberately NOT enabled: Wayland only, by decision.
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["font-kit", "runtime_shaders", "wayland"] }
 # Workbench chrome primitives (TabBar/Tab, StatusBar, Root, IconName).
 gpui-component = { version = "=0.8.0" }
 # The SVG icon set IconName resolves to, registered as the app AssetSource.
