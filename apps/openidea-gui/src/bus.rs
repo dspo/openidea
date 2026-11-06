@@ -120,6 +120,14 @@ pub enum BusMessage {
     MenuOpened {
         menu: gpui::WeakEntity<gpui_component::menu::PopupMenu>,
     },
+    /// The editor's references answer landed (M10): the Find Usages window's
+    /// rows (the pane keeps its single-hit direct jump; multi-hit results
+    /// leave the old in-pane jump list for the tool window).
+    UsagesFound {
+        path: PathBuf,
+        symbol: String,
+        locations: Vec<ide_core::Location>,
+    },
 }
 
 /// The UI end of the event bus. Cheap to clone; `send` never blocks

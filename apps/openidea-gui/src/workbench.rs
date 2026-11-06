@@ -21,14 +21,17 @@ use gpui_component::WindowExt as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
-use gpui_component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
 use gpui_component::status_bar::StatusBar;
 use gpui_component::tab::{Tab as ComponentTab, TabBar};
-use gpui_component::{Icon, IconName, Selectable as _, Sizable as _};
+use gpui_component::{Icon, Selectable as _, Sizable as _};
+// The full Lucide catalog: the legacy gpui_component subset misses the
+// tool-window faces (stripe icons, ✕, the problem severities).
+use gpui_kit_assets::IconName;
 use ide_core::event::NotifyLevel;
 use ide_core::event::ServerStatus;
-use ide_core::{Diagnostic, DocId, IdeError, IdeEvent, OutlineItem, ServerId};
+use ide_core::{Diagnostic, DocId, IdeError, IdeEvent, OutlineItem, ServerId, Severity};
 use ide_index::{FileMatch, SymbolFilter, SymbolMatch};
 use ide_run::RunConfig;
 use ide_vcs::ChangeKind;
@@ -49,6 +52,7 @@ use crate::keymap;
 use crate::navigation;
 use crate::reconcile;
 use crate::run_panel::{RunPanel, stream_of};
+use crate::toolwindow::{self, Anchor, WindowDesc, WindowState};
 use crate::{ProjectHost, settings, strings, theme};
 
 /// The bottom dock's active page. Run pages are per-run tabs (M7): `Run(i)`
@@ -57,6 +61,10 @@ use crate::{ProjectHost, settings, strings, theme};
 enum DockPage {
     Run(usize),
     Find,
+    // M10 stripe pages: the aggregate diagnostics list, and the last
+    // references answer.
+    Problems,
+    Usages,
 }
 
 /// An active dock/tree drag (M7): which handle, where the press started, and
@@ -249,6 +257,16 @@ enum ToastClick {
 /// A toast's click handler face (`Notification::on_click`).
 type ToastHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut gpui::App)>;
 
+/// The Find Usages window's answer (M10): the references for one symbol of
+/// one file, routed here by the pane through the bus (the pane never holds
+/// a workbench handle).
+struct UsagesAnswer {
+    /// The file the queried symbol lives in.
+    source: PathBuf,
+    symbol: String,
+    locations: Vec<ide_core::Location>,
+}
+
 /// One queued toast: flushed to the window's notification stack at the next
 /// render (the bus pump has no window).
 struct Toast {
@@ -367,6 +385,14 @@ pub struct Workbench {
     /// Whether any live task exists (M8): its edges trace
     /// `[perf] indexing on/off` for the budget scenario's correlation.
     indexing: Cell<bool>,
+    /// The Structure window's outline (M10): the active file's flattened
+    /// LSP outline, refreshed on open / tab switch / save behind its own
+    /// generation guard (the picker's ⌘F12 popup keeps its own copy).
+    structure: Vec<(OutlineItem, usize)>,
+    structure_gen: u32,
+    /// The Find Usages window's content (M10): the last references answer
+    /// the active pane routed here through the bus.
+    usages: Option<UsagesAnswer>,
     /// The open floating context menu (M8): a right-click menu is
     /// element-scoped gpui-component state, invisible to the Esc chain —
     /// when anything steals its focus, Esc lands here as a bare Cancel and
@@ -382,6 +408,13 @@ pub struct Workbench {
 impl Workbench {
     pub fn new(host: Option<Arc<Host>>, bus: Bus, settings: settings::Settings, cx: &mut Context<Self>) -> Self {
         let bookmarks = navigation::Bookmarks::from_map(settings.bookmarks.clone());
+        // The M10 stripe model's view of the persisted layout: a visible tree
+        // with no recorded left window means Project is the raised one (the
+        // M7 files predate the left_active field).
+        let mut settings = settings;
+        if settings.layout.left_active.is_none() && settings.layout.tree_visible {
+            settings.layout.left_active = Some("project".to_owned());
+        }
         let mut tree = FileTree::new();
         if let Some(host) = &host
             && let Err(e) = tree.open(host)
@@ -438,6 +471,9 @@ impl Workbench {
             closed_tabs: Vec::new(),
             tasks: Vec::new(),
             indexing: Cell::new(false),
+            structure: Vec::new(),
+            structure_gen: 0,
+            usages: None,
             open_menu: None,
             menu_sub: None,
         }
@@ -623,6 +659,11 @@ impl Workbench {
         self.find_panel = None;
         self.dock_page = DockPage::Run(0);
         self.closed_tabs.clear();
+        // The usages answer belongs to the outgoing project; the Structure
+        // window refetches for the (initially) empty active tab.
+        self.usages = None;
+        self.structure.clear();
+        self.structure_gen += 1;
         if let Err(e) = self.tree.open(&host) {
             eprintln!("[workbench] tree open: {}", e.message);
         }
@@ -653,6 +694,11 @@ impl Workbench {
         // A save is an edit event the recent-locations list records (the
         // leaving-tab hook only fires on switches).
         self.record_edit_location(cx);
+        // The outline may have changed (new/renamed members) — the
+        // Structure window keeps up (generation-guarded fetch).
+        if self.structure_window_open() {
+            self.refresh_structure(cx);
+        }
         let (doc, path, name) = {
             let tab = &self.tabs[index];
             (tab.doc, tab.path.clone(), file_name(&tab.path))
@@ -750,7 +796,7 @@ impl Workbench {
     fn on_stop_run(&mut self, _: &StopRun, _window: &mut Window, cx: &mut Context<Self>) {
         let selected = match self.dock_page {
             DockPage::Run(index) => self.runs.get(index).cloned(),
-            DockPage::Find => None,
+            DockPage::Find | DockPage::Problems | DockPage::Usages => None,
         };
         let target = selected
             .filter(|panel| panel.read(cx).running())
@@ -765,48 +811,349 @@ impl Workbench {
         }
     }
 
-    /// ⌘1: shows/hides the project tree (the persisted layout follows).
-    /// Hiding hands the focus to a live surface (the root when no editor is
-    /// open), or ⌘1 itself would go dead with it.
+    /// ⌘1: shows/hides the project tool window (the stripe's toggle; the
+    /// persisted layout follows). Hiding hands the focus to a live surface
+    /// (the root when no editor is open), or ⌘1 itself would go dead with it.
     fn on_toggle_tree(&mut self, _: &acts::ToggleTree, window: &mut Window, cx: &mut Context<Self>) {
-        self.settings.layout.tree_visible = !self.settings.layout.tree_visible;
+        self.toggle_window("project", cx);
         if !self.settings.layout.tree_visible {
             self.restore_focus(window, cx);
         } else if self.active.is_none() {
             window.focus(&self.tree_focus, cx);
         }
-        settings::save(&self.settings);
-        cx.notify();
     }
 
-    /// ⌘4: shows/hides the bottom dock. Showing selects the last page the
-    /// dock had; with no panel ever created there is nothing to show (the M4
-    /// contract: the dock exists from the first run/search onward). Hiding
-    /// hands the focus to a live surface.
-    fn on_toggle_dock(&mut self, _: &acts::ToggleDock, window: &mut Window, cx: &mut Context<Self>) {
-        if self.runs.is_empty() && self.find_panel.is_none() {
+    /// ⌘4: the Run window's stripe toggle. Showing raises the dock with the
+    /// run page; a second press on the raised page hides the dock. With no
+    /// panel ever created there is nothing to show (the M4 contract: the
+    /// dock exists from the first run/search onward).
+    fn on_toggle_dock(&mut self, _: &acts::ToggleDock, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.runs.is_empty() && self.find_panel.is_none() && self.dock_page == DockPage::Run(0) {
             return;
         }
-        self.settings.layout.dock_visible = !self.settings.layout.dock_visible;
-        self.clamp_dock_page();
-        if !self.settings.layout.dock_visible {
-            self.restore_focus(window, cx);
+        self.toggle_window("run", cx);
+    }
+
+    /// Keeps `dock_page` pointing at a page that has content (run tabs can
+    /// close; Find/Usages live from their first use).
+    fn clamp_dock_page(&mut self) {
+        if let DockPage::Run(index) = self.dock_page
+            && index >= self.runs.len()
+        {
+            self.dock_page = DockPage::Run(self.runs.len().saturating_sub(1));
+        }
+        let page_live = match self.dock_page {
+            DockPage::Find => self.find_panel.is_some(),
+            DockPage::Usages => self.usages.is_some(),
+            DockPage::Problems | DockPage::Run(_) => true,
+        };
+        if !page_live {
+            self.dock_page = if self.find_panel.is_some() {
+                DockPage::Find
+            } else {
+                DockPage::Run(self.runs.len().saturating_sub(1))
+            };
+        }
+    }
+
+    // -- tool-window stripes (M10) ------------------------------------------------
+
+    /// The user state for one window: the sparse map plus the derived faces
+    /// (the project window's visibility IS `tree_visible`; a bottom window's
+    /// is the dock's page selection).
+    fn win_state(&self, desc: &WindowDesc) -> WindowState {
+        let mut state =
+            self.settings.layout.windows.get(desc.id).cloned().unwrap_or_else(|| WindowState::defaults(desc));
+        if desc.id == "project" {
+            state.visible = self.settings.layout.tree_visible;
+        } else if matches!(desc.id, "find" | "problems" | "usages" | "run") {
+            state.visible = self.settings.layout.dock_visible && self.dock_page == self.page_for(desc.id);
+        }
+        state
+    }
+
+    /// The pure-model view the stripe decisions read.
+    fn tw(&self) -> toolwindow::Layout<'_> {
+        toolwindow::Layout {
+            windows: &self.settings.layout.windows,
+            left_active: self.settings.layout.left_active.as_deref(),
+            maximized: self.settings.layout.maximized.as_deref(),
+        }
+    }
+
+    /// The dock page a bottom window owns ("run" resolves to the newest run
+    /// tab).
+    fn page_for(&self, id: &str) -> DockPage {
+        match id {
+            "problems" => DockPage::Problems,
+            "find" => DockPage::Find,
+            "usages" => DockPage::Usages,
+            _ => DockPage::Run(self.runs.len().saturating_sub(1)),
+        }
+    }
+
+    /// The window the dock's current page shows.
+    fn bottom_window_id(&self) -> Option<&'static str> {
+        match self.dock_page {
+            DockPage::Run(_) => Some("run"),
+            DockPage::Find => Some("find"),
+            DockPage::Problems => Some("problems"),
+            DockPage::Usages => Some("usages"),
+        }
+    }
+
+    /// Stores one window's state (the derived faces live in their own
+    /// fields, not the map) and persists.
+    fn set_win_state(&mut self, desc: &WindowDesc, state: WindowState, cx: &mut Context<Self>) {
+        let stored = match desc.id {
+            "project" | "find" | "problems" | "usages" | "run" => WindowState { visible: false, ..state },
+            _ => state,
+        };
+        self.settings.layout.windows.insert(desc.id.to_owned(), stored);
+        settings::save(&self.settings);
+        cx.notify();
+    }
+
+    /// The stripe/header/⌘digit toggle: activate raises and marks used; a
+    /// second press on the raised window hides it (IDEA's slot behavior).
+    fn toggle_window(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(desc) = toolwindow::window(id) else { return };
+        let state = self.win_state(desc);
+        let raised = match state.anchor_of(desc) {
+            Anchor::Left => state.visible && self.settings.layout.left_active.as_deref() == Some(desc.id),
+            Anchor::Right => state.visible && self.settings.layout.right_active.as_deref() == Some(desc.id),
+            Anchor::Bottom => self.settings.layout.dock_visible && self.dock_page == self.page_for(desc.id),
+        };
+        if raised {
+            self.hide_window(id, cx);
+        } else {
+            self.open_window(id, cx);
+        }
+    }
+
+    /// Opens (and raises) a tool window. One window up per side: opening
+    /// replaces the side's raised one.
+    fn open_window(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(desc) = toolwindow::window(id) else { return };
+        let mut state = self.win_state(desc);
+        state.visible = true;
+        state.used = true;
+        match state.anchor_of(desc) {
+            Anchor::Left => {
+                if let Some(prev) = self.settings.layout.left_active.clone().filter(|prev| prev != desc.id)
+                    && let Some(prev_desc) = toolwindow::window(&prev)
+                {
+                    let mut prev_state = self.win_state(prev_desc);
+                    prev_state.visible = false;
+                    self.settings.layout.windows.insert(prev_desc.id.to_owned(), prev_state);
+                }
+                self.settings.layout.left_active = Some(desc.id.to_owned());
+                if id == "project" {
+                    self.settings.layout.tree_visible = true;
+                }
+                if id == "structure" {
+                    self.refresh_structure(cx);
+                }
+            }
+            Anchor::Right => {
+                if let Some(prev) = self.settings.layout.right_active.clone().filter(|prev| prev != desc.id)
+                    && let Some(prev_desc) = toolwindow::window(&prev)
+                {
+                    let mut prev_state = self.win_state(prev_desc);
+                    prev_state.visible = false;
+                    self.settings.layout.windows.insert(prev_desc.id.to_owned(), prev_state);
+                }
+                self.settings.layout.right_active = Some(desc.id.to_owned());
+                if id == "structure" {
+                    self.refresh_structure(cx);
+                }
+            }
+            Anchor::Bottom => {
+                self.settings.layout.dock_visible = true;
+                self.dock_page = self.page_for(desc.id);
+                self.clamp_dock_page();
+            }
+        }
+        self.set_win_state(desc, state, cx);
+    }
+
+    /// Plain hide (⌘⇧digit, the header menu): the window closes but keeps
+    /// its stripe button.
+    fn hide_window(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(desc) = toolwindow::window(id) else { return };
+        let mut state = self.win_state(desc);
+        state.visible = false;
+        match state.anchor_of(desc) {
+            Anchor::Left => {
+                if id == "project" {
+                    self.settings.layout.tree_visible = false;
+                }
+                if self.settings.layout.left_active.as_deref() == Some(desc.id) {
+                    self.settings.layout.left_active = None;
+                }
+            }
+            Anchor::Right => {
+                if self.settings.layout.right_active.as_deref() == Some(desc.id) {
+                    self.settings.layout.right_active = None;
+                }
+            }
+            Anchor::Bottom => {
+                self.settings.layout.dock_visible = false;
+            }
+        }
+        self.set_win_state(desc, state, cx);
+    }
+
+    /// The header menu's Move to: re-anchor (persisted) and reopen there.
+    fn move_window(&mut self, id: &str, anchor: Anchor, cx: &mut Context<Self>) {
+        let Some(desc) = toolwindow::window(id) else { return };
+        let was_visible = self.win_state(desc).visible;
+        if was_visible {
+            self.hide_window(id, cx);
+        }
+        let mut state = self.win_state(desc);
+        state.anchor = Some(anchor);
+        self.set_win_state(desc, state, cx);
+        if was_visible {
+            self.open_window(id, cx);
+        }
+    }
+
+    /// ⇧⎋ (the preset's toolwindow.hideActive): the raised side window,
+    /// else the bottom dock.
+    fn hide_active_window(&mut self, cx: &mut Context<Self>) {
+        let raised = self.settings.layout.left_active.clone().or_else(|| self.settings.layout.right_active.clone());
+        if let Some(id) = raised {
+            self.hide_window(&id, cx);
+            return;
+        }
+        if self.settings.layout.dock_visible
+            && let Some(id) = self.bottom_window_id()
+        {
+            self.hide_window(id, cx);
+        }
+    }
+
+    /// ⌘⇧' (the preset's toolwindow.maximize): toggles the raised window's
+    /// maximized face; nothing raised → no-op.
+    fn toggle_maximized(&mut self, cx: &mut Context<Self>) {
+        if self.settings.layout.maximized.take().is_none() {
+            let target = self
+                .settings
+                .layout
+                .left_active
+                .clone()
+                .or_else(|| self.settings.layout.right_active.clone())
+                .or_else(|| self.bottom_window_id().map(str::to_owned));
+            self.settings.layout.maximized = target;
         }
         settings::save(&self.settings);
         cx.notify();
     }
 
-    /// Keeps `dock_page` pointing at an existing run tab (tabs can close).
-    fn clamp_dock_page(&mut self) {
-        if let DockPage::Run(index) = self.dock_page {
-            if self.runs.is_empty() {
-                self.dock_page = if self.find_panel.is_some() { DockPage::Find } else { DockPage::Run(0) };
-            } else if index >= self.runs.len() {
-                self.dock_page = DockPage::Run(self.runs.len() - 1);
+    /// The Structure window's data: the active file's outline, fetched like
+    /// the picker's ⌘F12 but into the window's own cache, behind its own
+    /// generation guard (a tab switch while in flight drops the old answer).
+    fn refresh_structure(&mut self, cx: &mut Context<Self>) {
+        self.structure_gen += 1;
+        let generation = self.structure_gen;
+        let Some(host) = self.host.clone() else { return };
+        let Some(tab) = self.active_tab() else {
+            self.structure.clear();
+            cx.notify();
+            return;
+        };
+        let (doc, runtime, lsp) = (tab.doc, host.runtime.clone(), host.lsp.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        runtime.spawn(async move {
+            let _ = tx.send(lsp.document_symbols(doc).await);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.await
+                && let Ok(symbols) = result
+            {
+                this.update(cx, |workbench, cx| {
+                    if workbench.structure_gen != generation {
+                        return;
+                    }
+                    workbench.structure = flatten_outline(symbols.as_deref().unwrap_or(&[]), 0);
+                    cx.notify();
+                })
+                .ok();
             }
-        } else if self.find_panel.is_none() {
-            self.dock_page = DockPage::Run(self.runs.len().saturating_sub(1));
+        })
+        .detach();
+    }
+
+    /// Every diagnostic across files, sorted by path then position — the
+    /// Problems window's rows and the badge count.
+    fn all_diagnostics(&self) -> Vec<(PathBuf, Diagnostic)> {
+        let mut rows: Vec<_> = self
+            .diagnostics
+            .iter()
+            .flat_map(|(path, by_source)| {
+                Self::merge_diagnostics(by_source).into_iter().map(move |d| (path.clone(), d))
+            })
+            .collect();
+        rows.sort_by(|(apath, a), (bpath, b)| {
+            apath
+                .cmp(bpath)
+                .then(a.range.start.line.cmp(&b.range.start.line))
+                .then(a.range.start.col.cmp(&b.range.start.col))
+        });
+        rows
+    }
+
+    /// Whether the Structure window is docked on either side right now.
+    fn structure_window_open(&self) -> bool {
+        ["left", "right"].into_iter().any(|side| {
+            let active = match side {
+                "left" => self.settings.layout.left_active.as_deref(),
+                _ => self.settings.layout.right_active.as_deref(),
+            };
+            active == Some("structure")
+        })
+    }
+
+    /// A removed bookmark persists (the window row's ✕).
+    fn remove_bookmark(&mut self, path: PathBuf, line: u32, cx: &mut Context<Self>) {
+        if !self.bookmarks.toggle(path, line) {
+            self.settings.bookmarks = self.bookmarks.to_map();
+            settings::save(&self.settings);
+            cx.notify();
         }
+    }
+
+    fn on_toggle_bookmarks(&mut self, _: &acts::ToggleBookmarks, _window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_window("bookmarks", cx);
+    }
+
+    fn on_toggle_find(&mut self, _: &acts::ToggleFind, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.find_panel.is_none() && self.runs.is_empty() {
+            return;
+        }
+        self.toggle_window("find", cx);
+    }
+
+    fn on_toggle_problems(&mut self, _: &acts::ToggleProblems, _window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_window("problems", cx);
+    }
+
+    fn on_toggle_structure(&mut self, _: &acts::ToggleStructure, _window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_window("structure", cx);
+    }
+
+    fn on_hide_active_tool_window(
+        &mut self,
+        _: &acts::HideActiveToolWindow,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.hide_active_window(cx);
+    }
+
+    fn on_maximize_tool_window(&mut self, _: &acts::MaximizeToolWindow, _window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_maximized(cx);
     }
 
     /// Hands the focus to the topmost live surface: the still-open overlays
@@ -850,10 +1197,15 @@ impl Workbench {
             self.find_panel = Some(cx.new(|cx| FindPanel::new(self.bus.clone(), window, cx)));
         }
         self.dock_page = DockPage::Find;
+        // First use earns the Find window its OnUse stripe button (M10).
+        let find_desc = toolwindow::window("find").expect("the find row exists");
+        let mut find_state = self.win_state(find_desc);
+        find_state.used = true;
+        self.settings.layout.windows.insert("find".to_owned(), find_state);
         if !self.settings.layout.dock_visible {
             self.settings.layout.dock_visible = true;
-            settings::save(&self.settings);
         }
+        settings::save(&self.settings);
         if let Some(panel) = &self.find_panel {
             window.focus(&panel.read(cx).query_focus(cx), cx);
         }
@@ -1068,6 +1420,26 @@ impl Workbench {
     fn on_root_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(idea_id) = self.chord.keystroke(&ev.keystroke, Instant::now()) {
             self.run_gesture(idea_id, window, cx);
+            return;
+        }
+        // ⌘⇧digit hides the slot's window (the app's plain-hide face; the
+        // preset's own slots are the ⌘digit toggles). The digit arrives as
+        // itself or as its shifted character depending on the platform
+        // report, so both faces map.
+        if ev.keystroke.modifiers.platform && ev.keystroke.modifiers.shift {
+            let digit = match ev.keystroke.key.as_str() {
+                "1" | "!" => Some(1),
+                "2" | "@" => Some(2),
+                "3" | "#" => Some(3),
+                "4" | "$" => Some(4),
+                "6" | "^" => Some(6),
+                "7" | "&" => Some(7),
+                "0" | ")" => Some(0),
+                _ => None,
+            };
+            if let Some(desc) = digit.and_then(|digit| self.tw().slot_window(digit)) {
+                self.hide_window(desc.id, cx);
+            }
         }
     }
 
@@ -1438,6 +1810,7 @@ impl Workbench {
             }
         }
         rows.push(PickerRow::Dock(DockPage::Find, "Find".to_owned()));
+        rows.push(PickerRow::Dock(DockPage::Problems, "Problems".to_owned()));
         for index in 0..self.runs.len() {
             rows.push(PickerRow::Dock(DockPage::Run(index), format!("Run {}", index + 1)));
         }
@@ -1865,7 +2238,7 @@ impl Workbench {
     fn run_status(&self, cx: &Context<Self>) -> Option<(String, gpui::Hsla)> {
         let selected = match self.dock_page {
             DockPage::Run(index) => self.runs.get(index),
-            DockPage::Find => None,
+            DockPage::Find | DockPage::Problems | DockPage::Usages => None,
         };
         let panel = selected
             .or_else(|| self.runs.iter().find(|panel| panel.read(cx).running()))
@@ -1885,6 +2258,9 @@ impl Workbench {
             0 => None,
             len => Some(self.active.map_or(len - 1, |active| active.min(len - 1))),
         };
+        if self.structure_window_open() {
+            self.refresh_structure(cx);
+        }
         self.save_session(cx);
         cx.notify();
     }
@@ -1957,6 +2333,11 @@ impl Workbench {
             self.active = Some(index);
             self.save_session(cx);
             self.tree.select(path.to_path_buf());
+            // The Structure window follows the active file (its fetch is
+            // generation-guarded, so a burst of switches keeps one answer).
+            if self.structure_window_open() {
+                self.refresh_structure(cx);
+            }
             cx.notify();
             return;
         }
@@ -2119,6 +2500,12 @@ impl Workbench {
             BusMessage::Ide(IdeEvent::Notify { level, title, .. }) => {
                 self.toast(level, title);
                 cx.notify();
+            }
+            BusMessage::UsagesFound { path, symbol, locations } => {
+                // The references answer becomes the Find Usages window's
+                // rows; the dock opens on its page (IDEA's ⌥F7 face).
+                self.usages = Some(UsagesAnswer { source: path, symbol, locations });
+                self.open_window("usages", cx);
             }
             BusMessage::OpenLocation { path, pos } => {
                 // The editor's cross-file jumps (goto / usages / rename
@@ -3150,6 +3537,12 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_commit))
             .on_action(cx.listener(Self::on_toggle_tree))
             .on_action(cx.listener(Self::on_toggle_dock))
+            .on_action(cx.listener(Self::on_toggle_bookmarks))
+            .on_action(cx.listener(Self::on_toggle_find))
+            .on_action(cx.listener(Self::on_toggle_problems))
+            .on_action(cx.listener(Self::on_toggle_structure))
+            .on_action(cx.listener(Self::on_hide_active_tool_window))
+            .on_action(cx.listener(Self::on_maximize_tool_window))
             .on_action(cx.listener(Self::on_reopen_closed_tab))
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_cancel))
@@ -3189,6 +3582,20 @@ impl Render for Workbench {
             .on_key_down(cx.listener(Self::on_root_key))
             .children(self.host.is_none().then(|| self.render_welcome(cx)))
             .when(self.host.is_some(), |shell| {
+                // Maximized window: it takes everything above the status
+                // bar (IDEA's Maximize Tool Window face).
+                let maximized = self.settings.layout.maximized.clone();
+                if let Some(id) = maximized.filter(|id| {
+                    toolwindow::window(id).is_some_and(|desc| {
+                        desc.lit && {
+                            let state = self.win_state(desc);
+                            state.visible
+                        }
+                    })
+                }) {
+                    return shell
+                        .child(div().flex_1().min_h_0().flex().flex_col().children(self.render_window_area(&id, cx)));
+                }
                 shell
                     .child(
                         div()
@@ -3196,13 +3603,21 @@ impl Render for Workbench {
                             .min_h_0()
                             .flex()
                             .flex_row()
-                            .children(self.render_tree(cx))
-                            .child(self.render_tree_handle(cx))
-                            .child(self.render_editor_area(cx)),
+                            // The left stripe + the left area (the active
+                            // left window), then editor, then the right
+                            // side's area + stripe.
+                            .children(self.render_stripe(Anchor::Left, cx))
+                            .children(self.render_side_area(Anchor::Left, cx))
+                            .children(self.render_side_handle(Anchor::Left, cx))
+                            .child(self.render_editor_area(cx))
+                            .children(self.render_side_handle(Anchor::Right, cx))
+                            .children(self.render_side_area(Anchor::Right, cx))
+                            .children(self.render_stripe(Anchor::Right, cx)),
                     )
-                    // The bottom dock: Run (M4) and Find in Files (M5) as pages —
-                    // the M4 single-panel look when only one exists.
-                    .children(self.render_dock(cx))
+                    // The bottom stripe (right-aligned buttons) and the
+                    // bottom dock area.
+                    .children(self.render_stripe(Anchor::Bottom, cx))
+                    .children(self.render_bottom_area(cx))
             })
             .child(self.render_status(cx))
             .children(self.render_picker(cx))
@@ -3292,138 +3707,620 @@ impl Workbench {
 }
 
 impl Workbench {
-    /// The left dock tree; `None` while hidden (⌘1 / persisted layout).
-    fn render_tree(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        if !self.settings.layout.tree_visible {
+    // -- tool-window stripe rendering (M10) -----------------------------------
+
+    /// One anchor's stripe: the icon buttons of its shown windows. Left and
+    /// right are vertical strips at the window edges; the bottom strip sits
+    /// right-aligned above the status bar (IDEA's habit). Badges: Problems
+    /// carries its error count, Commit the changed-file count.
+    fn render_stripe(&self, anchor: Anchor, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let buttons = self.tw().stripe_buttons(anchor);
+        if buttons.is_empty() {
             return None;
         }
-        let project =
-            self.host.as_ref().map(|host| host.name.clone()).unwrap_or_else(|| strings::NO_PROJECT.to_owned());
-        let rows = self.tree.rows();
-        let selected = self.tree.selected.clone();
+        let strip = div()
+            .flex()
+            .flex_none()
+            .when(anchor == Anchor::Bottom, |strip| {
+                strip
+                    .flex_row()
+                    .justify_end()
+                    .items_center()
+                    .h(px(30.0))
+                    .px_2()
+                    .gap_1()
+                    .border_t_1()
+                    .border_color(theme::border())
+            })
+            .when(anchor != Anchor::Bottom, |strip| {
+                strip
+                    .flex_col()
+                    .items_center()
+                    .w(px(36.0))
+                    .py_1()
+                    .gap_1()
+                    .when(anchor == Anchor::Left, |strip| strip.border_r_1().border_color(theme::border()))
+                    .when(anchor == Anchor::Right, |strip| strip.border_l_1().border_color(theme::border()))
+            })
+            .children(buttons.into_iter().map(|(desc, _)| {
+                let active = match anchor {
+                    Anchor::Left | Anchor::Right => self.tw().is_active(desc),
+                    Anchor::Bottom => self.settings.layout.dock_visible && self.dock_page == self.page_for(desc.id),
+                };
+                let badge = self.badge_for(desc.id);
+                div()
+                    .id(SharedString::from(format!("stripe-{}", desc.id)))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .w(px(28.0))
+                    .h(px(26.0))
+                    .rounded(px(4.0))
+                    .text_color(if active { theme::fg() } else { theme::fg_muted() })
+                    .when(active, |btn| btn.bg(theme::selected_bg()))
+                    .hover(|btn| btn.bg(theme::raised_bg()))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_window(desc.id, cx)))
+                    .child(Icon::new(desc.icon))
+                    .children(badge.map(|count| {
+                        div().text_size(px(9.0)).text_color(theme::fg_muted()).child(SharedString::from(count))
+                    }))
+                    .into_any_element()
+            }));
+        Some(strip.into_any_element())
+    }
 
+    /// The stripe badge text for one window (None = no badge).
+    fn badge_for(&self, id: &str) -> Option<String> {
+        match id {
+            "problems" => {
+                let count = self.all_diagnostics().iter().filter(|(_, d)| d.severity == Severity::Error).count();
+                (count > 0).then(|| count.to_string())
+            }
+            "commit" => {
+                let count = self.git_status.len();
+                (count > 0).then(|| count.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// A side's docked area: the active window of that side at the side's
+    /// persisted width (`None` when no window is up there).
+    fn render_side_area(&mut self, anchor: Anchor, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let id = match anchor {
+            Anchor::Left => self.settings.layout.left_active.clone()?,
+            Anchor::Right => self.settings.layout.right_active.clone()?,
+            Anchor::Bottom => return None,
+        };
+        let desc = toolwindow::window(&id)?;
+        if !self.win_state(desc).visible {
+            return None;
+        }
+        let body = self.render_window_body(desc, cx)?;
         Some(
             div()
                 .w(px(self.settings.layout.tree_width))
                 .flex_none()
+                .h_full()
                 .flex()
                 .flex_col()
-                .border_r_1()
-                .border_color(theme::border())
-                .track_focus(&self.tree_focus)
-                .on_key_down(cx.listener(Self::on_tree_key))
-                .child(
+                .when(anchor == Anchor::Left, |area| area.border_r_1().border_color(theme::border()))
+                .when(anchor == Anchor::Right, |area| area.border_l_1().border_color(theme::border()))
+                .child(self.render_window_shell(desc, cx, body))
+                .into_any_element(),
+        )
+    }
+
+    /// The 4 px drag handle on a side area's inner edge: arms the width drag
+    /// (the side width is the persisted `tree_width`, whatever window shows).
+    fn render_side_handle(&self, anchor: Anchor, cx: &Context<Self>) -> Option<gpui::AnyElement> {
+        let up = match anchor {
+            Anchor::Left => self.settings.layout.left_active.is_some(),
+            Anchor::Right => self.settings.layout.right_active.is_some(),
+            Anchor::Bottom => false,
+        };
+        if !up {
+            return None;
+        }
+        Some(self.render_tree_handle(cx))
+    }
+
+    /// One window docked full-area (the maximized face): shell + body.
+    fn render_window_area(&mut self, id: &str, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let desc = toolwindow::window(id)?;
+        if !self.win_state(desc).visible {
+            return None;
+        }
+        let body = self.render_window_body(desc, cx)?;
+        Some(self.render_window_shell(desc, cx, body))
+    }
+
+    /// The window shell: the IDEA-style header (icon + title + the ⋮ menu:
+    /// Move to / Maximize / Hide) over the body.
+    fn render_window_shell(
+        &self,
+        desc: &'static WindowDesc,
+        cx: &mut Context<Self>,
+        body: gpui::AnyElement,
+    ) -> gpui::AnyElement {
+        let workbench = cx.entity().downgrade();
+        let anchor = self.win_state(desc).anchor_of(desc);
+        let maximized = self.tw().maximized == Some(desc.id);
+        div()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h_8()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(px(12.))
+                    .text_color(theme::fg_muted())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme::fg())
+                            .child(Icon::new(desc.icon).text_color(theme::fg_muted()))
+                            .child(SharedString::from(desc.title)),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new(SharedString::from(format!("win-menu-{}", desc.id)))
+                            .icon(IconName::EllipsisVertical)
+                            .xsmall()
+                            .ghost()
+                            .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, window, cx| {
+                                let id = desc.id;
+                                // Window-specific entries would come first
+                                // (the Commit window adds its own in M10 ④).
+                                let move_menu = PopupMenu::build(window, cx, |sub, _, _| {
+                                    let mut sub = sub;
+                                    for (target, label) in [
+                                        (Anchor::Left, strings::TW_MOVE_LEFT),
+                                        (Anchor::Right, strings::TW_MOVE_RIGHT),
+                                        (Anchor::Bottom, strings::TW_MOVE_BOTTOM),
+                                    ] {
+                                        let wb = workbench.clone();
+                                        let checked = anchor == target;
+                                        sub = sub.item(PopupMenuItem::new(label).checked(checked).on_click(
+                                            move |_, _, cx| {
+                                                wb.update(cx, |this, cx| this.move_window(id, target, cx)).ok();
+                                            },
+                                        ));
+                                    }
+                                    sub
+                                });
+                                let wb = workbench.clone();
+                                menu.item(PopupMenuItem::submenu(strings::TW_MOVE_TO, move_menu))
+                                    .item(PopupMenuItem::new(strings::TW_MAXIMIZE).checked(maximized).on_click(
+                                        move |_, _, cx| {
+                                            wb.update(cx, |this, cx| this.toggle_maximized(cx)).ok();
+                                        },
+                                    ))
+                                    .separator()
+                                    .item({
+                                        let wb = workbench.clone();
+                                        PopupMenuItem::new(strings::TW_HIDE).on_click(move |_, _, cx| {
+                                            wb.update(cx, |this, cx| this.hide_window(id, cx)).ok();
+                                        })
+                                    })
+                            }),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().min_w_0().overflow_hidden().child(body))
+            .into_any_element()
+    }
+
+    /// One window's content (no shell). `None` for a window with nothing to
+    /// show yet (the dock area hides accordingly).
+    fn render_window_body(&mut self, desc: &'static WindowDesc, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        match desc.id {
+            "project" => Some(self.render_project_body(cx)),
+            "structure" => self.render_structure_body(cx),
+            "bookmarks" => Some(self.render_bookmarks_body(cx)),
+            "problems" => Some(self.render_problems_body(cx)),
+            "find" => Some(self.find_panel.clone()?.into_any_element()),
+            "usages" => self.render_usages_body(cx),
+            "run" => Some(self.render_run_body(cx)),
+            _ => None,
+        }
+    }
+
+    /// The Project window's body: the file tree rows (the shell's header
+    /// replaces the old name row; the status bar carries the project name).
+    fn render_project_body(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let rows = self.tree.rows();
+        let selected = self.tree.selected.clone();
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .track_focus(&self.tree_focus)
+            .on_key_down(cx.listener(Self::on_tree_key))
+            .child(div().id("tree-scroll").flex_1().min_h_0().overflow_y_scroll().py_1().text_size(px(13.)).children(
+                rows.into_iter().enumerate().map(|(index, row)| {
+                    let is_selected = selected.as_ref() == Some(&row.path);
+                    let indent = px(8.0 + 14.0 * row.depth as f32);
+                    // A changed file's name carries its git kind's color.
+                    let git_color = self.git_status.get(&row.path).and_then(|kind| theme::git_status_color(*kind));
+                    // The row's context menu (M7): new file / folder
+                    // target the row's directory, rename / delete
+                    // the row itself (the root row hides the latter
+                    // two). All IO goes through ide-vfs (Host).
+                    let is_root = self.host.as_ref().is_some_and(|host| row.path == host.root);
+                    let workbench = cx.entity().downgrade();
+                    let row_path = row.path.clone();
+                    let is_dir = row.kind == EntryKind::Dir;
                     div()
-                        .h_8()
-                        .px_2()
+                        .id(("tree-row", index))
+                        .h(px(24.0))
+                        .pr_2()
+                        .pl(indent)
                         .flex()
                         .items_center()
                         .gap_1()
-                        .text_size(px(12.))
-                        .text_color(theme::fg_muted())
-                        .child(SharedString::from(strings::TREE_HEADER))
-                        .child(div().font_weight(gpui::FontWeight::MEDIUM).text_color(theme::fg()).child(project)),
-                )
-                .child(
-                    div().id("tree-scroll").flex_1().min_h_0().overflow_y_scroll().py_1().text_size(px(13.)).children(
-                        rows.into_iter().enumerate().map(|(index, row)| {
-                            let is_selected = selected.as_ref() == Some(&row.path);
-                            let indent = px(8.0 + 14.0 * row.depth as f32);
-                            // A changed file's name carries its git kind's color.
-                            let git_color =
-                                self.git_status.get(&row.path).and_then(|kind| theme::git_status_color(*kind));
-                            // The row's context menu (M7): new file / folder
-                            // target the row's directory, rename / delete
-                            // the row itself (the root row hides the latter
-                            // two). All IO goes through ide-vfs (Host).
-                            let is_root = self.host.as_ref().is_some_and(|host| row.path == host.root);
-                            let workbench = cx.entity().downgrade();
-                            let row_path = row.path.clone();
-                            let is_dir = row.kind == EntryKind::Dir;
-                            div()
-                                .id(("tree-row", index))
-                                .h(px(24.0))
-                                .pr_2()
-                                .pl(indent)
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .when(is_selected, |this| this.bg(theme::selected_bg()))
-                                .hover(|this| this.bg(theme::raised_bg()))
-                                .on_click(cx.listener({
-                                    let path = row.path.clone();
-                                    let kind = row.kind;
-                                    move |this, event: &ClickEvent, window, cx| {
-                                        this.on_tree_row(path.clone(), kind, event, window, cx)
+                        .when(is_selected, |this| this.bg(theme::selected_bg()))
+                        .hover(|this| this.bg(theme::raised_bg()))
+                        .on_click(cx.listener({
+                            let path = row.path.clone();
+                            let kind = row.kind;
+                            move |this, event: &ClickEvent, window, cx| {
+                                this.on_tree_row(path.clone(), kind, event, window, cx)
+                            }
+                        }))
+                        .context_menu(move |menu, window, cx| {
+                            eprintln!(
+                                "[menu] tree build: focused_present={} menu_focus={:?}",
+                                window.focused(cx).is_some(),
+                                menu.focus_handle(cx)
+                            );
+                            // Track the menu for the Esc chain (M8): when
+                            // something steals its focus, Esc lands on the
+                            // workbench as a bare Cancel and dismisses it.
+                            let built = cx.entity();
+                            workbench.update(cx, |this, cx| this.menu_opened(built, cx)).ok();
+                            let menu = menu
+                                .item(PopupMenuItem::new(strings::TREE_NEW_FILE).on_click({
+                                    let workbench = workbench.clone();
+                                    let dir = Workbench::target_dir(&row_path, is_dir);
+                                    move |_, window, cx| {
+                                        workbench
+                                            .update(cx, |this, cx| this.begin_new_file(dir.clone(), window, cx))
+                                            .ok();
                                     }
                                 }))
-                                .context_menu(move |menu, window, cx| {
-                                    eprintln!(
-                                        "[menu] tree build: focused_present={} menu_focus={:?}",
-                                        window.focused(cx).is_some(),
-                                        menu.focus_handle(cx)
-                                    );
-                                    // Track the menu for the Esc chain (M8): when
-                                    // something steals its focus, Esc lands on the
-                                    // workbench as a bare Cancel and dismisses it.
-                                    let built = cx.entity();
-                                    workbench.update(cx, |this, cx| this.menu_opened(built, cx)).ok();
-                                    let menu = menu
-                                        .item(PopupMenuItem::new(strings::TREE_NEW_FILE).on_click({
-                                            let workbench = workbench.clone();
-                                            let dir = Workbench::target_dir(&row_path, is_dir);
-                                            move |_, window, cx| {
-                                                workbench
-                                                    .update(cx, |this, cx| this.begin_new_file(dir.clone(), window, cx))
-                                                    .ok();
-                                            }
-                                        }))
-                                        .item(PopupMenuItem::new(strings::TREE_NEW_FOLDER).on_click({
-                                            let workbench = workbench.clone();
-                                            let dir = Workbench::target_dir(&row_path, is_dir);
-                                            move |_, window, cx| {
-                                                workbench
-                                                    .update(cx, |this, cx| {
-                                                        this.begin_new_folder(dir.clone(), window, cx)
-                                                    })
-                                                    .ok();
-                                            }
-                                        }));
-                                    if is_root {
-                                        return menu;
+                                .item(PopupMenuItem::new(strings::TREE_NEW_FOLDER).on_click({
+                                    let workbench = workbench.clone();
+                                    let dir = Workbench::target_dir(&row_path, is_dir);
+                                    move |_, window, cx| {
+                                        workbench
+                                            .update(cx, |this, cx| this.begin_new_folder(dir.clone(), window, cx))
+                                            .ok();
                                     }
-                                    menu.separator()
-                                        .item(PopupMenuItem::new(strings::TREE_RENAME).on_click({
-                                            let workbench = workbench.clone();
-                                            let path = row_path.clone();
-                                            move |_, window, cx| {
-                                                workbench
-                                                    .update(cx, |this, cx| this.begin_rename(path.clone(), window, cx))
-                                                    .ok();
-                                            }
-                                        }))
-                                        .item(PopupMenuItem::new(strings::TREE_DELETE).on_click({
-                                            let workbench = workbench.clone();
-                                            let path = row_path.clone();
-                                            move |_, _, cx| {
-                                                workbench
-                                                    .update(cx, |this, cx| this.begin_delete(path.clone(), is_dir, cx))
-                                                    .ok();
-                                            }
-                                        }))
-                                })
-                                .child(row_icon(&row))
-                                .child(
-                                    div()
-                                        .when_some(git_color, |name, color| name.text_color(color))
-                                        .child(SharedString::from(row.name)),
-                                )
-                                .into_any_element()
-                        }),
-                    ),
-                )
+                                }));
+                            if is_root {
+                                return menu;
+                            }
+                            menu.separator()
+                                .item(PopupMenuItem::new(strings::TREE_RENAME).on_click({
+                                    let workbench = workbench.clone();
+                                    let path = row_path.clone();
+                                    move |_, window, cx| {
+                                        workbench
+                                            .update(cx, |this, cx| this.begin_rename(path.clone(), window, cx))
+                                            .ok();
+                                    }
+                                }))
+                                .item(PopupMenuItem::new(strings::TREE_DELETE).on_click({
+                                    let workbench = workbench.clone();
+                                    let path = row_path.clone();
+                                    move |_, _, cx| {
+                                        workbench
+                                            .update(cx, |this, cx| this.begin_delete(path.clone(), is_dir, cx))
+                                            .ok();
+                                    }
+                                }))
+                        })
+                        .child(row_icon(&row))
+                        .child(
+                            div()
+                                .when_some(git_color, |name, color| name.text_color(color))
+                                .child(SharedString::from(row.name)),
+                        )
+                        .into_any_element()
+                }),
+            ))
+            .into_any_element()
+    }
+
+    /// The Structure window's body: the active file's outline (the same
+    /// flattened LSP answer the ⌘F12 popup lists), clicks jump within the
+    /// active tab.
+    fn render_structure_body(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if self.structure.is_empty() {
+            return Some(self.render_window_placeholder(strings::TW_NO_STRUCTURE));
+        }
+        let rows: Vec<_> = self
+            .structure
+            .iter()
+            .map(|(item, depth)| {
+                let indent = px(8.0 + 12.0 * *depth as f32);
+                let line = item.selection_range.start.line;
+                let col = item.selection_range.start.col;
+                div()
+                    .id(SharedString::from(format!("structure-row-{}-{line}-{col}", item.name)))
+                    .h(px(24.0))
+                    .pr_2()
+                    .pl(indent)
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .hover(|this| this.bg(theme::raised_bg()))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.jump_active_to(line, col, cx);
+                        this.focus_active(window, cx);
+                    }))
+                    .child(div().truncate().text_color(theme::fg()).child(SharedString::from(item.name.clone())))
+                    .into_any_element()
+            })
+            .collect();
+        Some(
+            div()
+                .id("window-scroll-structure")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .children(rows)
                 .into_any_element(),
         )
+    }
+
+    /// The Bookmarks window's body: file groups of bookmarked lines; a click
+    /// jumps (through the navigation history), ✕ removes.
+    fn render_bookmarks_body(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.bookmarks.all().next().is_none() {
+            return self.render_window_placeholder(strings::TW_NO_BOOKMARKS);
+        }
+        let mut rows = Vec::new();
+        let mut current_path: Option<PathBuf> = None;
+        for (path, line) in self.bookmarks.all() {
+            let path = path.clone();
+            if current_path.as_ref() != Some(&path) {
+                current_path = Some(path.clone());
+                rows.push(
+                    div()
+                        .h(px(22.0))
+                        .px_2()
+                        .mt_1()
+                        .flex()
+                        .items_center()
+                        .text_size(px(11.0))
+                        .text_color(theme::fg_muted())
+                        .child(SharedString::from(file_name(&path)))
+                        .into_any_element(),
+                );
+            }
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("bookmark-row-{}-{line}", path.display())))
+                    .h(px(24.0))
+                    .pr_1()
+                    .pl(px(20.0))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .hover(|this| this.bg(theme::raised_bg()))
+                    .on_click(cx.listener({
+                        let jump_path = path.clone();
+                        move |this, _: &ClickEvent, window, cx| {
+                            this.jump_with_nav(navigation::Location::new(jump_path.clone(), line, 0), cx);
+                            this.focus_active(window, cx);
+                        }
+                    }))
+                    .child(div().text_color(theme::fg()).child(SharedString::from(format!("line {line}"))))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new(SharedString::from(format!("bookmark-remove-{}-{line}", path.display())))
+                            .icon(IconName::X)
+                            .xsmall()
+                            .ghost()
+                            .on_click(cx.listener({
+                                let remove_path = path.clone();
+                                move |this, _: &ClickEvent, _, cx| {
+                                    this.remove_bookmark(remove_path.clone(), line, cx);
+                                }
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        div().id("window-scroll-problems").flex_1().min_h_0().overflow_y_scroll().children(rows).into_any_element()
+    }
+
+    /// The Problems window's body: every diagnostic across files, sorted by
+    /// path then position; a click opens the file at the row.
+    fn render_problems_body(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let rows = self.all_diagnostics();
+        if rows.is_empty() {
+            return self.render_window_placeholder(strings::TW_NO_PROBLEMS);
+        }
+        let rows: Vec<_> = rows
+            .into_iter()
+            .map(|(path, d)| {
+                let (icon, color) = match d.severity {
+                    Severity::Error => (IconName::CircleAlert, theme::error()),
+                    Severity::Warning => (IconName::TriangleAlert, theme::warning()),
+                    _ => (IconName::Info, theme::fg_muted()),
+                };
+                let line = d.range.start.line;
+                let col = d.range.start.col;
+                let label = format!("{}:{}", line + 1, col + 1);
+                let jump_path = path.clone();
+                div()
+                    .id(SharedString::from(format!("problem-row-{}-{line}-{col}", path.display())))
+                    .h(px(24.0))
+                    .pr_2()
+                    .pl(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .hover(|this| this.bg(theme::raised_bg()))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.push_nav(cx);
+                        this.open_path(&jump_path, cx);
+                        this.jump_active_to(line, col, cx);
+                        this.focus_active(window, cx);
+                    }))
+                    .child(Icon::new(icon).text_color(color))
+                    .child(div().truncate().text_color(theme::fg()).child(SharedString::from(d.message.clone())))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.0))
+                            .text_color(theme::fg_muted())
+                            .child(SharedString::from(file_name(&path))),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.0))
+                            .text_color(theme::fg_muted())
+                            .child(SharedString::from(label)),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        div().id("window-scroll-bookmarks").flex_1().min_h_0().overflow_y_scroll().children(rows).into_any_element()
+    }
+
+    /// The Find Usages window's body: the last references answer.
+    fn render_usages_body(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let answer = self.usages.as_ref()?;
+        let mut rows = Vec::new();
+        rows.push(
+            div()
+                .h(px(22.0))
+                .px_2()
+                .mt_1()
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_size(px(11.0))
+                .text_color(theme::fg_muted())
+                .child(SharedString::from(format!(
+                    "\"{}\" in {} — {} usages",
+                    answer.symbol,
+                    file_name(&answer.source),
+                    answer.locations.len()
+                )))
+                .into_any_element(),
+        );
+        for location in &answer.locations {
+            let path = location.path.0.clone();
+            let jump_path = path.clone();
+            let start = location.range.start;
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("usage-row-{}-{}-{}", path.display(), start.line, start.col)))
+                    .h(px(24.0))
+                    .pr_2()
+                    .pl(px(20.0))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .hover(|this| this.bg(theme::raised_bg()))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.push_nav(cx);
+                        this.open_path(&jump_path, cx);
+                        this.jump_active_to(start.line, start.col, cx);
+                        this.focus_active(window, cx);
+                    }))
+                    .child(div().truncate().text_color(theme::fg()).child(SharedString::from(file_name(&path))))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.0))
+                            .text_color(theme::fg_muted())
+                            .child(SharedString::from(format!(":{}", start.line + 1))),
+                    )
+                    .into_any_element(),
+            );
+        }
+        Some(div().id("window-scroll-usages").flex_1().min_h_0().overflow_y_scroll().children(rows).into_any_element())
+    }
+
+    /// The Run window's body: the session tabs over the active panel (the
+    /// old dock tab strip, moved inside the window).
+    fn render_run_body(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        self.clamp_dock_page();
+        let find = self.find_panel.clone();
+        let pages = self.runs.len() + usize::from(find.is_some());
+        let has_find = find.is_some();
+        let body = match self.dock_page {
+            DockPage::Run(index) if self.runs.get(index).is_some() => self.runs[index].clone().into_any_element(),
+            _ => match find {
+                Some(panel) => panel.into_any_element(),
+                None => return self.render_window_placeholder(strings::TW_NOTHING_RUN),
+            },
+        };
+        if pages <= 1 {
+            return div().flex_1().min_h_0().flex().flex_col().child(body).into_any_element();
+        }
+        // Multiple pages: the tab switch above the active one. Run tabs are
+        // closable (a live run stops first); Find is a permanent page.
+        let workbench = cx.entity().downgrade();
+        let mut children = Vec::new();
+        for (index, panel) in self.runs.iter().enumerate() {
+            let name = panel.read(cx).config_name.clone();
+            children.push(ComponentTab::new().label(name).selected(self.dock_page == DockPage::Run(index)).suffix(
+                Button::new(("dock-tab-close", index)).icon(IconName::Close).xsmall().ghost().on_click({
+                    let workbench = workbench.clone();
+                    move |_, _, cx| {
+                        workbench.update(cx, |this, cx| this.close_run_tab(index, cx)).ok();
+                    }
+                }),
+            ));
+        }
+        if has_find {
+            children.push(ComponentTab::new().label(strings::FIND_FILES_TITLE));
+        }
+        let tabs = TabBar::new("dock-tabs")
+            .selected_index(match self.dock_page {
+                DockPage::Run(index) => index,
+                DockPage::Find => self.runs.len(),
+                DockPage::Problems | DockPage::Usages => 0,
+            })
+            .on_click(cx.listener(|this, index: &usize, _, cx| {
+                let runs = this.runs.len();
+                this.dock_page = if *index < runs { DockPage::Run(*index) } else { DockPage::Find };
+                cx.notify();
+            }))
+            .children(children);
+        div().flex_1().min_h_0().flex().flex_col().child(tabs).child(body).into_any_element()
+    }
+
+    /// The muted "nothing here" face of an empty window body.
+    fn render_window_placeholder(&self, text: &str) -> gpui::AnyElement {
+        div()
+            .flex_1()
+            .min_h_0()
+            .items_center()
+            .justify_center()
+            .p_3()
+            .text_size(px(12.))
+            .text_color(theme::fg_muted())
+            .child(SharedString::from(text.to_owned()))
+            .into_any_element()
     }
 
     /// The 4 px drag handle between tree and editor (M7): arms the width
@@ -3621,70 +4518,40 @@ impl Workbench {
     /// the active page. With a single page the M4 look (that panel alone, no
     /// tab bar, its own header) is preserved exactly. Hidden via ⌘4 or the
     /// persisted layout; the height drags (the 4 px handle on top).
-    fn render_dock(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    /// The bottom dock area: the page's window in its shell, under the
+    /// drag handle (M7's height drag stays). The M4 contract holds: the dock
+    /// renders from the first run/search/on-demand window onward, not at a
+    /// bare launch.
+    fn render_bottom_area(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.settings.layout.dock_visible {
             return None;
         }
-        let find = self.find_panel.clone();
         self.clamp_dock_page();
-        let pages = self.runs.len() + usize::from(find.is_some());
-        let body = match self.dock_page {
-            DockPage::Run(index) if self.runs.get(index).is_some() => self.runs[index].clone().into_any_element(),
-            // `find` (cloned above) stays owned for the tab-switch row after
-            // this; the `?` returns None when the Find page was never created.
-            _ => self.find_panel.clone()?.into_any_element(),
+        let id = self.bottom_window_id()?;
+        let desc = toolwindow::window(id)?;
+        let has_content = match id {
+            "run" => !self.runs.is_empty() || self.find_panel.is_some(),
+            "find" => self.find_panel.is_some(),
+            "usages" => self.usages.is_some(),
+            _ => self.win_state(desc).used,
         };
-        if pages <= 1 {
-            return Some(self.dock_shell(cx, None, body));
+        if !has_content {
+            return None;
         }
-        // Multiple pages: the tab switch above the active one. Run tabs are
-        // closable (a live run stops first); Find is a permanent page.
-        let workbench = cx.entity().downgrade();
-        let mut children = Vec::new();
-        for (index, panel) in self.runs.iter().enumerate() {
-            let name = panel.read(cx).config_name.clone();
-            children.push(ComponentTab::new().label(name).selected(self.dock_page == DockPage::Run(index)).suffix(
-                Button::new(("dock-tab-close", index)).icon(IconName::Close).xsmall().ghost().on_click({
-                    let workbench = workbench.clone();
-                    move |_, _, cx| {
-                        workbench.update(cx, |this, cx| this.close_run_tab(index, cx)).ok();
-                    }
-                }),
-            ));
-        }
-        if find.is_some() {
-            children.push(ComponentTab::new().label(strings::FIND_FILES_TITLE));
-        }
-        let tabs = TabBar::new("dock-tabs")
-            .selected_index(match self.dock_page {
-                DockPage::Run(index) => index,
-                DockPage::Find => self.runs.len(),
-            })
-            .on_click(cx.listener(|this, index: &usize, _, cx| {
-                let runs = this.runs.len();
-                this.dock_page = if *index < runs { DockPage::Run(*index) } else { DockPage::Find };
-                cx.notify();
-            }))
-            .children(children);
-        Some(self.dock_shell(cx, Some(tabs), body))
-    }
-
-    fn dock_shell(&self, cx: &Context<Self>, header: Option<TabBar>, body: impl IntoElement) -> gpui::AnyElement {
-        let mut shell = div()
-            .h(px(self.settings.layout.dock_height))
-            .flex_none()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .border_t_1()
-            .border_color(theme::border());
-        if header.is_some() {
-            shell = shell.child(self.render_dock_handle(cx));
-        }
-        if let Some(header) = header {
-            shell = shell.child(header);
-        }
-        shell.child(div().flex_1().min_h_0().child(body)).into_any_element()
+        let body = self.render_window_body(desc, cx)?;
+        Some(
+            div()
+                .h(px(self.settings.layout.dock_height))
+                .flex_none()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .border_t_1()
+                .border_color(theme::border())
+                .child(self.render_dock_handle(cx))
+                .child(self.render_window_shell(desc, cx, body))
+                .into_any_element(),
+        )
     }
 
     /// The 4 px drag handle above the dock (M7): arms the height drag.

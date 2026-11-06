@@ -2,7 +2,6 @@
 //! Tauri frontend's `text/en.json` + `zh.json` discipline starts with M2+).
 
 pub const APP_TITLE: &str = "OpenIDEA";
-pub const TREE_HEADER: &str = "Project";
 pub const NO_PROJECT: &str = "No project open";
 pub const NO_FILE: &str = "Open a file to start editing (⌘O)";
 pub const DIRTY_DOT: &str = "●";
@@ -113,3 +112,15 @@ pub const BOOKMARK_ADDED: &str = "Bookmark added:";
 pub const BOOKMARK_REMOVED: &str = "Bookmark removed:";
 pub const NO_EDIT_LOCATION: &str = "No edit location yet";
 pub const NOT_YET_AVAILABLE: &str = "{} is not yet available";
+
+// M10 tool-window stripes.
+pub const TW_MOVE_TO: &str = "Move to";
+pub const TW_MOVE_LEFT: &str = "Left";
+pub const TW_MOVE_RIGHT: &str = "Right";
+pub const TW_MOVE_BOTTOM: &str = "Bottom";
+pub const TW_MAXIMIZE: &str = "Maximize";
+pub const TW_HIDE: &str = "Hide";
+pub const TW_NO_STRUCTURE: &str = "Open a file to see its structure";
+pub const TW_NO_BOOKMARKS: &str = "No bookmarks yet — F3 bookmarks a line";
+pub const TW_NO_PROBLEMS: &str = "No problems";
+pub const TW_NOTHING_RUN: &str = "No run or search yet — ⌃R runs, ⇧⌘F finds";

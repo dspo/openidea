@@ -1114,6 +1114,9 @@ pub struct EditorPane {
     // Navigation (M3 phase 5): a jump list of locations (definitions,
     // usages) and the rename flow, if one is under way.
     jump: Option<(Vec<Location>, usize)>,
+    /// The queried symbol of an in-flight references request (M10): the
+    /// Find Usages window's header shows it.
+    usages_symbol: String,
     rename: Option<RenameFlow>,
     // Code actions (M5 phase 3): the open quick-fix menu and its selection.
     code_actions: Option<(Vec<ide_lsp::types::CodeAction>, usize)>,
@@ -1206,6 +1209,7 @@ impl EditorPane {
             completion_gen: 0,
             completion_cancel: None,
             jump: None,
+            usages_symbol: String::new(),
             rename: None,
             code_actions: None,
             signature: None,
@@ -2135,6 +2139,9 @@ impl EditorPane {
     }
 
     pub fn find_usages(&mut self, cx: &mut gpui::Context<Self>) {
+        // The queried symbol rides the answer to the Find Usages window (M10
+        // routes multi-hit references there instead of the in-pane list).
+        self.usages_symbol = self.word_at_caret();
         self.request_locations(
             "references",
             |lsp, doc, pos, cancel| {
@@ -2142,6 +2149,30 @@ impl EditorPane {
             },
             cx,
         );
+    }
+
+    /// The identifier around the primary caret (empty when the caret is not
+    /// on one) — the same bounds start_rename computes.
+    fn word_at_caret(&self) -> String {
+        let caret = self.selections.first().map_or(0, |s| s.head);
+        let mut start = caret.min(self.buf.utf16_len());
+        while start > 0 {
+            let prev = self.buf.prev_boundary(start);
+            if !(self.buf.char_of(prev).is_alphanumeric() || self.buf.char_of(prev) == '_') {
+                break;
+            }
+            start = prev;
+        }
+        let mut end = caret;
+        let len = self.buf.utf16_len();
+        while end < len {
+            let next = self.buf.next_boundary(end);
+            if next == end || !(self.buf.char_of(next).is_alphanumeric() || self.buf.char_of(next) == '_') {
+                break;
+            }
+            end = next;
+        }
+        if start == end { String::new() } else { self.buf.slice_utf16(start..end) }
     }
 
     fn request_locations(
@@ -2191,6 +2222,17 @@ impl EditorPane {
                 }
             }
             Ok(locations) if !locations.is_empty() => {
+                if feature == "references" {
+                    // M10: multi-hit references open the Find Usages tool
+                    // window (the pane's jump list keeps the goto flows).
+                    self.bus.send(BusMessage::UsagesFound {
+                        path: self.path.clone(),
+                        symbol: std::mem::take(&mut self.usages_symbol),
+                        locations,
+                    });
+                    cx.notify();
+                    return;
+                }
                 self.jump = Some((locations, 0));
                 cx.notify();
             }
