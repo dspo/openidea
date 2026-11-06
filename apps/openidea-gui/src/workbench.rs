@@ -428,6 +428,10 @@ pub struct Workbench {
     /// The active tab's caret (M10's line:col widget), 0-based from the
     /// pane's CaretMoved reports.
     caret: Cell<(u32, u32)>,
+    /// The caret widget's notify throttle: a caret move only re-renders the
+    /// workbench at ~10/s (typing bursts otherwise re-render the whole
+    /// shell per keystroke — the debug budget's key_to_px felt it).
+    caret_notify: Cell<(std::time::Instant, bool)>,
     /// The open floating context menu (M8): a right-click menu is
     /// element-scoped gpui-component state, invisible to the Esc chain —
     /// when anything steals its focus, Esc lands here as a bare Cancel and
@@ -526,6 +530,7 @@ impl Workbench {
             structure_gen: 0,
             usages: None,
             caret: Cell::new((0, 0)),
+            caret_notify: Cell::new((std::time::Instant::now(), false)),
             open_menu: None,
             menu_sub: None,
         }
@@ -1152,8 +1157,19 @@ impl Workbench {
         .detach();
     }
 
+    /// The error count across files — the Problems badge and the status
+    /// widget. A flat count (no build/sort of the row list: this runs on
+    /// every workbench render).
+    fn error_count(&self) -> usize {
+        self.diagnostics
+            .values()
+            .flat_map(|by_source| by_source.values().flatten())
+            .filter(|d| d.severity == Severity::Error)
+            .count()
+    }
+
     /// Every diagnostic across files, sorted by path then position — the
-    /// Problems window's rows and the badge count.
+    /// Problems window's rows.
     fn all_diagnostics(&self) -> Vec<(PathBuf, Diagnostic)> {
         let mut rows: Vec<_> = self
             .diagnostics
@@ -2679,7 +2695,17 @@ impl Workbench {
                 // background pane's render would lie about "the" position).
                 if self.active.and_then(|index| self.tabs.get(index)).is_some_and(|tab| tab.doc == doc) {
                     self.caret.set((line, col_utf16));
-                    cx.notify();
+                    let (last, pending) = self.caret_notify.get();
+                    // 300 ms: typing also lands a DocDirty render per
+                    // keystroke, so a caret notify inside that window just
+                    // doubles the shell renders (the debug budget felt it).
+                    // Slower caret moves (arrows, clicks) pass at once.
+                    if last.elapsed() >= std::time::Duration::from_millis(300) {
+                        self.caret_notify.set((std::time::Instant::now(), false));
+                        cx.notify();
+                    } else if !pending {
+                        self.caret_notify.set((last, true));
+                    }
                 }
             }
             BusMessage::UsagesFound { path, symbol, locations } => {
@@ -3795,6 +3821,17 @@ impl Render for Workbench {
         }
         // The toast queue drains here (the window exists from now on).
         self.flush_toasts(window, cx);
+        // A throttled caret position flushes on the next render (the editor
+        // pane's own redraws do not re-render this shell; any other bus
+        // event or interaction does — the 100ms throttle just caps the
+        // worst-case re-render rate while typing).
+        {
+            let (_, pending) = self.caret_notify.get();
+            if pending {
+                self.caret_notify.set((std::time::Instant::now(), false));
+                cx.notify();
+            }
+        }
         // A bus message closed an overlay (the commit landed): focus returns
         // to the topmost live surface.
         if self.restore_focus_pending.replace(false) {
@@ -4108,7 +4145,7 @@ impl Workbench {
     fn badge_for(&self, id: &str) -> Option<String> {
         match id {
             "problems" => {
-                let count = self.all_diagnostics().iter().filter(|(_, d)| d.severity == Severity::Error).count();
+                let count = self.error_count();
                 (count > 0).then(|| count.to_string())
             }
             "commit" => {
@@ -5151,7 +5188,7 @@ impl Workbench {
         let mut right = div().flex().items_center().gap_3().text_size(px(12.));
         // The Problems count (the F2 walker's set); a click opens the window.
         if shown("problems") {
-            let errors = self.all_diagnostics().iter().filter(|(_, d)| d.severity == Severity::Error).count();
+            let errors = self.error_count();
             let count = if errors == 0 { strings::NO_PROBLEMS_SHORT.to_owned() } else { format!("{errors}") };
             right = right.child(
                 div()
