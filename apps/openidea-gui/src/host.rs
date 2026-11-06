@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use ide_core::{ChangeSet, DocId, IdeError, IdeResult, RunId, SharedSink};
 use ide_index::ProjectIndex;
-use ide_language::{LanguageRegistry, Syntax};
+use ide_language::{LanguageRegistry, LanguageServerConfig, Syntax};
 use ide_lsp::LspManager;
 use ide_run::{OutputChunk, ProcessManager, RunConfig, RunInfo, StartOptions};
 use ide_text::AppliedChange;
@@ -46,6 +46,27 @@ const DEFAULT_EXCLUDES: &[&str] = &["**/.git", "**/target", "**/node_modules", "
 
 fn excludes() -> Vec<String> {
     DEFAULT_EXCLUDES.iter().map(|s| (*s).to_owned()).collect()
+}
+
+/// The app's LSP server options overlay (M9's fork move): the gopls opt-ins
+/// this fork used to carry as two data lines in `languages/go.toml`. gopls
+/// ships semantic tokens disabled (`semanticTokens` defaults to false and the
+/// provider answers empty without it — gopls docs / settings.md); inlay hints
+/// are the same story, the provider advertises but answers empty until the
+/// wanted `hints` kinds turn on (M6 probes: 5 hints on main.go for
+/// assignVariableTypes + parameterNames). They ride the LspManager's config
+/// hook now, so `languages/` stays at zero diff with upstream.
+const GOPLS_INITIALIZATION_OPTIONS: &str = "semanticTokens = true\n[hints]\nassignVariableTypes = true\nparameterNames = true\nfunctionTypeParameters = true\n";
+
+/// Fills server-config gaps before each launch. Deliberately conservative:
+/// only gopls, and only when nobody (a user override, a future registry
+/// change) already set options.
+fn apply_server_overrides(cfg: &mut LanguageServerConfig) {
+    if cfg.name == "gopls" && cfg.initialization_options.is_none() {
+        // Static text, unit-tested to parse; `.ok()` keeps the launch path
+        // panic-free even if it ever drifts.
+        cfg.initialization_options = toml::from_str(GOPLS_INITIALIZATION_OPTIONS).ok();
+    }
 }
 
 /// One open project folder: documents, the watcher that keeps them and the
@@ -104,6 +125,9 @@ impl Host {
         };
         let documents = Arc::new(Documents::new(sink.clone(), detect));
         let lsp = LspManager::new(root.clone(), languages.clone(), sink.clone());
+        // The app-side server options overlay (see GOPLS_INITIALIZATION_OPTIONS)
+        // applies to every server config before launch.
+        lsp.set_config_hook(Box::new(|cfg, _root| apply_server_overrides(cfg)));
         let index = {
             // Persistent index cache keyed per project (the FNV-1a convention
             // ide-host uses for its caches), under the platform cache dir.
@@ -380,5 +404,55 @@ impl DocumentObserver for LspObserver {
 
     fn closed(&self, doc: DocId, _path: &Path) {
         self.0.did_close(doc);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The registry row gopls gets from `languages/go.toml` (now upstream's,
+    /// without this fork's old two data lines).
+    fn gopls_config() -> LanguageServerConfig {
+        toml::from_str(
+            r#"
+name = "gopls"
+command = "gopls"
+root-markers = ["go.work", "go.mod"]
+"#,
+        )
+        .expect("gopls row parses")
+    }
+
+    #[test]
+    fn gopls_options_fill_semantic_tokens_and_hints() {
+        let mut cfg = gopls_config();
+        assert!(cfg.initialization_options.is_none(), "upstream's go.toml carries no options");
+        apply_server_overrides(&mut cfg);
+        let options = cfg.initialization_options.expect("gopls options filled");
+        assert_eq!(options["semanticTokens"].as_bool(), Some(true));
+        let hints = options["hints"].as_table().expect("hints table");
+        for kind in ["assignVariableTypes", "parameterNames", "functionTypeParameters"] {
+            assert_eq!(hints[kind].as_bool(), Some(true), "hint kind {kind} opted in");
+        }
+    }
+
+    #[test]
+    fn overrides_leave_other_servers_and_set_options_alone() {
+        let mut other: LanguageServerConfig =
+            toml::from_str("name = \"rust-analyzer\"\ncommand = \"rust-analyzer\"\n").expect("row parses");
+        apply_server_overrides(&mut other);
+        assert!(other.initialization_options.is_none(), "non-gopls untouched");
+
+        let mut preset: LanguageServerConfig = toml::from_str(
+            "name = \"gopls\"\ncommand = \"gopls\"\ninitialization-options = { semanticTokens = false }\n",
+        )
+        .expect("preset row parses");
+        apply_server_overrides(&mut preset);
+        assert_eq!(
+            preset.initialization_options.expect("kept")["semanticTokens"].as_bool(),
+            Some(false),
+            "an existing option is never clobbered"
+        );
     }
 }
