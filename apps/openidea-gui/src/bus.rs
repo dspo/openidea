@@ -136,6 +136,13 @@ pub enum BusMessage {
         result: IdeResult<String>,
         message: String,
     },
+    /// The active pane's caret moved (M10's line:col status widget). The
+    /// pane dedupes to one message per (line, col) change.
+    CaretMoved {
+        doc: ide_core::DocId,
+        line: u32,
+        col_utf16: u32,
+    },
 }
 
 /// The UI end of the event bus. Cheap to clone; `send` never blocks
