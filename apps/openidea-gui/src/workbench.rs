@@ -15,7 +15,7 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable as _, InteractiveElement, IntoElement,
     KeyDownEvent, ModifiersChangedEvent, MouseButton, ParentElement, Render, SharedString,
-    StatefulInteractiveElement as _, Styled, Window, div, px,
+    StatefulInteractiveElement as _, Styled, Window, canvas, div, px,
 };
 use gpui_component::WindowExt as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -3108,6 +3108,15 @@ impl Render for Workbench {
         if self.restore_focus_pending.replace(false) {
             self.restore_focus(window, cx);
         }
+        // An armed drag's window cursor is a paint-phase request, pushed per
+        // frame by a canvas (render runs at layout; the mouse handlers run in
+        // event dispatch — either caller panics the debug build, which is the
+        // M9 crash.log entry). No armed drag pushes nothing and the frame
+        // falls back to the per-element cursors.
+        let drag_cursor = self.drag.get().map(|drag| match drag {
+            Drag::Tree { .. } => gpui::CursorStyle::ResizeLeftRight,
+            Drag::Dock { .. } => gpui::CursorStyle::ResizeUpDown,
+        });
         div()
             .size_full()
             .relative()
@@ -3115,6 +3124,11 @@ impl Render for Workbench {
             .flex_col()
             .bg(theme::app_bg())
             .text_color(theme::fg())
+            .children(drag_cursor.map(|style| {
+                canvas(|_, _, _| {}, move |_, _, window, _| window.set_window_cursor_style(style))
+                    .absolute()
+                    .size_full()
+            }))
             // The fallback focus sink (see `root_focus`): keeps action
             // dispatch alive whenever nothing else holds the focus.
             .track_focus(&self.root_focus)
@@ -3426,21 +3440,22 @@ impl Workbench {
     }
 
     /// Arms the tree-width drag (the move drives it from the window root).
-    fn on_tree_handle_down(&mut self, event: &gpui::MouseDownEvent, window: &mut Window, _: &mut Context<Self>) {
+    /// The window cursor is set at paint (see `render`): event handlers run
+    /// outside paint and `set_window_cursor_style` panics there (the M9
+    /// crash.log entry).
+    fn on_tree_handle_down(&mut self, event: &gpui::MouseDownEvent, _window: &mut Window, _: &mut Context<Self>) {
         self.drag.set(Some(Drag::Tree {
             start_x: f32::from(event.position.x),
             start_width: self.settings.layout.tree_width,
         }));
-        window.set_window_cursor_style(gpui::CursorStyle::ResizeLeftRight);
     }
 
-    /// Arms the dock-height drag.
-    fn on_dock_handle_down(&mut self, event: &gpui::MouseDownEvent, window: &mut Window, _: &mut Context<Self>) {
+    /// Arms the dock-height drag (the cursor rides the paint-phase canvas).
+    fn on_dock_handle_down(&mut self, event: &gpui::MouseDownEvent, _window: &mut Window, _: &mut Context<Self>) {
         self.drag.set(Some(Drag::Dock {
             start_y: f32::from(event.position.y),
             start_height: self.settings.layout.dock_height,
         }));
-        window.set_window_cursor_style(gpui::CursorStyle::ResizeUpDown);
     }
 
     /// Drives an armed drag (the window root sees every move through the
@@ -3463,10 +3478,10 @@ impl Workbench {
         cx.notify();
     }
 
-    /// Ends the drag: release the cursor, persist the layout.
-    fn on_drag_end(&mut self, _: &gpui::MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+    /// Ends the drag: persist the layout. The window cursor restores itself
+    /// on the next frame (the paint-phase canvas stops pushing the style).
+    fn on_drag_end(&mut self, _: &gpui::MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if self.drag.take().is_some() {
-            window.set_window_cursor_style(gpui::CursorStyle::Arrow);
             settings::save(&self.settings);
             cx.notify();
         }
