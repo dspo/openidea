@@ -47,6 +47,7 @@ use crate::fuzzy;
 use crate::host::Host;
 use crate::keymap;
 use crate::navigation;
+use crate::reconcile;
 use crate::run_panel::{RunPanel, stream_of};
 use crate::{ProjectHost, settings, strings, theme};
 
@@ -123,6 +124,8 @@ enum PickerMode {
     Line,
     /// ⌃⇥ — open tabs and dock pages; ⌃⇥ cycles while it is open.
     Switcher,
+    /// ⌘⇧A — Find Action: the registry plus the preset's placeholders.
+    FindAction,
 }
 
 /// The ⇧⌘O / double-⇧ / ⌃R palette: one list, grouped per mode. Files and
@@ -143,6 +146,9 @@ struct Picker {
     /// Structure mode: the LSP outline (async answer lands here behind the
     /// generation guard).
     outline: Vec<(OutlineItem, usize)>,
+    /// Find Action mode: the preset's placeholder rows (recomputed per
+    /// query together with the actions).
+    placeholders: Vec<reconcile::PlaceholderRow>,
     selected: usize,
 }
 
@@ -169,6 +175,12 @@ enum PickerRow {
     Tab(usize),
     /// A dock page the switcher can focus (Find first, run tabs after).
     Dock(DockPage, String),
+    /// A preset action without a face yet (⌘⇧A): triggering toasts.
+    Placeholder {
+        title: String,
+        keys: &'static str,
+        idea_id: &'static str,
+    },
 }
 
 /// The open diff overlay (M4): one file's unified changes against HEAD.
@@ -1100,6 +1112,7 @@ impl Workbench {
             PickerMode::Structure => "file structure",
             PickerMode::Line => "line:column (⏎ jumps)",
             PickerMode::Switcher => "switcher",
+            PickerMode::FindAction => strings::PICKER_EVERYWHERE_PLACEHOLDER,
         };
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         window.focus(&input.read(cx).presentation().focus_handle().clone(), cx);
@@ -1120,6 +1133,7 @@ impl Workbench {
             actions: Vec::new(),
             configs,
             outline: Vec::new(),
+            placeholders: Vec::new(),
             selected: 0,
         });
         // Structure mode fetches the active file's outline right away.
@@ -1168,6 +1182,11 @@ impl Workbench {
         if mode == PickerMode::Everywhere {
             picker.actions = ranked_actions(&query);
         }
+        // Find Action: same registry fuzzy pass, placeholders below them.
+        if mode == PickerMode::FindAction {
+            picker.actions = ranked_actions(&query);
+            picker.placeholders = reconcile::placeholder_rows();
+        }
         picker.selected = 0;
         // The M9 modes list workbench state synchronously; the ⌘L query is
         // the payload itself.
@@ -1180,6 +1199,7 @@ impl Workbench {
                 | PickerMode::Structure
                 | PickerMode::Line
                 | PickerMode::Switcher
+                | PickerMode::FindAction
         ) {
             cx.notify();
             return;
@@ -1378,6 +1398,19 @@ impl Workbench {
             // ⌘L: the query is the payload; Enter parses it.
             PickerMode::Line => Vec::new(),
             PickerMode::Switcher => self.switcher_rows(),
+            PickerMode::FindAction => {
+                picker
+                    .actions
+                    .iter()
+                    .cloned()
+                    .map(PickerRow::Action)
+                    .chain(
+                        picker.placeholders.iter().filter(|row| matches_query(&row.title)).cloned().map(|row| {
+                            PickerRow::Placeholder { title: row.title, keys: row.keys, idea_id: row.idea_id }
+                        }),
+                    )
+                    .collect()
+            }
             _ => picker
                 .files
                 .iter()
@@ -1507,6 +1540,19 @@ impl Workbench {
                     self.settings.layout.dock_visible = true;
                     settings::save(&self.settings);
                 }
+                cx.notify();
+            }
+            PickerRow::Placeholder { idea_id, .. } => {
+                let title = reconcile::placeholder_rows()
+                    .iter()
+                    .find(|row| row.idea_id == idea_id)
+                    .map(|row| row.title.clone())
+                    .unwrap_or_else(|| idea_id.to_owned());
+                self.close_picker(window, cx);
+                self.toast(
+                    NotifyLevel::Info,
+                    format!("{} ({idea_id})", strings::NOT_YET_AVAILABLE.replace("{}", &title)),
+                );
                 cx.notify();
             }
         }
@@ -3119,6 +3165,9 @@ impl Render for Workbench {
                 cx.listener(|this, _: &acts::GotoLine, window, cx| this.open_picker(PickerMode::Line, window, cx)),
             )
             .on_action(cx.listener(|this, _: &acts::LastEditLocation, _, cx| this.jump_last_edit(cx)))
+            .on_action(cx.listener(|this, _: &acts::FindAction, window, cx| {
+                this.open_picker(PickerMode::FindAction, window, cx)
+            }))
             // Double ⇧ and the other modifier chords (modifier presses arrive
             // as modifiers events); the root key listener resolves their
             // follow-up keystrokes (⌥⌥ held, ↑ pressed).
@@ -3729,6 +3778,12 @@ impl Workbench {
             PickerMode::Structure => vec![("Structure", 0..rows.len())],
             PickerMode::Line => vec![("Go to Line", 0..rows.len())],
             PickerMode::Switcher => vec![("Switcher", 0..rows.len())],
+            // rows() re-filters the placeholder list by the query, so the
+            // second section's end is rows.len(), never the raw list's.
+            PickerMode::FindAction => {
+                let actions = picker.actions.len().min(rows.len());
+                vec![("Actions", 0..actions), ("Not yet available", actions..rows.len())]
+            }
         };
         let mut list = div().id("picker-list").max_h(px(420.0)).overflow_y_scroll().py_1();
         if rows.is_empty() {
@@ -3896,6 +3951,13 @@ impl Workbench {
                     .child(div().text_color(theme::fg()).child(SharedString::from(file_name(&self.tabs[*index].path))))
                     .into_any_element(),
                 Some(self.tabs[*index].path.display().to_string()),
+            ),
+            PickerRow::Placeholder { title, keys, .. } => (
+                div()
+                    .text_color(theme::fg_muted())
+                    .child(SharedString::from(format!("{title} — not yet available")))
+                    .into_any_element(),
+                (!keys.is_empty()).then(|| keys.to_string()),
             ),
             PickerRow::Dock(_, label) => (
                 div().child(div().text_color(theme::fg()).child(SharedString::from(label))).into_any_element(),

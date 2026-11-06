@@ -112,3 +112,4 @@ pub const NO_HISTORY_FORWARD: &str = "No later location";
 pub const BOOKMARK_ADDED: &str = "Bookmark added:";
 pub const BOOKMARK_REMOVED: &str = "Bookmark removed:";
 pub const NO_EDIT_LOCATION: &str = "No edit location yet";
+pub const NOT_YET_AVAILABLE: &str = "{} is not yet available";
