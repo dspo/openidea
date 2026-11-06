@@ -124,3 +124,7 @@ pub const TW_NO_STRUCTURE: &str = "Open a file to see its structure";
 pub const TW_NO_BOOKMARKS: &str = "No bookmarks yet — F3 bookmarks a line";
 pub const TW_NO_PROBLEMS: &str = "No problems";
 pub const TW_NOTHING_RUN: &str = "No run or search yet — ⌃R runs, ⇧⌘F finds";
+pub const TW_NOTHING_COMMIT: &str = "No changes to commit";
+pub const TW_REFRESH_CHANGES: &str = "Refresh Changes";
+pub const TW_COMMIT_HISTORY: &str = "History…";
+pub const TW_COMMIT_DIFF_HINT: &str = "Select a file to preview its diff";

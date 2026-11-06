@@ -17,6 +17,7 @@ use gpui::{
     KeyDownEvent, ModifiersChangedEvent, MouseButton, ParentElement, Render, SharedString,
     StatefulInteractiveElement as _, Styled, Window, canvas, div, px,
 };
+use gpui_component::Disableable as _;
 use gpui_component::WindowExt as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
@@ -205,6 +206,20 @@ struct CommitFile {
     selected: bool,
 }
 
+/// How many messages the Commit window's history keeps (settings persist).
+const COMMIT_HISTORY_CAP: usize = 20;
+
+/// The Commit tool window's state (M10): the changelist (checkbox rows),
+/// the diff preview target, and the message input. The ⌘K dialog keeps its
+/// own flow; both commit through [`Workbench::perform_commit`].
+struct CommitWindowState {
+    files: Vec<CommitFile>,
+    input: Entity<TextareaState>,
+    /// The file whose diff preview shows (`None` = the hint placeholder).
+    diff_for: Option<PathBuf>,
+    diff_lines: Vec<DiffLine>,
+}
+
 /// The commit overlay (M4): the changed files (checked = staged for this
 /// commit) and a multi-line message.
 struct CommitFlow {
@@ -347,6 +362,10 @@ pub struct Workbench {
     diff_focus_pending: Cell<bool>,
     /// The open commit overlay (⌘K).
     commit: Option<CommitFlow>,
+    /// The Commit tool window's state (M10), built at its first open.
+    commit_window: Option<CommitWindowState>,
+    /// The window input's ⌘Enter subscription, alive while the state is.
+    commit_window_sub: Option<gpui::Subscription>,
     /// The message input's PressEnter subscription, alive while the overlay is.
     commit_sub: Option<gpui::Subscription>,
     /// The tree prompt overlay (M7 context menu: new file / folder, rename)
@@ -467,6 +486,8 @@ impl Workbench {
             edits: navigation::EditLocations::default(),
             bookmarks,
             last_edit_memory: None,
+            commit_window: None,
+            commit_window_sub: None,
             save_flow: Cell::new(None),
             closed_tabs: Vec::new(),
             tasks: Vec::new(),
@@ -514,6 +535,8 @@ impl Workbench {
     /// Kicks a git status + branch refresh (coalesced; no-op without a repo
     /// or while one is already in flight).
     fn refresh_git(&mut self, cx: &mut Context<Self>) {
+        // The Commit window's changelist follows the working tree.
+        self.rebuild_commit_files(cx);
         let Some(host) = self.host.as_ref().filter(|host| host.repo.is_some()) else { return };
         if self.git_refreshing.replace(true) {
             self.git_refresh_queued.set(true);
@@ -1156,6 +1179,92 @@ impl Workbench {
         self.toggle_maximized(cx);
     }
 
+    /// ⌘0: the Commit window's stripe toggle. First open builds the
+    /// changelist + message input (the input entity needs the window).
+    fn on_toggle_commit(&mut self, _: &acts::ToggleCommit, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_window("commit", cx);
+        if self.commit_window.is_none() {
+            let input = cx.new(|cx| TextareaState::new(window, cx).placeholder(strings::COMMIT_MESSAGE_PLACEHOLDER));
+            self.commit_window = Some(CommitWindowState {
+                files: Vec::new(),
+                input: input.clone(),
+                diff_for: None,
+                diff_lines: Vec::new(),
+            });
+            // ⌘Enter commits (the ⌘K dialog's face, in the window too).
+            self.commit_window_sub = Some(cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
+                if let InputEvent::PressEnter { secondary: true, .. } = event {
+                    this.commit_window_confirm(cx);
+                }
+            }));
+            self.rebuild_commit_files(cx);
+        }
+    }
+
+    /// (Re)builds the Commit window's changelist from the current git
+    /// status, checked by default (the IDEA commit dialog's shape). The
+    /// message input and the diff preview survive the rebuild.
+    fn rebuild_commit_files(&mut self, cx: &mut Context<Self>) {
+        let Some(existing) = &self.commit_window else { return };
+        let input = existing.input.clone();
+        let mut files: Vec<CommitFile> = self
+            .git_status
+            .iter()
+            .map(|(path, kind)| CommitFile { path: path.clone(), name: file_name(path), kind: *kind, selected: true })
+            .collect();
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+        let diff_for = existing.diff_for.clone().filter(|path| files.iter().any(|file| &file.path == path));
+        let diff_lines = existing.diff_lines.clone();
+        self.commit_window = Some(CommitWindowState { files, input, diff_for, diff_lines });
+        cx.notify();
+    }
+
+    /// The Commit window's Commit button: the same staging discipline as
+    /// the ⌘K dialog (checked files stage, unchecked leave the index).
+    fn commit_window_confirm(&mut self, cx: &mut Context<Self>) {
+        eprintln!("[commit] window confirm");
+        let Some(window) = &self.commit_window else { return };
+        let message = window.input.read(cx).value().to_string();
+        if message.trim().is_empty() {
+            self.toast(NotifyLevel::Warning, strings::COMMIT_EMPTY_MESSAGE.to_owned());
+            cx.notify();
+            return;
+        }
+        let staged: Vec<PathBuf> =
+            window.files.iter().filter(|file| file.selected).map(|file| file.path.clone()).collect();
+        let unstaged: Vec<PathBuf> =
+            window.files.iter().filter(|file| !file.selected).map(|file| file.path.clone()).collect();
+        if staged.is_empty() {
+            self.toast(NotifyLevel::Warning, strings::COMMIT_NO_CHANGES.to_owned());
+            cx.notify();
+            return;
+        }
+        self.perform_commit(staged, unstaged, message, cx);
+    }
+
+    /// A changelist row click: the window's diff preview follows the file
+    /// (dirty buffer wins over the disk, like the ⌃D overlay).
+    fn preview_commit_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(host) = self.host.clone() else { return };
+        let current = match self.tabs.iter().find(|tab| tab.path == path) {
+            Some(tab) if tab.dirty => Some(tab.pane.read(cx).buffer_text()),
+            _ => None,
+        };
+        let current = current.or_else(|| std::fs::read_to_string(&path).ok()).unwrap_or_default();
+        if let Some(window) = &mut self.commit_window {
+            window.diff_for = Some(path.clone());
+            window.diff_lines.clear();
+        }
+        let bus = self.bus.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let result = host.git_line_hunks(&path, &current).map(|hunks| diff_view::from_hunks(&hunks, &current));
+                bus.send(BusMessage::CommitDiffReady { path, result });
+            })
+            .detach();
+        cx.notify();
+    }
+
     /// Hands the focus to the topmost live surface: the still-open overlays
     /// first (topmost in the render order), then the active editor pane,
     /// then the (visible) tree, then the workbench root. Every hide/close
@@ -1332,17 +1441,28 @@ impl Workbench {
             cx.notify();
             return;
         }
+        self.perform_commit(staged, unstaged, message, cx);
+    }
+
+    /// The staging + commit work both commit faces share (⌘K's dialog and
+    /// the M10 Commit window): unstaging first, so a previously staged-
+    /// then-unchecked file does not ride along.
+    fn perform_commit(
+        &mut self,
+        staged: Vec<PathBuf>,
+        unstaged: Vec<PathBuf>,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
         let Some(host) = self.host.clone() else { return };
         let bus = self.bus.clone();
         cx.background_executor()
             .spawn(async move {
-                // Unstage first so a previously staged-then-unchecked file
-                // does not ride along.
                 let result = host
                     .git_unstage(&unstaged)
                     .and_then(|()| host.git_stage(&staged))
                     .and_then(|()| host.git_commit(&message));
-                bus.send(BusMessage::CommitDone { result });
+                bus.send(BusMessage::CommitDone { result, message });
             })
             .detach();
     }
@@ -2631,7 +2751,7 @@ impl Workbench {
                 }
                 cx.notify();
             }
-            BusMessage::CommitDone { result } => {
+            BusMessage::CommitDone { result, message } => {
                 match result {
                     Ok(id) => {
                         let short: String = id.chars().take(7).collect();
@@ -2640,6 +2760,15 @@ impl Workbench {
                         self.restore_focus_pending.set(true);
                         self.toast(NotifyLevel::Info, format!("{} {short}", strings::COMMIT_TOAST));
                         eprintln!("[vcs] committed {id}");
+                        // The message joins the Commit window's history
+                        // (settings, newest first), then the changelist
+                        // rebuilds on the git refresh.
+                        if !message.trim().is_empty() {
+                            self.settings.commit_messages.retain(|seen| seen != &message);
+                            self.settings.commit_messages.insert(0, message);
+                            self.settings.commit_messages.truncate(COMMIT_HISTORY_CAP);
+                            settings::save(&self.settings);
+                        }
                         self.refresh_git(cx);
                     }
                     Err(e) => {
@@ -2647,6 +2776,15 @@ impl Workbench {
                     }
                 }
                 cx.notify();
+            }
+            BusMessage::CommitDiffReady { path, result } => {
+                if let Some(window) = self.commit_window.as_mut()
+                    && window.diff_for.as_deref() == Some(path.as_path())
+                    && let Ok(lines) = result
+                {
+                    window.diff_lines = lines;
+                    cx.notify();
+                }
             }
             BusMessage::FindInFilesStart { request, query } => {
                 // Snapshot the dirty open buffers once (their text wins over
@@ -3543,6 +3681,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_toggle_structure))
             .on_action(cx.listener(Self::on_hide_active_tool_window))
             .on_action(cx.listener(Self::on_maximize_tool_window))
+            .on_action(cx.listener(Self::on_toggle_commit))
             .on_action(cx.listener(Self::on_reopen_closed_tab))
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_cancel))
@@ -3878,10 +4017,18 @@ impl Workbench {
                             .icon(IconName::EllipsisVertical)
                             .xsmall()
                             .ghost()
-                            .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, window, cx| {
+                            .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |mut menu, window, cx| {
                                 let id = desc.id;
-                                // Window-specific entries would come first
-                                // (the Commit window adds its own in M10 ④).
+                                // Window-specific entries come first (the
+                                // Commit window refreshes its changelist).
+                                if desc.id == "commit" {
+                                    let wb = workbench.clone();
+                                    menu = menu.item(PopupMenuItem::new(strings::TW_REFRESH_CHANGES).on_click(
+                                        move |_, _, cx| {
+                                            wb.update(cx, |this, cx| this.rebuild_commit_files(cx)).ok();
+                                        },
+                                    ));
+                                }
                                 let move_menu = PopupMenu::build(window, cx, |sub, _, _| {
                                     let mut sub = sub;
                                     for (target, label) in [
@@ -3916,7 +4063,7 @@ impl Workbench {
                             }),
                     ),
             )
-            .child(div().flex_1().min_h_0().min_w_0().overflow_hidden().child(body))
+            .child(div().flex_1().min_h_0().min_w_0().overflow_hidden().flex().flex_col().child(body))
             .into_any_element()
     }
 
@@ -3928,6 +4075,7 @@ impl Workbench {
             "structure" => self.render_structure_body(cx),
             "bookmarks" => Some(self.render_bookmarks_body(cx)),
             "problems" => Some(self.render_problems_body(cx)),
+            "commit" => Some(self.render_commit_window_body(cx)),
             "find" => Some(self.find_panel.clone()?.into_any_element()),
             "usages" => self.render_usages_body(cx),
             "run" => Some(self.render_run_body(cx)),
@@ -4257,6 +4405,197 @@ impl Workbench {
             );
         }
         Some(div().id("window-scroll-usages").flex_1().min_h_0().overflow_y_scroll().children(rows).into_any_element())
+    }
+
+    /// The Commit window's body (M10, the IDEA 2020+ left-side Commit): the
+    /// changelist checkbox rows beside the selected file's diff preview, the
+    /// message history above the message input, and the Commit button. The
+    /// ⌘K dialog stays as the direct route (both commit through
+    /// `perform_commit`).
+    fn render_commit_window_body(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(window) = &self.commit_window else {
+            return self.render_window_placeholder(strings::TW_NOTHING_COMMIT);
+        };
+        let empty = window.files.is_empty();
+        let workbench = cx.entity().downgrade();
+        // The changelist: a checkbox + the git-kind-colored name per file; a
+        // row click (outside the checkbox) loads the diff preview.
+        let mut list = div().id("commit-window-files").min_h_0().overflow_y_scroll();
+        if empty {
+            list = list.child(self.render_window_placeholder(strings::COMMIT_NO_CHANGES));
+        }
+        for (index, file) in window.files.iter().enumerate() {
+            let color = theme::git_status_color(file.kind);
+            let path = file.path.clone();
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("commit-window-row-{index}")))
+                    .h(px(26.0))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.))
+                    .hover(|row| row.bg(theme::raised_bg()))
+                    .on_click(
+                        cx.listener(move |this, _: &ClickEvent, _, cx| this.preview_commit_file(path.clone(), cx)),
+                    )
+                    .child(Checkbox::new(("commit-window-check", index)).checked(file.selected).on_click({
+                        let workbench = workbench.clone();
+                        move |checked, _, cx| {
+                            workbench
+                                .update(cx, |this, cx| {
+                                    if let Some(file) = this.commit_window.as_mut().and_then(|w| w.files.get_mut(index))
+                                    {
+                                        file.selected = *checked;
+                                    }
+                                    cx.notify();
+                                })
+                                .ok();
+                        }
+                    }))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .when_some(color, |name, c| name.text_color(c))
+                            .child(SharedString::from(file.name.clone())),
+                    ),
+            );
+        }
+        // The diff preview: the selected file's hunks, or the hint.
+        let diff = div()
+            .id("commit-window-diff")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .py_1()
+            .font_family(theme::FONT_FAMILY)
+            .text_size(px(12.))
+            .line_height(px(theme::FONT_SIZE * 1.35))
+            .children(match window.diff_for.as_ref() {
+                None => Some(
+                    div().p_2().text_color(theme::fg_muted()).child(SharedString::from(strings::TW_COMMIT_DIFF_HINT)),
+                ),
+                Some(path) => {
+                    let mut rows = div();
+                    rows = rows
+                        .child(div().px_2().pb_1().text_color(theme::fg()).child(SharedString::from(file_name(path))));
+                    if window.diff_lines.is_empty() {
+                        rows = rows.child(
+                            div()
+                                .px_2()
+                                .text_color(theme::fg_muted())
+                                .child(SharedString::from(strings::DIFF_NO_CHANGES)),
+                        );
+                    }
+                    for (index, line) in window.diff_lines.iter().enumerate() {
+                        let (marker, color, text) = match line {
+                            DiffLine::Hunk(text) => ("  ", theme::fg_muted(), text.clone()),
+                            DiffLine::Del(text) => ("- ", theme::error(), text.clone()),
+                            DiffLine::Add(text) => ("+ ", theme::diff_added(), text.clone()),
+                        };
+                        rows = rows.child(
+                            div()
+                                .id(("commit-window-diff-line", index))
+                                .h(px(18.0))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .w(px(16.0))
+                                        .text_color(color)
+                                        .child(SharedString::from(marker.to_owned())),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(if matches!(line, DiffLine::Hunk(_)) {
+                                            theme::fg_muted()
+                                        } else {
+                                            theme::fg()
+                                        })
+                                        .child(SharedString::from(text)),
+                                ),
+                        );
+                    }
+                    Some(rows)
+                }
+            });
+        // The message area: history above, the input, the Commit button.
+        let history: Vec<String> = self.settings.commit_messages.clone();
+        let has_history = !history.is_empty();
+        let workbench_history = workbench.clone();
+        let mut message = div().flex().flex_col().border_t_1().border_color(theme::border());
+        if has_history {
+            message = message.child(
+                div().px_2().pt_1().child(
+                    Button::new("commit-window-history")
+                        .label(strings::TW_COMMIT_HISTORY)
+                        .xsmall()
+                        .ghost()
+                        .dropdown_menu_with_anchor(gpui::Anchor::TopLeft, move |mut menu, _, _| {
+                            for message in &history {
+                                let workbench = workbench_history.clone();
+                                let text = message.clone();
+                                menu = menu.item(PopupMenuItem::new(message.clone()).on_click(move |_, window, cx| {
+                                    workbench
+                                        .update(cx, |this, cx| {
+                                            if let Some(commit) = &this.commit_window {
+                                                commit.input.update(cx, |input, cx| input.set_value(&text, window, cx));
+                                            }
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                }));
+                            }
+                            menu
+                        }),
+                ),
+            );
+        }
+        let input = window.input.clone();
+        message = message
+            .child(
+                div()
+                    .h(px(72.0))
+                    .flex_none()
+                    .px_1()
+                    .id("commit-window-message")
+                    .overflow_y_scroll()
+                    .border_t_1()
+                    .border_color(theme::border())
+                    .child(Textarea::new(&input).h_full().bordered(false)),
+            )
+            .child(
+                div().flex().justify_end().px_2().py_1().border_t_1().border_color(theme::border()).child(
+                    Button::new("commit-window-submit")
+                        .label(strings::COMMIT_BUTTON)
+                        .xsmall()
+                        .secondary()
+                        .disabled(empty)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.commit_window_confirm(cx))),
+                ),
+            );
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_row()
+                    .child(list.w(px(180.0)).border_r_1().border_color(theme::border()))
+                    .child(diff),
+            )
+            .child(message)
+            .into_any_element()
     }
 
     /// The Run window's body: the session tabs over the active panel (the

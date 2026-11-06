@@ -61,10 +61,6 @@ pub enum BusMessage {
         title: String,
         result: IdeResult<Vec<crate::diff_view::DiffLine>>,
     },
-    /// The commit flow finished: the new HEAD commit id, or the failure.
-    CommitDone {
-        result: IdeResult<String>,
-    },
     /// ⇧⌘F (M5): the Find panel asked for a project search; the workbench
     /// snapshots the dirty open buffers (their text wins over the disk) and
     /// runs `ide_search::search` on the background executor.
@@ -127,6 +123,18 @@ pub enum BusMessage {
         path: PathBuf,
         symbol: String,
         locations: Vec<ide_core::Location>,
+    },
+    /// The Commit window's diff preview finished building (M10; the read ran
+    /// on the background executor like the ⌃D overlay's).
+    CommitDiffReady {
+        path: PathBuf,
+        result: IdeResult<Vec<crate::diff_view::DiffLine>>,
+    },
+    /// The commit flow finished: the new HEAD commit id, or the failure —
+    /// with the message, so the Commit window's history keeps it (M10).
+    CommitDone {
+        result: IdeResult<String>,
+        message: String,
     },
 }
 
