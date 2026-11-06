@@ -77,6 +77,15 @@ pub static BINDINGS: &[Binding] = &[
     binding!("shift-cmd-f", "workbench::FindInFiles", None, Some("find.inPath")),
     binding!("cmd-1", "workbench::ToggleTree", None, Some("toolwindow.project")),
     binding!("cmd-4", "workbench::ToggleDock", None, Some("toolwindow.run")),
+    // The M10 stripe slots (⌘0 rides in with the Commit window).
+    binding!("cmd-2", "workbench::ToggleBookmarks", None, Some("toolwindow.bookmarks")),
+    binding!("cmd-3", "workbench::ToggleFind", None, Some("toolwindow.find")),
+    binding!("cmd-6", "workbench::ToggleProblems", None, Some("toolwindow.problems")),
+    binding!("cmd-7", "workbench::ToggleStructure", None, Some("toolwindow.structure")),
+    binding!("shift-escape", "workbench::HideActiveToolWindow", None, Some("toolwindow.hideActive")),
+    // The preset's Meta+Shift+' converts to the shifted face (the macOS
+    // physical-key rule: ⌘⇧' produces `"` and drops the shift).
+    binding!("cmd-\"", "workbench::MaximizeToolWindow", None, Some("toolwindow.maximize")),
     binding!("shift-cmd-t", "workbench::ReopenClosedTab", None, None),
     binding!("cmd-,", "workbench::OpenSettings", None, Some("file.settings")),
     binding!("escape", "workbench::Cancel", None, None),

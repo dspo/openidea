@@ -66,17 +66,36 @@ pub struct TabSession {
     pub cursor_col_utf16: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Layout {
     pub tree_visible: bool,
     pub tree_width: f32,
     pub dock_visible: bool,
     pub dock_height: f32,
+    /// Which tool window owns the left dock area (M10); None = none open.
+    pub left_active: Option<String>,
+    /// Which tool window owns the right dock area (M10; empty until a Move
+    /// to puts a window there).
+    pub right_active: Option<String>,
+    /// The maximized tool window (M10), if any.
+    pub maximized: Option<String>,
+    /// Per-tool-window user state (M10): visibility, stripe decisions, Move
+    /// to overrides. Sparse — untouched windows follow the table.
+    pub windows: BTreeMap<String, crate::toolwindow::WindowState>,
 }
 
 impl Default for Layout {
     fn default() -> Self {
-        Self { tree_visible: true, tree_width: 256.0, dock_visible: true, dock_height: 240.0 }
+        Self {
+            tree_visible: true,
+            tree_width: 256.0,
+            dock_visible: true,
+            dock_height: 240.0,
+            left_active: None,
+            right_active: None,
+            maximized: None,
+            windows: BTreeMap::new(),
+        }
     }
 }
 
@@ -120,6 +139,14 @@ struct StoreLayout {
     dock_visible: Option<bool>,
     #[serde(default)]
     dock_height: Option<f32>,
+    #[serde(default)]
+    left_active: Option<String>,
+    #[serde(default)]
+    right_active: Option<String>,
+    #[serde(default)]
+    maximized: Option<String>,
+    #[serde(default)]
+    windows: BTreeMap<String, crate::toolwindow::WindowState>,
 }
 
 /// The settings file path (`None` keeps everything in memory — the defaults).
@@ -290,6 +317,10 @@ fn from_store(store: Store) -> Settings {
                 .and_then(|l| l.dock_height)
                 .filter(|h| DOCK_HEIGHT_RANGE.contains(h))
                 .unwrap_or(defaults.layout.dock_height),
+            left_active: layout.as_ref().and_then(|l| l.left_active.clone()),
+            right_active: layout.as_ref().and_then(|l| l.right_active.clone()),
+            maximized: layout.as_ref().and_then(|l| l.maximized.clone()),
+            windows: layout.map(|l| l.windows).unwrap_or_default(),
         },
         font_size: store.font_size.filter(|size| FONT_SIZE_RANGE.contains(size)).unwrap_or(defaults.font_size),
         session,
@@ -322,6 +353,10 @@ pub fn save(settings: &Settings) {
             tree_width: Some(settings.layout.tree_width),
             dock_visible: Some(settings.layout.dock_visible),
             dock_height: Some(settings.layout.dock_height),
+            left_active: settings.layout.left_active.clone(),
+            right_active: settings.layout.right_active.clone(),
+            maximized: settings.layout.maximized.clone(),
+            windows: settings.layout.windows.clone(),
         }),
         font_size: Some(settings.font_size),
         session: settings.session.clone(),
@@ -518,7 +553,13 @@ mod tests {
         // so the test does not touch it).
         let settings = Settings {
             recent_projects: vec![PathBuf::from("/tmp/m7-roundtrip")],
-            layout: Layout { tree_visible: false, tree_width: 300.0, dock_visible: false, dock_height: 320.0 },
+            layout: Layout {
+                tree_visible: false,
+                tree_width: 300.0,
+                dock_visible: false,
+                dock_height: 320.0,
+                ..Layout::default()
+            },
             font_size: 16.0,
             session: BTreeMap::from([(
                 "/tmp/m8-roundtrip".to_owned(),
@@ -541,6 +582,10 @@ mod tests {
                 tree_width: Some(settings.layout.tree_width),
                 dock_visible: Some(settings.layout.dock_visible),
                 dock_height: Some(settings.layout.dock_height),
+                left_active: settings.layout.left_active.clone(),
+                right_active: settings.layout.right_active.clone(),
+                maximized: settings.layout.maximized.clone(),
+                windows: settings.layout.windows.clone(),
             }),
             font_size: Some(settings.font_size),
             session: settings.session.clone(),
@@ -554,6 +599,9 @@ mod tests {
         assert_eq!(layout.tree_width, Some(300.0));
         assert_eq!(layout.dock_visible, Some(false));
         assert_eq!(layout.dock_height, Some(320.0));
+        assert!(layout.windows.is_empty());
+        assert_eq!(layout.left_active, None);
+        assert_eq!(layout.maximized, None);
         assert_eq!(back.font_size, Some(16.0));
         // The session round-trips verbatim (M8).
         assert_eq!(back.session, settings.session);

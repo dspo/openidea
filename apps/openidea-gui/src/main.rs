@@ -31,6 +31,7 @@ mod settings;
 mod strings;
 mod templates;
 mod theme;
+mod toolwindow;
 mod workbench;
 
 use std::path::PathBuf;

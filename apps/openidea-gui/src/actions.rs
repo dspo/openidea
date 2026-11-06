@@ -29,6 +29,14 @@ actions!(
         ToggleDock,
         ReopenClosedTab,
         OpenSettings,
+        // M10 tool-window stripes: the lit windows' slot keys (⌘2/3/6/7 join
+        // ⌘1/⌘4), plus the window-manager verbs the header menus share.
+        ToggleBookmarks,
+        ToggleFind,
+        ToggleProblems,
+        ToggleStructure,
+        HideActiveToolWindow,
+        MaximizeToolWindow,
         // M9 navigation habits.
         RecentFiles,
         RecentLocations,
@@ -184,6 +192,12 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("workbench::ToggleTree", "Toggle Project Tree", "View", "⌘1"),
     action_info!("workbench::ToggleDock", "Toggle Dock", "View", "⌘4"),
     action_info!("workbench::OpenSettings", "Settings…", "View", "⌘,"),
+    action_info!("workbench::ToggleBookmarks", "Bookmarks", "View", "⌘2"),
+    action_info!("workbench::ToggleFind", "Find", "View", "⌘3"),
+    action_info!("workbench::ToggleProblems", "Problems", "View", "⌘6"),
+    action_info!("workbench::ToggleStructure", "Structure", "View", "⌘7"),
+    action_info!("workbench::HideActiveToolWindow", "Hide Active Tool Window", "View", "⇧⎋"),
+    action_info!("workbench::MaximizeToolWindow", "Maximize Tool Window", "View", "⌘⇧'"),
     action_info!("editor::Paste", "Paste", "Edit", "⌘V"),
     action_info!("editor::TabIndent", "Indent / Expand Template", "Edit", "⇥"),
     action_info!("editor::OutdentLine", "Outdent Line", "Edit", "⇧⇥"),
