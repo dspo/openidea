@@ -128,3 +128,9 @@ pub const TW_NOTHING_COMMIT: &str = "No changes to commit";
 pub const TW_REFRESH_CHANGES: &str = "Refresh Changes";
 pub const TW_COMMIT_HISTORY: &str = "History…";
 pub const TW_COMMIT_DIFF_HINT: &str = "Select a file to preview its diff";
+
+// M10 project trust.
+pub const TRUST_TITLE: &str = "Trust and Open Project?";
+pub const TRUST_HINT: &str = "Projects in the trusted list open without this prompt.";
+pub const TRUST_ACCEPT: &str = "Trust Project";
+pub const TRUST_DECLINE: &str = "Don't Open";

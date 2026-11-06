@@ -178,6 +178,9 @@ pub static BINDINGS: &[Binding] = &[
     // -- palette list navigation ---------------------------------------------
     binding!("up", "palette::SelectPrev", Some("Palette"), None),
     binding!("down", "palette::SelectNext", Some("Palette"), None),
+    // -- project trust prompt (M10): Enter trusts; Esc is the window-level
+    // Cancel chain, which the prompt consumes as Don't Open.
+    binding!("enter", "workbench::TrustProject", Some("TrustPrompt"), None),
 ];
 
 /// The IDEA-notation rows whose first step is a bare modifier press: those
