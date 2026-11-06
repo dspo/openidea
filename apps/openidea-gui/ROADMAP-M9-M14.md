@@ -1,178 +1,137 @@
-# openidea-gui 路线图 M9–M14（本期修订版）：IDEA 习惯面 + Go/Rust/Python·TS/JS 本地开发体验
+# openidea-gui 路线图 M9–M14（fork 原则修订版）：IDEA 习惯面 + 五语言本地 DX
 
-> 承接 M0–M8（IME 门 → 工作台 → 编辑器 → LSP → run/git → 编辑器成熟 → Go 体验 → 工作台打磨 → 日用化）。
-> 分支链末端：`feat/gpui-m8-daily-driver`（= origin/Native tip）。
+> 承接 M0–M8。分支链末端：`feat/gpui-m8-daily-driver`（= origin/Native tip）。
 
 ## 总目标与本期焦点
 
 **openidea 的最大价值是对 JetBrains IDEA UI 与使用习惯的复刻；GPUI 版必须达到同等的
-UI 与习惯一致性。** 本期在完整对标第一个 big bang commit（`9a2025b7`）的长线路径上，
-聚焦两件事：
+UI 与习惯一致性。** 本期聚焦：①IDEA 习惯面（键位/菜单/工具窗/状态栏/微习惯）；
+②五语言本地开发体验（Go 已深耕 → Rust/Python/TS/JS/Node 拉齐）。
 
-1. **IDEA 习惯面**：键位（221 条 intellij-macos 预设）、菜单栏、工具窗 stripe 体系、
-   状态栏 widgets、编辑/导航微习惯——它们是所有功能的放大器，优先级最高。
-2. **五语言本地开发体验**：Go（M6 已深耕）→ Rust、Python、TS/JS/Node 拉齐到同一
-   基线：LSP/调试/测试/格式化/重构全通，纯本地，不依赖远端服务。
+## Fork 原则（本路线图的第一纪律）
 
-## 边界（本期暂缓 ≠ 不做，后续路线回收）
+本项目是 fork：**长期同步上游（l0ng-ai/openidea）、不向上游贡献**。因此：
 
-- **Maven/Gradle sync 与 Java 构建链**（本期不做 Java）
-- **GitHub PR**（本期只做本地开发体验；Git 本地全量照做）
-- **DB / HTTP client / Docker 工具家族**、**WASM 插件 UI**、**60+ 语言广度冒烟**、
-  **zh 双语**、**主题切换系统**
-- post-first-commit 能力（notebook/agent/remote/spell/web 视图）、Windows/Linux 平台
+1. **后端树目标零 diff**：`crates/`、`languages/`、`src/`、`src-tauri/`、`wit/`、
+   `fixtures/`、根 `Cargo.lock` 与根 `Cargo.toml` 的 workspace 部分——除非结构性
+   必需，不改动；所有 GPUI 前端实现一律在 `apps/openidea-gui` 独立 crate 内。
+2. **现状盘点（2026-11-05）**：我方后端漂移仅 3 处——根 `Cargo.toml` 的
+   `exclude = ["apps/openidea-gui"]`（结构性必需，保留）、`languages/go.toml` 两行
+   （gopls semanticTokens / inlay hints 开关）。**M9 将把 go.toml 两行回迁 app 侧**
+   （LSP server options 覆盖层），恢复 `languages/` 与上游零 diff。
+3. **上游同步是周期性工作**：fork 基点已落后 upstream/main（ide-vcs log/history、
+   ide-lsp、ide-workspace 等大改）。**每里程碑 phase 0 = 同步 upstream/main**；
+   首次同步（M9 phase 0）工作量最大。同步冲突与修复一律发生在 app 侧。
+4. **防腐层（adapter）纪律**：UI 代码不得散点 `use ide_*`——后端访问统一经 app 内
+   `host.rs`/service 层收敛，上游 API 变动的波及面集中到一处文件集。
+5. 后端改动默认禁止；此前计划中「related-information 需改 ide-core/ide-lsp」一项
+   **撤销、回缓建清单**（等上游实现，或届时评估独立 shim crate，不动上游文件）。
+
+## 边界（本期暂缓 ≠ 不做）
+
+Maven/Gradle 与 Java 构建链；GitHub PR；DB/HTTP/Docker 工具家族；WASM 插件 UI；
+60+ 语言广度冒烟；zh 双语；主题切换；post-first-commit 能力（notebook/agent/
+remote/spell/web 视图）；Windows/Linux 平台；related-info（受 fork 原则约束）。
 
 ## 验收权威清单（本期版）
 
-1. `intellij-macos` 221 条键位（`src/platform/keymaps/intellij-macos.ts`）逐条对账
-2. 工具窗：stripe 体系建齐 + **本期窗口集**点亮（project/structure/bookmarks/commit/
-   terminal/run/debug/problems/find/usages/todo/git/coverage→测试与检查相关窗）；
-   缓建窗口（DB/GitHub/Docker/Maven/Gradle/profiler/inspection-results…）保留注册
-   数据位、不点亮
-3. 五语言 DX 矩阵：每语言「检测/注释/高亮/语义 tokens/LSP 生命周期/补全/跳转/重命名/
-   格式化/inlay hints/quick fixes/调试/测试/运行」列项打勾
+1. `intellij-macos` 221 条键位逐条对账（done/placeholder/na）
+2. 工具窗：stripe 体系 + 本期窗口集点亮；缓建窗口留注册数据位不渲染
+3. 五语言 DX 矩阵：检测/注释/高亮/语义 tokens/LSP 生命周期/补全/跳转/重命名/
+   格式化/inlay hints/quick fixes/调试/测试/运行
 4. 工作台形态：macOS 全菜单、状态栏 widgets、Commit 工具窗、trust 对话框
-
-## 差距评估摘要（对照第一个 commit，2026-11-05）
-
-习惯面（键位/菜单/工具窗/状态栏/微习惯）= 大差距；功能家族（终端/调试/测试树/VCS
-本地面）= 大差距；五语言里 Go 已达 M6 基线、Rust 顺带可用、Python/TS 未接；
-编辑器内核/LSP/性能已超日用基线。详细矩阵见 git 历史前版本文档。
+5. **Fork 卫生**：每里程碑结束时 `git diff upstream/main..HEAD -- crates/ languages/
+   src/ src-tauri/ wit/ Cargo.lock` 中我方改动仅剩根 exclude 一行
 
 ---
 
-## M9 — 键位与导航习惯层（≈M2 量级）
+## M9 — 上游同步 + 键位与导航习惯层（≈M2+ 量级）
 
-**目标**：以 221 条 intellij-macos 绑定为验收表，键位与导航习惯对齐 IDEA。
+**目标**：完成首次上游同步并建立同步机制；以 221 条绑定对齐 IDEA 键位与导航习惯。
 
 **范围**：
-1. 键位体系升级：preset 数据移植（intellij-macos 全量，intellij-windows/vscode 数据
-   一并入库存备用）、用户覆盖、双击 chord、物理键位匹配（macOS ⌥ 符号问题）。
+0. **首次上游同步**：merge upstream/main 进链（上游 ide-vcs/ide-lsp/ide-workspace
+   大改，app 修复集中在 host.rs/适配层）；同步后全量回归 M0–M8 行为；把 go.toml
+   两行回迁 app 侧 server options 覆盖层。**此后每里程碑 phase 0 重复小规模同步**。
+1. 键位体系升级：intellij-macos 221 条 preset 数据移植（win/vscode 数据一并入库
+   备用）、用户覆盖、双击 chord、物理键位匹配（macOS ⌥ 符号）。
 2. 编辑微习惯：⌘D 复制行/选区、⌘/ 与 ⌘⇧/ 注释、⌥↑/⌥↓ 扩展/收缩选区、⌘⇧↑/↓
-   移动行等（按 221 清单编辑段逐条对账）。
-3. 导航习惯：⌘E 最近文件、⌘⇧E 最近位置、⌘[/⌘] back/forward、F2/⇧F2 错误跳转、
-   F3/⌘F3 书签、⌘F12 文件结构 popup、⌃⇥ Switcher、⌘L 行跳转、⌘⌥B/⌘⇧B、
-   ⌘⇧⌹ 最后编辑位置。
-4. **放开后端约束第一处**：`ide-core::Diagnostic` 加 related information +
-   `ide-lsp` 转换（单独提交，Tauri 版同受益），诊断 tooltip 多跳落地。
-5. 缺功能的 action 先注册占位（Find Action/键位表可见），221 清单逐条标注
-   done/placeholder/na。
+   移动行等（按 221 清单编辑段对账）。
+3. 导航习惯：⌘E/⌘⇧E 最近文件/位置、⌘[/⌘] back/forward、F2/⇧F2 错误跳转、
+   F3/⌘F3 书签、⌘F12 文件结构、⌃⇥ Switcher、⌘L、⌘⌥B/⌘⇧B、⌘⇧⌹。
+4. 缺功能的 action 先注册占位（Find Action/键位表可见）。
 
-**出口**：221 条对账表；真实导航流（back/forward、recent files、书签、错误跳转、
-switcher）实跑 transcript。
+**出口**：上游同步完成且回归全绿；221 条对账表；导航流实跑 transcript；
+go.toml 恢复与上游零 diff。
 
 ## M10 — 工作台结构层（≈M2–M3 量级）
 
-**目标**：工作台结构对齐 IDEA。
+（内容同前版：菜单栏全结构、工具窗 stripe 体系 + 本期窗口集、状态栏 widgets、
+Commit 工具窗、project trust、Structure/Bookmarks 窗。实现全部在 app crate；
+工具窗 contributions 模型对齐 Tauri 版 `contributions.ts` 语义，但为 app 内独立
+实现，不 import 上游前端代码。）
 
-**范围**：
-1. macOS 菜单栏全 IDEA 结构（File/Edit/View/Navigate/Code/Refactor/Build/Run/
-   Tools/VCS/Window/Help——缓建项的菜单条目灰色或隐藏），全部经 action registry 生成。
-2. 工具窗系统重构为 contributions 模型（对齐 Tauri 版 `contributions.ts` 语义）：
-   左/右/下三边 stripe、图标、badge（Problems 计数等）、`stripe: shown/onUse`、
-   header ⋮ 菜单（Move to/Maximize/Hide + 窗自定义项）、⌘⇧+数字显隐。
-   **体系 + 本期窗口集**点亮；缓建窗口留注册数据位不渲染。
-3. 状态栏 widgets 化：line:col、错误计数、encoding、行分隔符、VCS 分支、语言服务
-   状态；右键显隐菜单。
-4. **Commit 工具窗**（左侧，IDEA 2020+ 习惯）：changelist 勾选 + diff 预览 + 消息
-   历史；⌘K 对话框保留直达。
-5. Project trust 对话框；Structure 工具窗（⌘F12 窗形态）；Bookmarks 工具窗。
-
-**出口**：stripe 交互与 Tauri 版并排对照截图；菜单全结构截图；trust/commit 窗实跑；
-状态栏 widget 显隐菜单实测。
+**出口**：stripe 与 Tauri 版并排对照截图；菜单全结构截图；trust/commit 窗实跑。
 
 ## M11 — 终端 + 调试器（≈M2+M3 量级，预计续传一次）
 
-**目标**：补齐本地开发体验的两个重器；调试覆盖五语言。
+（内容同前版：vte 入 app 侧接线 + Terminal 工具窗；DAP 断点/单步/变量/条件断点；
+Services 窗最小面。**fork 修订**：`vte` 依赖加在 app crate，不改 `ide-terminal`；
+调试适配器以 `languages/*.toml` 现状声明为准——rust=codelldb、python、ts/js 的
+LSP+debugger 均已声明，**目标零 toml 改动**，确需改的先评估同步冲突。）
 
-**范围**：
-1. 终端：`vte` 入 `ide-terminal`，Terminal 工具窗（bottom，"Local × + ▾" header
-   形态、多 tab、随前台会话 cwd）；自绘 cell grid 渲染。
-2. DAP 调试器：gutter 断点（⌘F8）、Debug 工具窗（Variables/Watches/Call Stack/
-   Console）、F7/F8/F9、当前行高亮、条件断点；launch/attach 并入 run 配置体系。
-   适配器以 `languages/*.toml` 的 `[debugger]` 声明为准：Go=delve（已配）、
-   Rust=codelldb/lldb-dap、Python=debugpy、TS/JS/Node=js-debug；**缺失的 toml 条目
-   补齐（单独提交，含 install-hint）**，本机按 hint 安装。
-3. Services 工具窗最小面（运行中会话列表 + 日志跟随，run/debug 会话统一入列）。
+**出口**：五语言各一条断点调试实跑；终端多 tab transcript；会话入 Services 窗。
 
-**出口**：五语言各一条「断点→单步→看变量→继续」实跑（fixtures 或 scratch）；
-终端多 tab + 交互 transcript；⌃R/Debug 会话在 Services 窗可见。
+## M12 — 测试树 + 检查（≈M3 量级）
 
-## M12 — 测试树 + 检查（≈M3 量级，本期无构建链）
+（内容同前版：Run/Debug 树形态 + gutter 运行标记 + 失败跳转；适配器 app 侧
+parser——go test -json / cargo test(nextest JSON 优先) / pytest junitxml / vitest
+jest JSON；Problems 工具窗聚合过滤；`ide-analysis` 重复检查接入。构建链暂缓，
+`go build`/`cargo check` 走既有 run 配置。）
 
-**目标**：IDEA 的测试与检查体验（构建链按边界暂缓；go build/cargo check 走既有
-run 配置即够用）。
+**出口**：五语言测试树绿红态 + 失败跳转实跑（fixtures 补样例不入仓库树根）；
+重复检查可跳转。
 
-**范围**：
-1. 测试树：Run/Debug 工具窗的树形态（套件/用例/状态图标/时长/重跑）、编辑器
-   gutter 的运行单测标记、失败跳转 + 实际值/期望值对照。适配器（app 侧 parser +
-   `ide-run` 执行）：
-   - Go：`go test -json`
-   - Rust：`cargo test`（nextest JSON 若可用优先，否则解析 libtest 输出）
-   - Python：`pytest --junitxml`（或 `-v` 解析）
-   - TS/JS/Node：vitest / jest 的 JSON reporter
-   Java 走 `ide-build` 测试模型——**本期暂缓，接缝留注释**。
-2. Problems 工具窗：诊断聚合（编辑器 + 全项目两级）、过滤、F2 导航联动。
-3. Inspections：`ide-analysis` 重复代码检查接入（InspectionResults/Duplicates 窗）、
-   与 Problems 的分级展示。
+## M13 — 本地 VCS 全量（≈M3 量级，上游同步受益项）
 
-**出口**：五语言各自的测试树绿红态 + 失败跳转实跑（fixtures 建对应测试样例，不
-弄脏仓库）；重复检查出结果可跳转。
+**fork 注意**：上游对 ide-vcs 的 log/history 有大重构——本期开工前先完成例行
+上游同步，log graph 的数据面**用上游新 API**（白拿上游成果，这正是同步的价值）。
 
-## M13 — 本地 VCS 全量（≈M3 量级）
+（内容同前版：Git 工具窗 log graph/branches popup/blame 双形态/冲突最小 UI/
+changelists；Find Usages 工具窗；行内 blame 开关。GitHub 暂缓。）
 
-**目标**：VCS 从最小面到第一个 commit 的本地全量（GitHub 按边界暂缓）。
-
-**范围**：
-1. Git 工具窗（bottom）：log 历史 graph（分支拓扑着色）、branches popup
-   （新建/切换/删除/rebase 最小集）、blame 注释模式 + 行内 blame、冲突解决最小 UI
-   （ours/theirs）、changelists。
-2. 行内 blame 开关；Commit 工具窗（M10）与 Git 窗共享 `ide-vcs::Repo` 数据一致性。
-3. Find Usages 工具窗（bottom）：结果树形态（M3 jump list 的窗化）。
-
-**出口**：scratch 仓库走完分支操作 + 历史浏览 + blame + 冲突解决；usages 窗树形
-浏览 + 分组跳转实跑。
+**出口**：scratch 仓库分支操作 + 历史浏览 + blame + 冲突解决全流程；usages 树形
+浏览实跑。
 
 ## M14 — 五语言深耕收官 + 产品形态补齐（≈M8 量级，可拆两次派单）
 
-**目标**：把 Rust/Python/TS/JS/Node 拉齐到 Go 的 M6 基线；产品形态收官。
+（内容同前版：五语言 DX 拉齐——rust-analyzer/basedpyright 或 pyright + ruff/
+vtsls 或 typescript-language-server，按 `languages/*.toml` 现状走，**options 差异
+走 app 侧覆盖层，目标零 toml 改动**；每语言实测脾性入报告；重命名抽样（Python
+动态性、js/ts 边界）；TODO 视图、scratch、viewers、welcome；Settings 的 keymap
+页（预设/覆盖/录制器）；收官三方对账 + 下期回收方案。）
 
-**范围**：
-1. **五语言 DX 拉齐**（矩阵逐项：检测/注释/高亮/语义 tokens/LSP 生命周期/补全/
-   跳转/重命名/格式化/inlay hints/quick fixes/调试/测试/运行）：
-   - LSP/服务器：rust-analyzer（已通）、pyright 或 basedpyright + ruff、
-     typescript-language-server 或 vtsls；按 `languages/*.toml` 走，缺配置修 toml
-     （单独提交，先例：go.toml 的 semanticTokens/hints 开关）。
-   - 每语言一节「实测脾性」进报告（gopls 的教训表明每家 LSP 都有暗坑：
-     能力默认关、静默降级、位置语义差异）。
-   - 抽样验证重命名正确性（Python 动态性、TS 的 js/ts 边界）。
-2. **产品形态补齐**：TODO 视图（`ide-search` TODO 扫描）、scratch files、
-   viewers 最小面（图片/只读文本）、welcome 页对齐（最近项目/打开）。
-3. **Settings 扩容**：keymap 页（预设切换/覆盖/**录制器**，对齐 Tauri 版），
-   其余页只读起步。
-4. **收官对账**：221 键位表 × 本期工具窗集 × 五语言 DX 矩阵三方清单逐项打勾；
-   与 Tauri 版并排截图对照；产出收官报告（残余差距 + 下一期路线建议：Maven/
-   Gradle、GitHub、工具家族、WASM 插件、多语言广度、zh 双语如何回收）。
-
-**出口**：三方清单全勾（或显式 na）；每语言至少一条真实开发循环 transcript；
-keymap 录制器实测改键并生效。
+**出口**：三方清单全勾（或显式 na）；每语言一条真实开发循环 transcript；
+fork 卫生检查（后端树 diff 仅剩 exclude 一行）。
 
 ---
 
-## 协作流程与纪律（延续 M0–M8）
+## 协作流程与纪律（延续 M0–M8 + fork 原则）
 
 code-deliver 派单；每 phase 一提交、提交时全绿（fmt + clippy `-D warnings` + 单测）；
-实跑验证 + 窗口级截图（绝不截全屏）；clean-room（Zed 不读或仅编码前参考+笔记先行）；
-**止步本地：禁止 `git push`、禁止 `gh pr create`**（推送由主会话统一到 origin/Native）；
-每里程碑 REPORT + 人工清单；新 worktree 基于上一里程碑分支；前序 worktree 勿动；
-主 workspace 不受影响——**例外**：小范围、单独提交、显著说明的后端改动允许
-（related-info 等以 Tauri 版同受益为准则）；长命令分开跑；只杀自己启动的进程。
+实跑验证 + 窗口级截图（绝不截全屏）；clean-room（Zed 不读或仅编码前参考+笔记先行；
+**同样不得复制上游 Tauri 前端代码**——实现独立，语义对齐）；**止步本地：禁止
+`git push`、禁止 `gh pr create`**（推送由主会话统一到 origin/Native）；每里程碑
+REPORT + 人工清单；新 worktree 基于上一里程碑分支；前序 worktree 勿动；
+**每里程碑 phase 0 同步 upstream/main**；**后端树零 diff（fork 卫生项进每期
+REPORT 验收）**；长命令分开跑；只杀自己启动的进程。
 
 ## 附录：验收权威文件
 
-| 清单 | 第一个 commit 路径 |
+| 清单 | 路径 |
 |---|---|
-| README 九条宣称 | `git show 9a2025b7:README.md` |
+| README 九条宣称 | `git show 9a2025b7:README.md`（对照基准，能力子集按本期边界裁剪） |
 | 键位预设（221 条） | `src/platform/keymaps/intellij-macos.ts` |
 | 工具窗注册与扩展点语义 | 各 feature `registerToolWindow` / `src/workbench/contributions.ts` |
-| 语言定义 | `languages/*.toml`（五语言为本期验收面） |
+| 语言定义 | `languages/*.toml`（五语言现状为准，目标零改动） |
+| 上游 | `upstream` = `https://github.com/l0ng-ai/openidea.git` |
