@@ -15,6 +15,11 @@ mod find_panel;
 mod fuzzy;
 mod highlight;
 mod host;
+mod keymap;
+// The preset tables: the active one binds; the other three stay as data for
+// the Settings keymap page (M14), re-synced by the generator.
+#[allow(dead_code)]
+mod keymap_data;
 mod markdown;
 mod perf;
 mod run_panel;
@@ -28,20 +33,11 @@ mod workbench;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{App, AppContext as _, KeyBinding, WindowBounds, WindowOptions, px, size};
+use gpui::{App, AppContext as _, WindowBounds, WindowOptions, px, size};
 use gpui_component::{Root, Theme, ThemeMode};
 use gpui_kit_assets::AllAssets;
 
-use crate::actions::{
-    Cancel, CloseTab, CodeActions, Commit, CursorDocEnd, CursorDocStart, CursorDown, CursorLeft, CursorLineEnd,
-    CursorLineHome, CursorRight, CursorUp, CursorWordLeft, CursorWordRight, DeleteBackward, DeleteForward,
-    DeleteWordBackward, DeleteWordForward, Find, FindInFiles, FindUsages, FormatDocument, GoToFile, GotoDefinition,
-    Newline, OpenFile, OpenSettings, OrganizeImports, OutdentLine, Paste, Quit, Redo, Rename, ReopenClosedTab, Run,
-    Save, SelectDocEnd, SelectDocStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineHome, SelectRight, SelectUp,
-    SelectWordLeft, SelectWordRight, ShowDiff, StopRun, TabIndent, ToggleDock, ToggleInlayHints, TogglePerfHud,
-    ToggleReplace, ToggleTree, Undo,
-};
-use crate::actions::{SelectNext, SelectPrev};
+use crate::actions::Quit;
 use crate::bus::Bus;
 use crate::host::Host;
 use crate::workbench::Workbench;
@@ -139,95 +135,17 @@ fn main() {
                 gpui_component::init(cx);
                 // The main app's chrome is dark; gpui-component defaults to light.
                 Theme::change(ThemeMode::Dark, None, cx);
-                cx.bind_keys([
-                    KeyBinding::new("cmd-q", Quit, None),
-                    KeyBinding::new("cmd-o", OpenFile, None),
-                    KeyBinding::new("cmd-s", Save, None),
-                    KeyBinding::new("cmd-w", CloseTab, None),
-                    KeyBinding::new("cmd-z", Undo, None),
-                    KeyBinding::new("shift-cmd-z", Redo, None),
-                    // M3: navigation and the command surfaces (the handlers land
-                    // with their features; an unhandled action is a no-op).
-                    // (Search Everywhere has no key binding: double ⇧ is a
-                    // modifiers-event gesture in the workbench, since
-                    // modifier-only presses never become keystrokes.)
-                    KeyBinding::new("shift-cmd-o", GoToFile, None),
-                    KeyBinding::new("cmd-b", GotoDefinition, None),
-                    KeyBinding::new("shift-f6", Rename, None),
-                    KeyBinding::new("alt-f7", FindUsages, None),
-                    // M4: run and git surfaces (handlers on the workbench).
-                    KeyBinding::new("ctrl-r", Run, None),
-                    KeyBinding::new("ctrl-cmd-r", StopRun, None),
-                    KeyBinding::new("ctrl-d", ShowDiff, None),
-                    KeyBinding::new("cmd-k", Commit, None),
-                    // M5: in-file find (⌘F) and Find in Files (⇧⌘F).
-                    KeyBinding::new("cmd-f", Find, Some("Editor")),
-                    KeyBinding::new("alt-cmd-f", ToggleReplace, Some("Editor")),
-                    KeyBinding::new("shift-cmd-f", FindInFiles, None),
-                    // M7: dock panel visibility (the IDEA gestures: ⌘1 Project,
-                    // ⌘4 Run/output).
-                    KeyBinding::new("cmd-1", ToggleTree, None),
-                    KeyBinding::new("cmd-4", ToggleDock, None),
-                    // M7: tab management.
-                    KeyBinding::new("shift-cmd-t", ReopenClosedTab, None),
-                    // M7: the minimal settings overlay.
-                    KeyBinding::new("cmd-,", OpenSettings, None),
-                    // Escape cancels panels/popups first (whatever has focus),
-                    // then collapses the editor's own state.
-                    KeyBinding::new("escape", Cancel, None),
-                    KeyBinding::new("f12", TogglePerfHud, None),
-                    // Editor commands live in the "Editor" key context so they
-                    // only fire while the editor pane holds focus (the file tree
-                    // keeps its own enter / arrow handling).
-                    KeyBinding::new("enter", Newline, Some("Editor")),
-                    KeyBinding::new("backspace", DeleteBackward, Some("Editor")),
-                    KeyBinding::new("delete", DeleteForward, Some("Editor")),
-                    KeyBinding::new("alt-backspace", DeleteWordBackward, Some("Editor")),
-                    KeyBinding::new("alt-delete", DeleteWordForward, Some("Editor")),
-                    // M5: language-driven indentation (tab / shift-tab).
-                    KeyBinding::new("tab", TabIndent, Some("Editor")),
-                    KeyBinding::new("shift-tab", OutdentLine, Some("Editor")),
-                    // M5: quick fixes and formatting.
-                    KeyBinding::new("alt-enter", CodeActions, Some("Editor")),
-                    KeyBinding::new("cmd-alt-l", FormatDocument, Some("Editor")),
-                    // M6: organize imports (also the ⌘S pre-save step) and inlay hints.
-                    KeyBinding::new("ctrl-alt-o", OrganizeImports, Some("Editor")),
-                    KeyBinding::new("alt-cmd-i", ToggleInlayHints, Some("Editor")),
-                    // Paste rides the editor context (the gpui-component inputs
-                    // keep their own clipboard handling).
-                    KeyBinding::new("cmd-v", Paste, Some("Editor")),
-                    KeyBinding::new("left", CursorLeft, Some("Editor")),
-                    KeyBinding::new("right", CursorRight, Some("Editor")),
-                    KeyBinding::new("up", CursorUp, Some("Editor")),
-                    KeyBinding::new("down", CursorDown, Some("Editor")),
-                    KeyBinding::new("alt-left", CursorWordLeft, Some("Editor")),
-                    KeyBinding::new("alt-right", CursorWordRight, Some("Editor")),
-                    KeyBinding::new("cmd-left", CursorLineHome, Some("Editor")),
-                    KeyBinding::new("cmd-right", CursorLineEnd, Some("Editor")),
-                    KeyBinding::new("cmd-up", CursorDocStart, Some("Editor")),
-                    KeyBinding::new("cmd-down", CursorDocEnd, Some("Editor")),
-                    KeyBinding::new("shift-left", SelectLeft, Some("Editor")),
-                    KeyBinding::new("shift-right", SelectRight, Some("Editor")),
-                    KeyBinding::new("shift-up", SelectUp, Some("Editor")),
-                    KeyBinding::new("shift-down", SelectDown, Some("Editor")),
-                    KeyBinding::new("shift-alt-left", SelectWordLeft, Some("Editor")),
-                    KeyBinding::new("shift-alt-right", SelectWordRight, Some("Editor")),
-                    KeyBinding::new("shift-cmd-left", SelectLineHome, Some("Editor")),
-                    KeyBinding::new("shift-cmd-right", SelectLineEnd, Some("Editor")),
-                    KeyBinding::new("shift-cmd-up", SelectDocStart, Some("Editor")),
-                    KeyBinding::new("shift-cmd-down", SelectDocEnd, Some("Editor")),
-                    // Palette list navigation (⇧⌘O / double-⇧). Registered after
-                    // gpui-component init, so for the same keystroke these beat
-                    // the query input's own cursor moves inside the palette.
-                    KeyBinding::new("up", SelectPrev, Some("Palette")),
-                    KeyBinding::new("down", SelectNext, Some("Palette")),
-                ]);
-                let (bus, rx) = Bus::channel();
                 // The persisted settings (recents, layout, font size) load once;
                 // the workbench owns the value and saves on change. The editor
                 // font size feeds the theme before any view renders.
                 let mut app_settings = settings::load();
                 theme::set_font_size(app_settings.font_size);
+                // The keymap (M9): the defaults are the IDEA preset rows in
+                // keymap::BINDINGS, registered data-driven after
+                // gpui_component::init (later registrations win keystroke
+                // ties). A persisted user override replaces a row's keys.
+                keymap::bind(cx, &app_settings.keymap_overrides);
+                let (bus, rx) = Bus::channel();
                 // The manager must be constructed inside the runtime's context so
                 // it captures this handle for its background tasks.
                 let host = {
