@@ -43,6 +43,8 @@ pub struct Settings {
     /// Bookmarks (M9), path -> ascending bookmarked lines. IDE-global (IDEA
     /// keeps bookmarks across projects too); written on toggle only.
     pub bookmarks: BTreeMap<String, Vec<u32>>,
+    /// Recent commit messages (M10's Commit window history), newest first.
+    pub commit_messages: Vec<String>,
 }
 
 /// One project's restored session (M8): the tabs in open order, the active
@@ -108,6 +110,7 @@ impl Default for Settings {
             session: BTreeMap::new(),
             keymap_overrides: BTreeMap::new(),
             bookmarks: BTreeMap::new(),
+            commit_messages: Vec::new(),
         }
     }
 }
@@ -127,6 +130,8 @@ struct Store {
     keymap_overrides: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     bookmarks: BTreeMap<String, Vec<u32>>,
+    #[serde(default)]
+    commit_messages: Vec<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -326,6 +331,7 @@ fn from_store(store: Store) -> Settings {
         session,
         keymap_overrides: store.keymap_overrides,
         bookmarks: store.bookmarks,
+        commit_messages: store.commit_messages,
     }
 }
 
@@ -362,6 +368,7 @@ pub fn save(settings: &Settings) {
         session: settings.session.clone(),
         keymap_overrides: settings.keymap_overrides.clone(),
         bookmarks: settings.bookmarks.clone(),
+        commit_messages: settings.commit_messages.clone(),
     };
     let Ok(json) = serde_json::to_string_pretty(&store) else { return };
     if let Some(parent) = path.parent()
@@ -574,6 +581,7 @@ mod tests {
             )]),
             keymap_overrides: BTreeMap::from([("file.save".to_owned(), vec!["Ctrl+S".to_owned()])]),
             bookmarks: BTreeMap::from([("/tmp/x.go".to_owned(), vec![3, 9])]),
+            commit_messages: vec!["initial".to_owned()],
         };
         let store = Store {
             recent_projects: settings.recent_projects.clone(),
@@ -591,6 +599,7 @@ mod tests {
             session: settings.session.clone(),
             keymap_overrides: settings.keymap_overrides.clone(),
             bookmarks: settings.bookmarks.clone(),
+            commit_messages: settings.commit_messages.clone(),
         };
         let back: Store = serde_json::from_str(&serde_json::to_string(&store).unwrap()).unwrap();
         assert_eq!(back.recent_projects, settings.recent_projects);
@@ -602,6 +611,8 @@ mod tests {
         assert!(layout.windows.is_empty());
         assert_eq!(layout.left_active, None);
         assert_eq!(layout.maximized, None);
+        // The commit history round-trips (M10).
+        assert_eq!(back.commit_messages, vec!["initial".to_owned()]);
         assert_eq!(back.font_size, Some(16.0));
         // The session round-trips verbatim (M8).
         assert_eq!(back.session, settings.session);

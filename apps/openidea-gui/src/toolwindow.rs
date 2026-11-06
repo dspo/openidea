@@ -83,7 +83,7 @@ pub const WINDOWS: &[WindowDesc] = &[
     window!("project", "Project", FolderOpen, Left, 0, Some(1), Shown, Some("toolwindow.project"), true),
     window!("bookmarks", "Bookmarks", BookMarked, Left, 1, Some(2), Shown, Some("toolwindow.bookmarks"), true),
     window!("structure", "Structure", ListTree, Left, 2, Some(7), Shown, Some("toolwindow.structure"), true),
-    window!("commit", "Commit", GitCommitHorizontal, Left, 3, Some(0), Shown, Some("toolwindow.commit"), false),
+    window!("commit", "Commit", GitCommitHorizontal, Left, 3, Some(0), Shown, Some("toolwindow.commit"), true),
     // -- bottom stripe -------------------------------------------------------
     window!("problems", "Problems", CircleAlert, Bottom, 0, Some(6), Shown, Some("toolwindow.problems"), true),
     window!("find", "Find", Search, Bottom, 1, Some(3), OnUse, Some("toolwindow.find"), true),
@@ -220,9 +220,7 @@ mod tests {
         for (digit, id) in expect {
             assert_eq!(l.slot_window(digit).map(|d| d.id), Some(id), "slot {digit}");
         }
-        // Deferred slots stay dark: no lit window answers 0 / 5 / 8 / 9 yet
-        // (commit lights with the Commit window phase).
-        assert!(l.slot_window(0).is_none());
+        // Deferred slots stay dark: no lit window answers 5 / 8 / 9 yet.
         assert!(l.slot_window(5).is_none());
         assert!(l.slot_window(8).is_none());
         assert!(l.slot_window(9).is_none());
@@ -247,9 +245,8 @@ mod tests {
             None,
         );
         let left: Vec<&str> = l.stripe_buttons(Anchor::Left).iter().map(|(d, _)| d.id).collect();
-        // Commit is deferred (its window lights later this milestone), and
-        // project's button was hidden by the user.
-        assert_eq!(left, vec!["bookmarks", "structure"]);
+        // Project's button was hidden by the user.
+        assert_eq!(left, vec!["bookmarks", "structure", "commit"]);
         let bottom: Vec<&str> = l.stripe_buttons(Anchor::Bottom).iter().map(|(d, _)| d.id).collect();
         assert_eq!(bottom, vec!["problems", "run"], "find is OnUse and unused; usages has no button yet");
     }

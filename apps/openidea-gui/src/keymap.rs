@@ -82,6 +82,7 @@ pub static BINDINGS: &[Binding] = &[
     binding!("cmd-3", "workbench::ToggleFind", None, Some("toolwindow.find")),
     binding!("cmd-6", "workbench::ToggleProblems", None, Some("toolwindow.problems")),
     binding!("cmd-7", "workbench::ToggleStructure", None, Some("toolwindow.structure")),
+    binding!("cmd-0", "workbench::ToggleCommit", None, Some("toolwindow.commit")),
     binding!("shift-escape", "workbench::HideActiveToolWindow", None, Some("toolwindow.hideActive")),
     // The preset's Meta+Shift+' converts to the shifted face (the macOS
     // physical-key rule: ⌘⇧' produces `"` and drops the shift).

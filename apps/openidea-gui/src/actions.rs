@@ -37,6 +37,7 @@ actions!(
         ToggleStructure,
         HideActiveToolWindow,
         MaximizeToolWindow,
+        ToggleCommit,
         // M9 navigation habits.
         RecentFiles,
         RecentLocations,
@@ -198,6 +199,7 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("workbench::ToggleStructure", "Structure", "View", "⌘7"),
     action_info!("workbench::HideActiveToolWindow", "Hide Active Tool Window", "View", "⇧⎋"),
     action_info!("workbench::MaximizeToolWindow", "Maximize Tool Window", "View", "⌘⇧'"),
+    action_info!("workbench::ToggleCommit", "Commit", "VCS", "⌘0"),
     action_info!("editor::Paste", "Paste", "Edit", "⌘V"),
     action_info!("editor::TabIndent", "Indent / Expand Template", "Edit", "⇥"),
     action_info!("editor::OutdentLine", "Outdent Line", "Edit", "⇧⇥"),
