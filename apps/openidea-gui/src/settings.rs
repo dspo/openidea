@@ -48,6 +48,9 @@ pub struct Settings {
     /// Projects the user trusted (M10's Project trust dialog), canonicalized.
     /// An interactive open of a directory outside this list prompts first.
     pub trusted_projects: Vec<String>,
+    /// Status bar widget visibility (M10's right-click menu), id -> shown.
+    /// Missing ids follow the widget's default (shown).
+    pub status_widgets: BTreeMap<String, bool>,
 }
 
 /// One project's restored session (M8): the tabs in open order, the active
@@ -115,6 +118,7 @@ impl Default for Settings {
             bookmarks: BTreeMap::new(),
             commit_messages: Vec::new(),
             trusted_projects: Vec::new(),
+            status_widgets: BTreeMap::new(),
         }
     }
 }
@@ -138,6 +142,8 @@ struct Store {
     commit_messages: Vec<String>,
     #[serde(default)]
     trusted_projects: Vec<String>,
+    #[serde(default)]
+    status_widgets: BTreeMap<String, bool>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -339,6 +345,7 @@ fn from_store(store: Store) -> Settings {
         bookmarks: store.bookmarks,
         commit_messages: store.commit_messages,
         trusted_projects: store.trusted_projects,
+        status_widgets: store.status_widgets,
     }
 }
 
@@ -377,6 +384,7 @@ pub fn save(settings: &Settings) {
         bookmarks: settings.bookmarks.clone(),
         commit_messages: settings.commit_messages.clone(),
         trusted_projects: settings.trusted_projects.clone(),
+        status_widgets: settings.status_widgets.clone(),
     };
     let Ok(json) = serde_json::to_string_pretty(&store) else { return };
     if let Some(parent) = path.parent()
@@ -591,6 +599,7 @@ mod tests {
             bookmarks: BTreeMap::from([("/tmp/x.go".to_owned(), vec![3, 9])]),
             commit_messages: vec!["initial".to_owned()],
             trusted_projects: vec!["/tmp/m10-trusted".to_owned()],
+            status_widgets: BTreeMap::new(),
         };
         let store = Store {
             recent_projects: settings.recent_projects.clone(),
@@ -610,6 +619,7 @@ mod tests {
             bookmarks: settings.bookmarks.clone(),
             commit_messages: settings.commit_messages.clone(),
             trusted_projects: settings.trusted_projects.clone(),
+            status_widgets: settings.status_widgets.clone(),
         };
         let back: Store = serde_json::from_str(&serde_json::to_string(&store).unwrap()).unwrap();
         assert_eq!(back.recent_projects, settings.recent_projects);

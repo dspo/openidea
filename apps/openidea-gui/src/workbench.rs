@@ -425,6 +425,9 @@ pub struct Workbench {
     /// The Find Usages window's content (M10): the last references answer
     /// the active pane routed here through the bus.
     usages: Option<UsagesAnswer>,
+    /// The active tab's caret (M10's line:col widget), 0-based from the
+    /// pane's CaretMoved reports.
+    caret: Cell<(u32, u32)>,
     /// The open floating context menu (M8): a right-click menu is
     /// element-scoped gpui-component state, invisible to the Esc chain —
     /// when anything steals its focus, Esc lands here as a bare Cancel and
@@ -522,6 +525,7 @@ impl Workbench {
             structure: Vec::new(),
             structure_gen: 0,
             usages: None,
+            caret: Cell::new((0, 0)),
             open_menu: None,
             menu_sub: None,
         }
@@ -2669,6 +2673,14 @@ impl Workbench {
             BusMessage::Ide(IdeEvent::Notify { level, title, .. }) => {
                 self.toast(level, title);
                 cx.notify();
+            }
+            BusMessage::CaretMoved { doc, line, col_utf16 } => {
+                // Only the active tab's caret drives the status widget (a
+                // background pane's render would lie about "the" position).
+                if self.active.and_then(|index| self.tabs.get(index)).is_some_and(|tab| tab.doc == doc) {
+                    self.caret.set((line, col_utf16));
+                    cx.notify();
+                }
             }
             BusMessage::UsagesFound { path, symbol, locations } => {
                 // The references answer becomes the Find Usages window's
@@ -5091,6 +5103,11 @@ impl Workbench {
     // -- status bar ----------------------------------------------------------------
 
     fn render_status(&self, cx: &Context<Self>) -> impl IntoElement {
+        let widget_state = self.settings.status_widgets.clone();
+        let shown = |id: &str| widget_state.get(id).copied().unwrap_or(true);
+        // The menu closure owns its own copy of the visibility map.
+        let menu_state = widget_state.clone();
+        let menu_shown = move |id: &str| menu_state.get(id).copied().unwrap_or(true);
         let (project, file, state) = match (&self.host, self.active) {
             (Some(host), Some(index)) => {
                 let tab = &self.tabs[index];
@@ -5107,54 +5124,125 @@ impl Workbench {
             (None, _) => (strings::NO_PROJECT.to_owned(), None, (strings::SAVE_STATE_SAVED, theme::fg_muted())),
         };
         let mut left = div().flex().items_center().gap_2().text_size(px(12.));
-        left = left.child(div().text_color(theme::fg_muted()).child(SharedString::from(project)));
-        if let Some(branch) = &self.git_branch {
+        if shown("project") {
+            left = left.child(div().text_color(theme::fg_muted()).child(SharedString::from(project)));
+        }
+        if shown("branch")
+            && let Some(branch) = &self.git_branch
+        {
             left = left
                 .child(
                     div().text_color(theme::fg_muted()).child(SharedString::from(strings::GIT_BRANCH_LABEL.to_owned())),
                 )
                 .child(div().text_color(theme::fg()).child(SharedString::from(branch.clone())));
         }
-        if let Some(file) = file {
+        if shown("position") {
+            let (line, col) = self.caret.get();
+            let position = format!("{}:{}", line + 1, col + 1);
+            left = left.child(
+                div()
+                    .text_color(theme::fg())
+                    .when_some(file, |widget, name| widget.child(SharedString::from(format!("{name} "))))
+                    .child(SharedString::from(position)),
+            );
+        } else if let Some(file) = file {
             left = left.child(div().text_color(theme::fg()).child(SharedString::from(file)));
         }
         let mut right = div().flex().items_center().gap_3().text_size(px(12.));
+        // The Problems count (the F2 walker's set); a click opens the window.
+        if shown("problems") {
+            let errors = self.all_diagnostics().iter().filter(|(_, d)| d.severity == Severity::Error).count();
+            let count = if errors == 0 { strings::NO_PROBLEMS_SHORT.to_owned() } else { format!("{errors}") };
+            right = right.child(
+                div()
+                    .id("status-problems")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_window("problems", cx)))
+                    .when(errors > 0, |widget| widget.text_color(theme::error()))
+                    .child(SharedString::from(count)),
+            );
+        }
+        if shown("encoding") {
+            right =
+                right.child(div().text_color(theme::fg_muted()).child(SharedString::from(strings::STATUS_ENCODING)));
+        }
+        if shown("linesep") {
+            right = right.child(div().text_color(theme::fg_muted()).child(SharedString::from(strings::STATUS_LINESEP)));
+        }
         // The run indicator (running · elapsed, or the exit code), from the
         // selected run tab (or the live one when the Find page shows).
-        if let Some((text, color)) = self.run_status(cx) {
+        if shown("run")
+            && let Some((text, color)) = self.run_status(cx)
+        {
             right = right.child(div().truncate().text_color(color).child(SharedString::from(text)));
         }
         // Language-server rows: name + status, colored by health.
-        for row in &self.servers {
-            let (text, color) = match row.status {
-                ServerStatus::Ready | ServerStatus::Busy => (strings::LS_READY.to_owned(), theme::fg_muted()),
-                ServerStatus::Starting => (strings::LS_STARTING.to_owned(), theme::warning()),
-                ServerStatus::Missing | ServerStatus::Crashed | ServerStatus::Misconfigured => {
-                    (strings::LS_DOWN.to_owned(), theme::error())
-                }
-                ServerStatus::Stopped => (strings::LS_STOPPED.to_owned(), theme::fg_muted()),
-            };
-            right = right.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(div().text_color(theme::fg()).child(SharedString::from(row.name.clone())))
-                    .child(div().text_color(color).child(SharedString::from(text))),
-            );
+        if shown("servers") {
+            for row in &self.servers {
+                let (text, color) = match row.status {
+                    ServerStatus::Ready | ServerStatus::Busy => (strings::LS_READY.to_owned(), theme::fg_muted()),
+                    ServerStatus::Starting => (strings::LS_STARTING.to_owned(), theme::warning()),
+                    ServerStatus::Missing | ServerStatus::Crashed | ServerStatus::Misconfigured => {
+                        (strings::LS_DOWN.to_owned(), theme::error())
+                    }
+                    ServerStatus::Stopped => (strings::LS_STOPPED.to_owned(), theme::fg_muted()),
+                };
+                right = right.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(div().text_color(theme::fg()).child(SharedString::from(row.name.clone())))
+                        .child(div().text_color(color).child(SharedString::from(text))),
+                );
+            }
         }
         // Live server tasks (indexing, package loads): the anti-"hang" face.
-        for (_, title, message, fraction) in &self.tasks {
-            let mut text = message.clone().unwrap_or_else(|| title.clone());
-            if let Some(fraction) = fraction {
-                text = format!("{text} {}%", (fraction * 100.0).round() as u32);
+        if shown("tasks") {
+            for (_, title, message, fraction) in &self.tasks {
+                let mut text = message.clone().unwrap_or_else(|| title.clone());
+                if let Some(fraction) = fraction {
+                    text = format!("{text} {}%", (fraction * 100.0).round() as u32);
+                }
+                right = right.child(div().text_color(theme::fg()).child(SharedString::from(title.clone()))).child(
+                    div().max_w(px(160.0)).truncate().text_color(theme::warning()).child(SharedString::from(text)),
+                );
             }
-            right = right
-                .child(div().text_color(theme::fg()).child(SharedString::from(title.clone())))
-                .child(div().max_w(px(160.0)).truncate().text_color(theme::warning()).child(SharedString::from(text)));
         }
         right = right.child(div().text_color(state.1).child(SharedString::from(state.0)));
-        StatusBar::new().left(left).right(right)
+        // The Status Bar Widgets menu (M10): the named widgets' show/hide
+        // checks, persisted. Untitled faces (save state) stay always on.
+        let widgets: [(&str, &str); 7] = [
+            ("project", strings::W_PROJECT),
+            ("branch", strings::W_BRANCH),
+            ("position", strings::W_POSITION),
+            ("problems", strings::W_PROBLEMS),
+            ("encoding", strings::W_ENCODING),
+            ("linesep", strings::W_LINESEP),
+            ("servers", strings::W_SERVERS),
+        ];
+        let workbench = cx.entity().downgrade();
+        div()
+            .relative()
+            .context_menu(move |menu, _, _| {
+                let mut menu = menu.label(SharedString::from(strings::STATUS_WIDGETS_MENU));
+                for (id, title) in widgets {
+                    let workbench = workbench.clone();
+                    let shown = menu_shown(id);
+                    menu = menu.item(PopupMenuItem::new(title).checked(shown).on_click(move |_, _, cx| {
+                        workbench
+                            .update(cx, |this, cx| {
+                                let shown = this.settings.status_widgets.get(id).copied().unwrap_or(true);
+                                this.settings.status_widgets.insert(id.to_owned(), !shown);
+                                settings::save(&this.settings);
+                                cx.notify();
+                            })
+                            .ok();
+                    }));
+                }
+                menu
+            })
+            .child(StatusBar::new().left(left).right(right))
     }
 }
 

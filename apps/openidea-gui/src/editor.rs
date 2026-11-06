@@ -1117,6 +1117,9 @@ pub struct EditorPane {
     /// The queried symbol of an in-flight references request (M10): the
     /// Find Usages window's header shows it.
     usages_symbol: String,
+    /// The caret position last reported to the status bar (M10's line:col
+    /// widget): the render-time emission dedupes against it.
+    reported_caret: Cell<(u32, u32)>,
     rename: Option<RenameFlow>,
     // Code actions (M5 phase 3): the open quick-fix menu and its selection.
     code_actions: Option<(Vec<ide_lsp::types::CodeAction>, usize)>,
@@ -1210,6 +1213,7 @@ impl EditorPane {
             completion_cancel: None,
             jump: None,
             usages_symbol: String::new(),
+            reported_caret: Cell::new((u32::MAX, u32::MAX)),
             rename: None,
             code_actions: None,
             signature: None,
@@ -4851,6 +4855,17 @@ impl Render for EditorPane {
         if !self.focused_once.get() {
             self.focused_once.set(true);
             window.focus(&self.focus, cx);
+        }
+        // The status bar's line:col widget rides this pane's caret (M10):
+        // renders happen on every caret change (the pane notifies to repaint
+        // the cursor), and the dedupe keeps one message per position.
+        {
+            let pos = self.cursor_pos();
+            let seen = self.reported_caret.get();
+            if (pos.line, pos.col) != seen {
+                self.reported_caret.set((pos.line, pos.col));
+                self.bus.send(BusMessage::CaretMoved { doc: self.doc_id, line: pos.line, col_utf16: pos.col });
+            }
         }
         let focus = self.focus.clone();
         // The Esc-chain registration (M8) sends the opened menu to the

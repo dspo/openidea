@@ -129,6 +129,19 @@ pub const TW_REFRESH_CHANGES: &str = "Refresh Changes";
 pub const TW_COMMIT_HISTORY: &str = "History…";
 pub const TW_COMMIT_DIFF_HINT: &str = "Select a file to preview its diff";
 
+// M10 status bar widgets.
+pub const STATUS_WIDGETS_MENU: &str = "Status Bar Widgets";
+pub const W_PROJECT: &str = "Project";
+pub const W_BRANCH: &str = "VCS Branch";
+pub const W_POSITION: &str = "Line:Column";
+pub const W_PROBLEMS: &str = "Problems Count";
+pub const W_ENCODING: &str = "Encoding";
+pub const W_LINESEP: &str = "Line Separator";
+pub const W_SERVERS: &str = "Language Servers";
+pub const STATUS_ENCODING: &str = "UTF-8";
+pub const STATUS_LINESEP: &str = "LF";
+pub const NO_PROBLEMS_SHORT: &str = "no problems";
+
 // M10 project trust.
 pub const TRUST_TITLE: &str = "Trust and Open Project?";
 pub const TRUST_HINT: &str = "Projects in the trusted list open without this prompt.";
