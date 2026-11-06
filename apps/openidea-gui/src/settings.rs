@@ -36,6 +36,10 @@ pub struct Settings {
     pub font_size: f32,
     /// Per-project session (M8), keyed by the canonical project root.
     pub session: BTreeMap<String, SessionTabs>,
+    /// User keymap overrides (M9), keyed by the preset action id, values in
+    /// the IDEA notation the presets use ("Meta+Shift+O"). An id with an
+    /// empty list unbinds the action's default keys.
+    pub keymap_overrides: BTreeMap<String, Vec<String>>,
 }
 
 /// One project's restored session (M8): the tabs in open order, the active
@@ -80,6 +84,7 @@ impl Default for Settings {
             layout: Layout::default(),
             font_size: crate::theme::FONT_SIZE,
             session: BTreeMap::new(),
+            keymap_overrides: BTreeMap::new(),
         }
     }
 }
@@ -95,6 +100,8 @@ struct Store {
     font_size: Option<f32>,
     #[serde(default)]
     session: BTreeMap<String, SessionTabs>,
+    #[serde(default)]
+    keymap_overrides: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -280,6 +287,7 @@ fn from_store(store: Store) -> Settings {
         },
         font_size: store.font_size.filter(|size| FONT_SIZE_RANGE.contains(size)).unwrap_or(defaults.font_size),
         session,
+        keymap_overrides: store.keymap_overrides,
     }
 }
 
@@ -310,6 +318,7 @@ pub fn save(settings: &Settings) {
         }),
         font_size: Some(settings.font_size),
         session: settings.session.clone(),
+        keymap_overrides: settings.keymap_overrides.clone(),
     };
     let Ok(json) = serde_json::to_string_pretty(&store) else { return };
     if let Some(parent) = path.parent()
@@ -514,6 +523,7 @@ mod tests {
                     active: Some(0),
                 },
             )]),
+            keymap_overrides: BTreeMap::from([("file.save".to_owned(), vec!["Ctrl+S".to_owned()])]),
         };
         let store = Store {
             recent_projects: settings.recent_projects.clone(),
@@ -525,6 +535,7 @@ mod tests {
             }),
             font_size: Some(settings.font_size),
             session: settings.session.clone(),
+            keymap_overrides: settings.keymap_overrides.clone(),
         };
         let back: Store = serde_json::from_str(&serde_json::to_string(&store).unwrap()).unwrap();
         assert_eq!(back.recent_projects, settings.recent_projects);
@@ -536,5 +547,7 @@ mod tests {
         assert_eq!(back.font_size, Some(16.0));
         // The session round-trips verbatim (M8).
         assert_eq!(back.session, settings.session);
+        // The keymap overrides round-trip verbatim (M9).
+        assert_eq!(back.keymap_overrides, settings.keymap_overrides);
     }
 }

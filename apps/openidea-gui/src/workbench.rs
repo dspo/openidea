@@ -45,6 +45,7 @@ use crate::file_tree::{FileTree, Row};
 use crate::find_panel::FindPanel;
 use crate::fuzzy;
 use crate::host::Host;
+use crate::keymap;
 use crate::run_panel::{RunPanel, stream_of};
 use crate::{ProjectHost, settings, strings, theme};
 
@@ -303,10 +304,9 @@ pub struct Workbench {
     /// Set when a bus message closed an overlay: the next render hands the
     /// focus back to the editor (or the tree).
     restore_focus_pending: Cell<bool>,
-    /// The last bare ⇧ press, for the double-⇧ Search Everywhere gesture.
-    last_shift: Cell<Option<Instant>>,
-    /// Whether ⇧ was held at the last modifiers event (rising-edge detection).
-    shift_held: Cell<bool>,
+    /// The modifier-only chords (M9 keymap): double ⇧ opens Search
+    /// Everywhere; the tracker also arms the ⌥⌥ / ⌃⌃ follow-ups.
+    chord: keymap::Chord,
     /// ⌘S's organize-imports-then-save flow in flight (M6), if any: the doc
     /// it organizes. A second ⌘S on it saves plainly instead of queueing.
     save_flow: Cell<Option<DocId>>,
@@ -376,8 +376,7 @@ impl Workbench {
             settings_overlay: None,
             settings_focus: cx.focus_handle(),
             restore_focus_pending: Cell::new(false),
-            last_shift: Cell::new(None),
-            shift_held: Cell::new(false),
+            chord: keymap::Chord::default(),
             save_flow: Cell::new(None),
             closed_tabs: Vec::new(),
             tasks: Vec::new(),
@@ -993,25 +992,33 @@ impl Workbench {
         cx.notify();
     }
 
-    /// Bare-⇧ taps, two within a short window, open Search Everywhere.
+    /// Bare-modifier presses, two within a short window, complete the keymap's
+    /// gesture chords (double ⇧ → Search Everywhere; ⌥⌥ / ⌃⌃ arm follow-ups).
     /// Modifier-only presses never become key events (macOS turns them into
-    /// `ModifiersChanged`), so the gesture lives here on the rising edge of a
-    /// bare shift instead of in the keymap.
+    /// `ModifiersChanged`), so the gestures live here on the rising edge of a
+    /// bare modifier instead of in the keymap.
     fn on_modifiers(&mut self, ev: &ModifiersChangedEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let mods = ev.modifiers;
-        let shift = mods.shift;
-        let was_held = self.shift_held.replace(shift);
-        let bare = shift && !mods.control && !mods.alt && !mods.platform && !mods.function;
-        if bare && !was_held {
-            let now = Instant::now();
-            let again = self
-                .last_shift
-                .replace(Some(now))
-                .is_some_and(|at| now.duration_since(at) < Duration::from_millis(600));
-            if again {
-                self.last_shift.set(None);
-                self.open_picker(PickerMode::Everywhere, window, cx);
-            }
+        if let Some(idea_id) = self.chord.modifiers_changed(&ev.modifiers, Instant::now()) {
+            self.run_gesture(idea_id, window, cx);
+        }
+    }
+
+    /// A keystroke at the root: unhandled combos reach this listener last, so
+    /// an armed chord follow-up (⌥⌥ held, ↑ pressed) resolves here.
+    fn on_root_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(idea_id) = self.chord.keystroke(&ev.keystroke, Instant::now()) {
+            self.run_gesture(idea_id, window, cx);
+        }
+    }
+
+    /// Executes a completed gesture chord by its preset id.
+    fn run_gesture(&mut self, idea_id: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        self.chord.reset();
+        match idea_id {
+            "navigate.searchEverywhere" => self.open_picker(PickerMode::Everywhere, window, cx),
+            // Phase 4 owns the not-yet-available face; for now the row is only
+            // tracked (the chord must not wedge the tracker's state).
+            _ => eprintln!("[keymap] gesture {idea_id} has no face yet"),
         }
     }
 
@@ -1019,6 +1026,8 @@ impl Workbench {
         if self.picker.is_some() {
             return;
         }
+        // A half-typed chord must not leak into the palette's input.
+        self.chord.reset();
         let placeholder = match mode {
             PickerMode::Files => strings::PICKER_FILE_PLACEHOLDER,
             PickerMode::Everywhere => strings::PICKER_EVERYWHERE_PLACEHOLDER,
@@ -2627,8 +2636,11 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_reopen_closed_tab))
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_cancel))
-            // Double ⇧ gesture (modifier presses arrive as modifiers events).
+            // Double ⇧ and the other modifier chords (modifier presses arrive
+            // as modifiers events); the root key listener resolves their
+            // follow-up keystrokes (⌥⌥ held, ↑ pressed).
             .on_modifiers_changed(cx.listener(Self::on_modifiers))
+            .on_key_down(cx.listener(Self::on_root_key))
             .children(self.host.is_none().then(|| self.render_welcome(cx)))
             .when(self.host.is_some(), |shell| {
                 shell
