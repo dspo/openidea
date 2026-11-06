@@ -163,6 +163,7 @@ macro_rules! action_info {
 // is only read by the tests below.
 #[allow(dead_code)]
 pub const REGISTRY: &[ActionInfo] = &[
+    action_info!("workbench::Quit", "Quit", "File", "⌘Q"),
     action_info!("workbench::OpenFile", "Open File…", "File", "⌘O"),
     action_info!("workbench::Save", "Save", "File", "⌘S"),
     action_info!("workbench::CloseTab", "Close Tab", "File", "⌘W"),
@@ -177,7 +178,7 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("workbench::NavigateForward", "Forward", "Navigate", "⌘]"),
     action_info!("workbench::NextError", "Next Highlighted Error", "Navigate", "F2"),
     action_info!("workbench::PrevError", "Previous Highlighted Error", "Navigate", "⇧F2"),
-    action_info!("editor::ToggleBookmark", "Toggle Bookmark", "Navigate", "F3"),
+    action_info!("workbench::ToggleBookmark", "Toggle Bookmark", "Navigate", "F3"),
     action_info!("workbench::ShowBookmarks", "Bookmarks", "Navigate", "⌘F3"),
     action_info!("workbench::FileStructure", "File Structure", "Navigate", "⌘F12"),
     action_info!("workbench::Switcher", "Switcher", "Navigate", "⌃⇥"),

@@ -21,6 +21,7 @@ mod keymap;
 #[allow(dead_code)]
 mod keymap_data;
 mod markdown;
+mod menu;
 mod navigation;
 mod perf;
 mod reconcile;
@@ -165,6 +166,9 @@ fn main() {
                 // gpui_component::init (later registrations win keystroke
                 // ties). A persisted user override replaces a row's keys.
                 keymap::bind(cx, &app_settings.keymap_overrides);
+                // The macOS menu bar (M10): IDEA's full structure, generated
+                // from the action registry the Find Action palette reads.
+                menu::install(cx);
                 let (bus, rx) = Bus::channel();
                 // The Project trust gate (M10): a startup root outside the
                 // trusted list waits in the trust prompt instead of opening
