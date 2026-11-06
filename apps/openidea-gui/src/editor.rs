@@ -573,7 +573,9 @@ impl Buffer {
             }
             if commented {
                 // Drop the token plus the space after it (when we wrote one).
-                let mut at = indent + utf16_len(token);
+                // Byte domain: `indent` and `token.len()` are both bytes of
+                // the same string.
+                let mut at = indent + token.len();
                 if text[at..].starts_with(' ') {
                     at += 1;
                 }
@@ -1094,6 +1096,9 @@ pub struct EditorPane {
     redo: Vec<UndoGroup>,
     /// When the last grouped edit happened and whether it was one.
     last_edit: Option<(std::time::Instant, bool)>,
+    /// ⌘⇧⌫'s source: where the newest real edit landed (primary change
+    /// start), with its time. Mechanical batches do not touch it.
+    last_edit_at: Option<(std::time::Instant, Pos)>,
     // Folding (phase 5): the syntax candidates plus the user's folded subset.
     fold_candidates: Vec<(u32, u32)>,
     folds: Vec<Fold>,
@@ -1192,6 +1197,7 @@ impl EditorPane {
             undo: Vec::new(),
             redo: Vec::new(),
             last_edit: None,
+            last_edit_at: None,
             fold_candidates: Vec::new(),
             folds: Vec::new(),
             diagnostics: Vec::new(),
@@ -1642,6 +1648,14 @@ impl EditorPane {
         // The inverse needs the text the batch replaces, captured pre-apply.
         let originals: Vec<String> =
             changes.iter().map(|c| self.buf.slice_utf16(c.from as usize..c.to as usize)).collect();
+        // ⌘⇧⌫'s data point (pre-apply, so the line math reads the batch's own
+        // coordinates): where the newest real edit lands. Mechanical batches
+        // (undo, patches) are restores, not edits.
+        let edit_pos = (!matches!(cause, Cause::Mechanical)).then(|| batch.first()).flatten().map(|change| {
+            let from = change.from as usize;
+            let span = self.buf.line_span(self.buf.line_of(from));
+            Pos::new(self.buf.line_of(from), (from - span.start) as u32)
+        });
         let set = ChangeSet { changes: changes.clone() };
         let byte_edits = match self.buf.doc.apply_detailed(version, &set) {
             Ok((_, byte_edits)) => byte_edits,
@@ -1701,6 +1715,9 @@ impl EditorPane {
         self.shrink_stack.clear();
         self.last_edit =
             Some((std::time::Instant::now(), matches!(cause, Cause::Typing | Cause::Delete | Cause::ImeCommit)));
+        if let Some(pos) = edit_pos {
+            self.last_edit_at = Some((std::time::Instant::now(), pos));
+        }
         self.hover.set(None);
         // A menu parked over stale offsets is gone once the text moves.
         if matches!(cause, Cause::Typing | Cause::Delete | Cause::Paste | Cause::Template) {
@@ -2091,6 +2108,30 @@ impl EditorPane {
             |lsp, doc, pos, _cancel| Box::pin(async move { lsp.goto(doc, pos, GotoKind::Definition).await }),
             cx,
         );
+    }
+
+    /// ⌘⌥B: the implementations behind the symbol at the caret.
+    pub fn goto_implementation(&mut self, cx: &mut gpui::Context<Self>) {
+        self.request_locations(
+            "implementation",
+            |lsp, doc, pos, _cancel| Box::pin(async move { lsp.goto(doc, pos, GotoKind::Implementation).await }),
+            cx,
+        );
+    }
+
+    /// ⌘⇧B: the type declaration behind the expression at the caret.
+    pub fn goto_type_declaration(&mut self, cx: &mut gpui::Context<Self>) {
+        self.request_locations(
+            "type definition",
+            |lsp, doc, pos, _cancel| Box::pin(async move { lsp.goto(doc, pos, GotoKind::TypeDefinition).await }),
+            cx,
+        );
+    }
+
+    /// ⌘⇧⌫'s data: when the pane last took a real edit, and where it landed.
+    /// Mechanical batches (undo, patches) do not count.
+    pub fn last_edit_info(&self) -> Option<(std::time::Instant, Pos)> {
+        self.last_edit_at
     }
 
     pub fn find_usages(&mut self, cx: &mut gpui::Context<Self>) {
@@ -4957,6 +4998,8 @@ impl Render for EditorPane {
             // Rename: input overlay, then the workspace-edit preview.
             .children(self.render_rename(window, cx))
             .on_action(cx.listener(|this, _: &acts::GotoDefinition, _, cx| this.goto_definition(cx)))
+            .on_action(cx.listener(|this, _: &acts::GotoImplementation, _, cx| this.goto_implementation(cx)))
+            .on_action(cx.listener(|this, _: &acts::GotoTypeDeclaration, _, cx| this.goto_type_declaration(cx)))
             .on_action(cx.listener(|this, _: &acts::FindUsages, _, cx| this.find_usages(cx)))
             .on_action(cx.listener(|this, _: &acts::Rename, window, cx| this.start_rename(window, cx)))
             .on_action(cx.listener(|this, _: &acts::CodeActions, _, cx| this.request_code_actions(cx)))

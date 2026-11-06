@@ -148,6 +148,22 @@ pub static BINDINGS: &[Binding] = &[
     binding!("cmd-g", "editor::FindNext", Some("Editor"), Some("find.next")),
     binding!("shift-cmd-g", "editor::FindPrevious", Some("Editor"), Some("find.previous")),
     // ⌥⌥↑ / ⌥⌥↓ ride the Chord gestures (see GESTURES), not keystroke rows.
+    // -- M9 navigation habits -------------------------------------------------
+    binding!("cmd-e", "workbench::RecentFiles", None, Some("navigate.recentFiles")),
+    binding!("shift-cmd-e", "workbench::RecentLocations", None, Some("navigate.recentLocations")),
+    binding!("cmd-[", "workbench::NavigateBack", None, Some("navigate.back")),
+    binding!("cmd-]", "workbench::NavigateForward", None, Some("navigate.forward")),
+    binding!("f2", "workbench::NextError", None, Some("navigate.nextError")),
+    binding!("shift-f2", "workbench::PrevError", None, Some("navigate.prevError")),
+    binding!("f3", "workbench::ToggleBookmark", None, Some("navigate.toggleBookmark")),
+    binding!("cmd-f3", "workbench::ShowBookmarks", None, Some("navigate.showBookmarks")),
+    binding!("cmd-f12", "workbench::FileStructure", None, Some("navigate.fileStructure")),
+    binding!("ctrl-tab", "workbench::Switcher", None, Some("navigate.switcher")),
+    binding!("ctrl-shift-tab", "workbench::SwitcherBack", None, Some("navigate.switcherBack")),
+    binding!("cmd-l", "workbench::GotoLine", None, Some("navigate.gotoLine")),
+    binding!("shift-cmd-backspace", "workbench::LastEditLocation", None, Some("navigate.lastEditLocation")),
+    binding!("alt-cmd-b", "editor::GotoImplementation", Some("Editor"), Some("navigate.implementation")),
+    binding!("shift-cmd-b", "editor::GotoTypeDeclaration", Some("Editor"), Some("navigate.typeDeclaration")),
     // -- palette list navigation ---------------------------------------------
     binding!("up", "palette::SelectPrev", Some("Palette"), None),
     binding!("down", "palette::SelectNext", Some("Palette"), None),

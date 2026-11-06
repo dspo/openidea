@@ -104,3 +104,11 @@ pub const SETTINGS_INDENT_DEFAULT: &str = "Follows the language defaults";
 pub const SETTINGS_KEYMAP: &str = "Keymap";
 // Stability (M8): the crash toast on the launch after an unclean exit.
 pub const LAST_RUN_UNCLEAN: &str = "The previous session ended unexpectedly";
+
+// M9 navigation habits.
+pub const NO_ERRORS: &str = "No errors to navigate to";
+pub const NO_HISTORY_BACK: &str = "No earlier location";
+pub const NO_HISTORY_FORWARD: &str = "No later location";
+pub const BOOKMARK_ADDED: &str = "Bookmark added:";
+pub const BOOKMARK_REMOVED: &str = "Bookmark removed:";
+pub const NO_EDIT_LOCATION: &str = "No edit location yet";

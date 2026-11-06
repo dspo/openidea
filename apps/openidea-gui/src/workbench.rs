@@ -28,7 +28,7 @@ use gpui_component::tab::{Tab as ComponentTab, TabBar};
 use gpui_component::{Icon, IconName, Selectable as _, Sizable as _};
 use ide_core::event::NotifyLevel;
 use ide_core::event::ServerStatus;
-use ide_core::{Diagnostic, DocId, IdeError, IdeEvent, ServerId};
+use ide_core::{Diagnostic, DocId, IdeError, IdeEvent, OutlineItem, ServerId};
 use ide_index::{FileMatch, SymbolFilter, SymbolMatch};
 use ide_run::RunConfig;
 use ide_vcs::ChangeKind;
@@ -46,6 +46,7 @@ use crate::find_panel::FindPanel;
 use crate::fuzzy;
 use crate::host::Host;
 use crate::keymap;
+use crate::navigation;
 use crate::run_panel::{RunPanel, stream_of};
 use crate::{ProjectHost, settings, strings, theme};
 
@@ -108,6 +109,20 @@ enum PickerMode {
     Everywhere,
     /// Run configurations (⌃R): pick one, or type a one-off shell command.
     Run,
+    // M9 navigation habits: everything below lists workbench state
+    // synchronously (no index calls behind it).
+    /// ⌘E — recently opened files.
+    RecentFiles,
+    /// ⌘⇧E — where edits landed.
+    RecentLocations,
+    /// ⌘F3 — the bookmark list.
+    Bookmarks,
+    /// ⌘F12 — the active file's LSP outline.
+    Structure,
+    /// ⌘L — the query parses as `line:column`.
+    Line,
+    /// ⌃⇥ — open tabs and dock pages; ⌃⇥ cycles while it is open.
+    Switcher,
 }
 
 /// The ⇧⌘O / double-⇧ / ⌃R palette: one list, grouped per mode. Files and
@@ -125,6 +140,9 @@ struct Picker {
     actions: Vec<RankedAction>,
     /// Run mode: the configurations offered, cached at open.
     configs: Vec<RunConfig>,
+    /// Structure mode: the LSP outline (async answer lands here behind the
+    /// generation guard).
+    outline: Vec<(OutlineItem, usize)>,
     selected: usize,
 }
 
@@ -138,6 +156,19 @@ enum PickerRow {
     Run(Box<RunConfig>),
     /// A one-off shell command line typed into the Run palette.
     Shell(String),
+    // M9 navigation rows.
+    /// A recently opened file (⌘E), possibly not open as a tab.
+    RecentFile(PathBuf),
+    /// A recent edit location / switcher-history entry.
+    Location(navigation::Location),
+    /// A bookmarked line.
+    Bookmark(PathBuf, u32),
+    /// A file-structure symbol (indented per outline depth).
+    Outline(OutlineItem, usize),
+    /// An open tab (index into `Workbench::tabs`).
+    Tab(usize),
+    /// A dock page the switcher can focus (Find first, run tabs after).
+    Dock(DockPage, String),
 }
 
 /// The open diff overlay (M4): one file's unified changes against HEAD.
@@ -307,6 +338,14 @@ pub struct Workbench {
     /// The modifier-only chords (M9 keymap): double ⇧ opens Search
     /// Everywhere; the tracker also arms the ⌥⌥ / ⌃⌃ follow-ups.
     chord: keymap::Chord,
+    /// The navigation habits (M9): the ⌘[/⌘] history, the ⌘E file MRU, the
+    /// ⌘⇧E edit locations, the persistent bookmarks, and ⌘⇧⌫'s memory of
+    /// where the last jump came from.
+    nav: navigation::NavStack,
+    recent_files: Vec<PathBuf>,
+    edits: navigation::EditLocations,
+    bookmarks: navigation::Bookmarks,
+    last_edit_memory: Option<navigation::Location>,
     /// ⌘S's organize-imports-then-save flow in flight (M6), if any: the doc
     /// it organizes. A second ⌘S on it saves plainly instead of queueing.
     save_flow: Cell<Option<DocId>>,
@@ -330,6 +369,7 @@ pub struct Workbench {
 
 impl Workbench {
     pub fn new(host: Option<Arc<Host>>, bus: Bus, settings: settings::Settings, cx: &mut Context<Self>) -> Self {
+        let bookmarks = navigation::Bookmarks::from_map(settings.bookmarks.clone());
         let mut tree = FileTree::new();
         if let Some(host) = &host
             && let Err(e) = tree.open(host)
@@ -377,6 +417,11 @@ impl Workbench {
             settings_focus: cx.focus_handle(),
             restore_focus_pending: Cell::new(false),
             chord: keymap::Chord::default(),
+            nav: navigation::NavStack::default(),
+            recent_files: Vec::new(),
+            edits: navigation::EditLocations::default(),
+            bookmarks,
+            last_edit_memory: None,
             save_flow: Cell::new(None),
             closed_tabs: Vec::new(),
             tasks: Vec::new(),
@@ -593,6 +638,9 @@ impl Workbench {
     fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.active else { return };
         let Some(host) = self.host.clone() else { return };
+        // A save is an edit event the recent-locations list records (the
+        // leaving-tab hook only fires on switches).
+        self.record_edit_location(cx);
         let (doc, path, name) = {
             let tab = &self.tabs[index];
             (tab.doc, tab.path.clone(), file_name(&tab.path))
@@ -1046,6 +1094,12 @@ impl Workbench {
             PickerMode::Files => strings::PICKER_FILE_PLACEHOLDER,
             PickerMode::Everywhere => strings::PICKER_EVERYWHERE_PLACEHOLDER,
             PickerMode::Run => strings::PICKER_RUN_PLACEHOLDER,
+            PickerMode::RecentFiles => "recent files",
+            PickerMode::RecentLocations => "recent locations",
+            PickerMode::Bookmarks => "bookmarks",
+            PickerMode::Structure => "file structure",
+            PickerMode::Line => "line:column (⏎ jumps)",
+            PickerMode::Switcher => "switcher",
         };
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         window.focus(&input.read(cx).presentation().focus_handle().clone(), cx);
@@ -1065,8 +1119,13 @@ impl Workbench {
             lsp_symbols: Vec::new(),
             actions: Vec::new(),
             configs,
+            outline: Vec::new(),
             selected: 0,
         });
+        // Structure mode fetches the active file's outline right away.
+        if mode == PickerMode::Structure {
+            self.request_outline(cx);
+        }
         self.picker_sub =
             Some(cx.subscribe_in(&input, window, |this, input, event: &InputEvent, window, cx| match event {
                 InputEvent::Change => this.picker_query_changed(input, window, cx),
@@ -1110,7 +1169,18 @@ impl Workbench {
             picker.actions = ranked_actions(&query);
         }
         picker.selected = 0;
-        if mode == PickerMode::Run {
+        // The M9 modes list workbench state synchronously; the ⌘L query is
+        // the payload itself.
+        if matches!(
+            mode,
+            PickerMode::Run
+                | PickerMode::RecentFiles
+                | PickerMode::RecentLocations
+                | PickerMode::Bookmarks
+                | PickerMode::Structure
+                | PickerMode::Line
+                | PickerMode::Switcher
+        ) {
             cx.notify();
             return;
         }
@@ -1215,6 +1285,36 @@ impl Workbench {
         .detach();
     }
 
+    /// Structure mode's data: the active file's LSP outline (flattened with
+    /// outline depth), fetched once at open behind the generation guard.
+    fn request_outline(&mut self, cx: &mut Context<Self>) {
+        let Some(host) = self.host.clone() else { return };
+        let Some(tab) = self.active_tab() else { return };
+        let (doc, generation) = (tab.doc, self.picker_gen + 1);
+        let runtime = host.runtime.clone();
+        let lsp = host.lsp.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        runtime.spawn(async move {
+            let result = lsp.document_symbols(doc).await;
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.await {
+                this.update(cx, |workbench, cx| {
+                    if workbench.picker_gen != generation - 1 {
+                        return;
+                    }
+                    let Ok(symbols) = result else { return };
+                    let Some(picker) = workbench.picker.as_mut() else { return };
+                    picker.outline = flatten_outline(symbols.as_deref().unwrap_or(&[]), 0);
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     /// The run palette's rows: configs matching the query (name or command),
     /// plus a trailing one-off shell row for a non-empty query.
     fn run_rows(&self) -> (Vec<PickerRow>, usize) {
@@ -1243,8 +1343,41 @@ impl Workbench {
     /// or the run list.
     fn picker_rows(&self) -> Vec<PickerRow> {
         let Some(picker) = &self.picker else { return Vec::new() };
+        let query = picker.query.trim();
+        let matches_query = |text: &str| query.is_empty() || fuzzy::match_text(text, query).is_some();
         match picker.mode {
             PickerMode::Run => self.run_rows().0,
+            PickerMode::RecentFiles => self
+                .recent_files
+                .iter()
+                .filter(|path| matches_query(&file_name(path)))
+                .cloned()
+                .map(PickerRow::RecentFile)
+                .collect(),
+            PickerMode::RecentLocations => self
+                .edits
+                .latest()
+                .iter()
+                .filter(|location| matches_query(&file_name(&location.path)))
+                .cloned()
+                .map(PickerRow::Location)
+                .collect(),
+            PickerMode::Bookmarks => self
+                .bookmarks
+                .all()
+                .filter(|(path, _)| matches_query(&file_name(path)))
+                .map(|(path, line)| PickerRow::Bookmark(path.clone(), line))
+                .collect(),
+            PickerMode::Structure => picker
+                .outline
+                .iter()
+                .filter(|(item, _)| matches_query(&item.name))
+                .cloned()
+                .map(|(item, depth)| PickerRow::Outline(item, depth))
+                .collect(),
+            // ⌘L: the query is the payload; Enter parses it.
+            PickerMode::Line => Vec::new(),
+            PickerMode::Switcher => self.switcher_rows(),
             _ => picker
                 .files
                 .iter()
@@ -1255,6 +1388,27 @@ impl Workbench {
                 .chain(picker.actions.iter().cloned().map(PickerRow::Action))
                 .collect(),
         }
+    }
+
+    /// The switcher's rows: open tabs in the file MRU's order (tabs never
+    /// opened since launch trail), then the dock pages (Find, run tabs).
+    fn switcher_rows(&self) -> Vec<PickerRow> {
+        let mut rows: Vec<PickerRow> = Vec::new();
+        for path in &self.recent_files {
+            if let Some(index) = self.tabs.iter().position(|tab| tab.path == *path) {
+                rows.push(PickerRow::Tab(index));
+            }
+        }
+        for index in 0..self.tabs.len() {
+            if !rows.iter().any(|row| matches!(row, PickerRow::Tab(seen) if *seen == index)) {
+                rows.push(PickerRow::Tab(index));
+            }
+        }
+        rows.push(PickerRow::Dock(DockPage::Find, "Find".to_owned()));
+        for index in 0..self.runs.len() {
+            rows.push(PickerRow::Dock(DockPage::Run(index), format!("Run {}", index + 1)));
+        }
+        rows
     }
 
     fn picker_move(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -1270,6 +1424,17 @@ impl Workbench {
 
     fn picker_accept(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selected = self.picker.as_ref().map_or(0, |picker| picker.selected);
+        // The line jump (cmd-L) has no rows: Enter parses the query itself.
+        if let Some(picker) = &self.picker
+            && picker.mode == PickerMode::Line
+        {
+            let query = picker.query.trim().to_owned();
+            self.close_picker(window, cx);
+            if let Some((line, col)) = navigation::parse_line_col(&query) {
+                self.jump_active_to(line, col, cx);
+            }
+            return;
+        }
         let Some(row) = self.picker_rows().get(selected).cloned() else { return };
         match row {
             PickerRow::File(file) => {
@@ -1307,7 +1472,272 @@ impl Workbench {
                 self.close_picker(window, cx);
                 self.start_run(shell_config(line), cx);
             }
+            // -- M9 navigation rows -------------------------------------
+            PickerRow::RecentFile(path) => {
+                self.close_picker(window, cx);
+                self.jump_with_nav(navigation::Location::new(path, 0, 0), cx);
+                self.focus_active(window, cx);
+            }
+            PickerRow::Location(location) => {
+                self.close_picker(window, cx);
+                self.jump_with_nav(location, cx);
+                self.focus_active(window, cx);
+            }
+            PickerRow::Bookmark(path, line) => {
+                self.close_picker(window, cx);
+                self.jump_with_nav(navigation::Location::new(path, line, 0), cx);
+                self.focus_active(window, cx);
+            }
+            PickerRow::Outline(item, _) => {
+                self.close_picker(window, cx);
+                self.jump_active_to(item.selection_range.start.line, item.selection_range.start.col, cx);
+                self.focus_active(window, cx);
+            }
+            PickerRow::Tab(index) => {
+                self.close_picker(window, cx);
+                if let Some(tab) = self.tabs.get(index).map(|tab| tab.path.clone()) {
+                    self.jump_with_nav(navigation::Location::new(tab, 0, 0), cx);
+                    self.focus_active(window, cx);
+                }
+            }
+            PickerRow::Dock(page, _) => {
+                self.close_picker(window, cx);
+                self.dock_page = page;
+                if !self.settings.layout.dock_visible {
+                    self.settings.layout.dock_visible = true;
+                    settings::save(&self.settings);
+                }
+                cx.notify();
+            }
         }
+    }
+
+    // -- M9 navigation habits -----------------------------------------------
+    //
+    // One history (cmd-[ / cmd-]), one file MRU (cmd-E), one edit-location
+    // list (cmd-shift-E), persistent bookmarks (F3), and the jump helpers
+    // every entry point routes through: `jump_with_nav` records the
+    // departure, `jump_to` moves without touching the history (back/forward
+    // ride this one).
+
+    /// Where the workbench is now (the active tab's path + caret), for the
+    /// history's departure records.
+    fn current_location(&self, cx: &Context<Self>) -> Option<navigation::Location> {
+        let index = self.active?;
+        let tab = self.tabs.get(index)?;
+        let pos = tab.pane.read(cx).cursor_pos();
+        Some(navigation::Location::new(tab.path.clone(), pos.line, pos.col))
+    }
+
+    /// Records the current location as a departure point.
+    fn push_nav(&mut self, cx: &Context<Self>) {
+        if let Some(location) = self.current_location(cx) {
+            self.nav.push(location);
+        }
+    }
+
+    /// Opens `path` and places the caret; the history records the departure
+    /// first (the cmd-E / cmd-shift-E / F2 / F3 / cmd-F12 / ctrl-tab entry
+    /// points).
+    fn jump_with_nav(&mut self, destination: navigation::Location, cx: &mut Context<Self>) {
+        self.push_nav(cx);
+        self.jump_to(destination, cx);
+    }
+
+    /// The move without the history write (back/forward ride this).
+    fn jump_to(&mut self, destination: navigation::Location, cx: &mut Context<Self>) {
+        let pos = ide_core::Pos::new(destination.line, destination.col_utf16);
+        if let Some(index) = self.tabs.iter().position(|tab| tab.path == destination.path) {
+            self.active = Some(index);
+            if let Some(tab) = self.tabs.get(index) {
+                let pane = tab.pane.clone();
+                pane.update(cx, |pane, cx| pane.jump_to_offset(pos, cx));
+            }
+            self.tree.select(destination.path.clone());
+            self.save_session(cx);
+            cx.notify();
+            return;
+        }
+        self.open_path(&destination.path, cx);
+        if let Some(tab) = self.tabs.iter().find(|tab| tab.path == destination.path) {
+            tab.pane.update(cx, |pane, cx| pane.jump_to_offset(pos, cx));
+        }
+        cx.notify();
+    }
+
+    /// Jumps within the ACTIVE file (cmd-L, the outline): caret only, no
+    /// open. Records the departure so cmd-[ walks back.
+    fn jump_active_to(&mut self, line: u32, col: u32, cx: &mut Context<Self>) {
+        self.push_nav(cx);
+        if let Some(tab) = self.active_tab() {
+            let pane = tab.pane.clone();
+            pane.update(cx, |pane, cx| pane.jump_to_offset(ide_core::Pos::new(line, col), cx));
+        }
+        cx.notify();
+    }
+
+    /// The active tab, if any.
+    fn active_tab(&self) -> Option<&Tab> {
+        self.active.and_then(|index| self.tabs.get(index))
+    }
+
+    /// cmd-E's list: every file opened this session, most recent first (the
+    /// session-restored tabs seed it in recorded order).
+    fn remember_recent_file(&mut self, path: &Path) {
+        self.recent_files.retain(|seen| seen != path);
+        self.recent_files.insert(0, path.to_path_buf());
+        self.recent_files.truncate(50);
+    }
+
+    /// cmd-shift-E's data: the leaving tab's newest edit position, recorded
+    /// when the user moves away (and on save), so the list holds the places
+    /// edits actually happened without per-keystroke bookkeeping.
+    fn record_edit_location(&mut self, cx: &Context<Self>) {
+        let Some(index) = self.active else { return };
+        let Some(tab) = self.tabs.get(index) else { return };
+        let Some((_, pos)) = tab.pane.read(cx).last_edit_info() else { return };
+        let path = tab.path.clone();
+        self.edits.push(navigation::Location::new(path, pos.line, pos.col));
+    }
+
+    /// F2 / shift-F2: the project's errors (severity Error only, sorted by
+    /// file and position), navigated relative to the current spot, wrapping.
+    fn error_locations(&self) -> Vec<(PathBuf, ide_core::Pos, String)> {
+        let mut errors: Vec<(PathBuf, ide_core::Pos, String)> = self
+            .diagnostics
+            .iter()
+            .flat_map(|(path, by_source)| {
+                by_source.values().flatten().filter(|d| d.severity == ide_core::Severity::Error).map(move |d| {
+                    (path.clone(), d.range.start, d.message.lines().next().unwrap_or_default().to_owned())
+                })
+            })
+            .collect();
+        errors.sort_by(|a, b| (&a.0, a.1.line, a.1.col).cmp(&(&b.0, b.1.line, b.1.col)));
+        errors
+    }
+
+    fn jump_error(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let errors = self.error_locations();
+        if errors.is_empty() {
+            self.toast(NotifyLevel::Info, strings::NO_ERRORS.to_owned());
+            cx.notify();
+            return;
+        }
+        let next = match self.current_location(cx) {
+            Some(current) => match delta {
+                1 => errors
+                    .iter()
+                    .position(|(path, pos, _)| {
+                        *path > current.path
+                            || (*path == current.path
+                                && (pos.line > current.line
+                                    || (pos.line == current.line && pos.col > current.col_utf16)))
+                    })
+                    .unwrap_or(0),
+                _ => errors
+                    .iter()
+                    .rposition(|(path, pos, _)| {
+                        *path < current.path
+                            || (*path == current.path
+                                && (pos.line < current.line
+                                    || (pos.line == current.line && pos.col < current.col_utf16)))
+                    })
+                    .unwrap_or(errors.len() - 1),
+            },
+            None => 0,
+        };
+        if let Some((path, pos, message)) = errors.get(next) {
+            eprintln!("[nav] error {next}/{}: {}", errors.len(), message);
+            self.jump_with_nav(navigation::Location::new(path.clone(), pos.line, pos.col), cx);
+        }
+    }
+
+    /// F3: toggles the bookmark on the active tab's caret line, persisted in
+    /// the settings store (a structural event: toggles are rare).
+    fn toggle_bookmark(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab() else { return };
+        let (path, line) = (tab.path.clone(), tab.pane.read(cx).cursor_pos().line);
+        let added = self.bookmarks.toggle(&path, line);
+        eprintln!("[nav] bookmark {} {}:{line}", if added { "+" } else { "-" }, path.display());
+        self.settings.bookmarks = self.bookmarks.to_map();
+        settings::save(&self.settings);
+        self.toast(
+            NotifyLevel::Info,
+            format!(
+                "{} {}:{line}",
+                if added { strings::BOOKMARK_ADDED } else { strings::BOOKMARK_REMOVED },
+                file_name(&path)
+            ),
+        );
+        cx.notify();
+    }
+
+    /// cmd-shift-backspace: the newest edit among the open tabs (the
+    /// leaving-memory slot breaks the already-there case, IDEA-style).
+    fn jump_last_edit(&mut self, cx: &mut Context<Self>) {
+        let mut newest: Option<(std::time::Instant, PathBuf, ide_core::Pos)> = None;
+        for tab in &self.tabs {
+            if let Some((at, pos)) = tab.pane.read(cx).last_edit_info()
+                && newest.as_ref().is_none_or(|(seen, _, _)| at > *seen)
+            {
+                newest = Some((at, tab.path.clone(), pos));
+            }
+        }
+        let Some((_, path, pos)) = newest else {
+            self.toast(NotifyLevel::Info, strings::NO_EDIT_LOCATION.to_owned());
+            cx.notify();
+            return;
+        };
+        let destination = navigation::Location::new(path, pos.line, pos.col);
+        if self.current_location(cx).as_ref() == Some(&destination) {
+            if let Some(memory) = self.last_edit_memory.take() {
+                self.jump_with_nav(memory, cx);
+            }
+            return;
+        }
+        self.last_edit_memory = self.current_location(cx);
+        self.jump_with_nav(destination, cx);
+    }
+
+    /// ⌘[ / ⌘]: the history step. `direction` 1 = back (into the past),
+    /// -1 = forward; the current location parks on the opposite half.
+    fn navigate(&mut self, direction: isize, cx: &mut Context<Self>) {
+        let Some(current) = self.current_location(cx) else { return };
+        let (available, empty) = if direction == 1 {
+            (self.nav.can_back(), strings::NO_HISTORY_BACK)
+        } else {
+            (self.nav.can_forward(), strings::NO_HISTORY_FORWARD)
+        };
+        if !available {
+            self.toast(NotifyLevel::Info, empty);
+            cx.notify();
+            return;
+        }
+        let destination = if direction == 1 { self.nav.back(current) } else { self.nav.forward(current) };
+        let Some(destination) = destination else {
+            self.toast(NotifyLevel::Info, empty);
+            cx.notify();
+            return;
+        };
+        eprintln!(
+            "[nav] {} {}:{}",
+            if direction == 1 { "back" } else { "forward" },
+            destination.path.display(),
+            destination.line + 1
+        );
+        self.jump_to(destination, cx);
+    }
+
+    /// ctrl-tab / ctrl-shift-tab: opens the switcher and immediately moves
+    /// the selection one step (IDEA's cycle-as-you-press), so Enter confirms
+    /// the neighbour tab. A second press cycles within the open switcher.
+    fn open_switcher(&mut self, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.as_ref().is_some_and(|picker| picker.mode == PickerMode::Switcher) {
+            self.picker_move(direction, cx);
+            return;
+        }
+        self.open_picker(PickerMode::Switcher, window, cx);
+        self.picker_move(direction, cx);
     }
 
     // -- run (M4, multi-run tabs in M7) --------------------------------------
@@ -1470,6 +1900,13 @@ impl Workbench {
             cx.notify();
             return;
         };
+        // A tab switch is a jump: the history records the departure and the
+        // leaving tab's newest edit lands in the recent-locations list.
+        let switching_away = self.active_tab().is_some_and(|tab| tab.path != path);
+        if switching_away {
+            self.push_nav(cx);
+            self.record_edit_location(cx);
+        }
         if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
             self.active = Some(index);
             self.save_session(cx);
@@ -1507,10 +1944,11 @@ impl Workbench {
         });
         self.active = Some(self.tabs.len() - 1);
         // Every open feeds the index's recency (the empty palette query lists
-        // recent files).
+        // recent files) and the workbench's own ⌘E list.
         if let Some(host) = &self.host {
             host.index.mark_recent(&path);
         }
+        self.remember_recent_file(&path);
         self.save_session(cx);
         self.tree.select(path);
         cx.notify();
@@ -1637,6 +2075,11 @@ impl Workbench {
                 cx.notify();
             }
             BusMessage::OpenLocation { path, pos } => {
+                // The editor's cross-file jumps (goto / usages / rename
+                // preview) are navigation: the history records the departure
+                // (a same-file jump that does not switch tabs still rides
+                // open_path's dedup path, so only the caret moves).
+                self.push_nav(cx);
                 self.open_path(&path, cx);
                 if let Some(tab) = self.tabs.iter().find(|tab| tab.path == path) {
                     tab.pane.update(cx, |pane, cx| pane.jump_to_offset(pos, cx));
@@ -2650,6 +3093,32 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_reopen_closed_tab))
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_cancel))
+            // M9 navigation habits.
+            .on_action(cx.listener(|this, _: &acts::RecentFiles, window, cx| {
+                this.open_picker(PickerMode::RecentFiles, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::RecentLocations, window, cx| {
+                this.open_picker(PickerMode::RecentLocations, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::NavigateBack, _, cx| this.navigate(1, cx)))
+            .on_action(cx.listener(|this, _: &acts::NavigateForward, _, cx| this.navigate(-1, cx)))
+            .on_action(cx.listener(|this, _: &acts::NextError, _, cx| this.jump_error(1, cx)))
+            .on_action(cx.listener(|this, _: &acts::PrevError, _, cx| this.jump_error(-1, cx)))
+            .on_action(cx.listener(|this, _: &acts::ToggleBookmark, _, cx| this.toggle_bookmark(cx)))
+            .on_action(cx.listener(|this, _: &acts::ShowBookmarks, window, cx| {
+                this.open_picker(PickerMode::Bookmarks, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::FileStructure, window, cx| {
+                this.open_picker(PickerMode::Structure, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::Switcher, window, cx| this.open_switcher(1, window, cx)))
+            .on_action(cx.listener(|this, _: &acts::SwitcherBack, window, cx| this.open_switcher(-1, window, cx)))
+            .on_action(cx.listener(|this, _: &acts::SwitcherNext, window, cx| this.open_switcher(1, window, cx)))
+            .on_action(cx.listener(|this, _: &acts::SwitcherPrev, window, cx| this.open_switcher(-1, window, cx)))
+            .on_action(
+                cx.listener(|this, _: &acts::GotoLine, window, cx| this.open_picker(PickerMode::Line, window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &acts::LastEditLocation, _, cx| this.jump_last_edit(cx)))
             // Double ⇧ and the other modifier chords (modifier presses arrive
             // as modifiers events); the root key listener resolves their
             // follow-up keystrokes (⌥⌥ held, ↑ pressed).
@@ -3253,6 +3722,13 @@ impl Workbench {
                 ("Symbols", picker.files.len()..picker.files.len() + picker.symbols.len() + picker.lsp_symbols.len()),
                 ("Actions", picker.files.len() + picker.symbols.len() + picker.lsp_symbols.len()..rows.len()),
             ],
+            // The M9 modes are one flat list (the mode is the group title).
+            PickerMode::RecentFiles => vec![("Recent Files", 0..rows.len())],
+            PickerMode::RecentLocations => vec![("Recent Locations", 0..rows.len())],
+            PickerMode::Bookmarks => vec![("Bookmarks", 0..rows.len())],
+            PickerMode::Structure => vec![("Structure", 0..rows.len())],
+            PickerMode::Line => vec![("Go to Line", 0..rows.len())],
+            PickerMode::Switcher => vec![("Switcher", 0..rows.len())],
         };
         let mut list = div().id("picker-list").max_h(px(420.0)).overflow_y_scroll().py_1();
         if rows.is_empty() {
@@ -3374,6 +3850,56 @@ impl Workbench {
                     .child(div().truncate().text_color(theme::fg()).child(SharedString::from(line)))
                     .into_any_element(),
                 None,
+            ),
+            // M9 navigation rows: the same two-column shape, relative paths
+            // for the secondary column.
+            PickerRow::RecentFile(path) => (
+                div()
+                    .child(div().text_color(theme::fg()).child(SharedString::from(file_name(path))))
+                    .into_any_element(),
+                Some(path.display().to_string()),
+            ),
+            PickerRow::Location(location) => (
+                div()
+                    .child(div().text_color(theme::fg()).child(SharedString::from(file_name(&location.path))))
+                    .into_any_element(),
+                Some(format!(
+                    ":{}{}",
+                    location.line + 1,
+                    if location.col_utf16 > 0 { format!(":{}", location.col_utf16 + 1) } else { String::new() }
+                )),
+            ),
+            PickerRow::Bookmark(path, line) => (
+                div()
+                    .child(div().text_color(theme::fg()).child(SharedString::from(file_name(path))))
+                    .into_any_element(),
+                Some(format!(":{line}")),
+            ),
+            PickerRow::Outline(item, depth) => {
+                let detail = item.detail.clone().unwrap_or_default();
+                let content = div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .when(*depth > 0, |row| row.child(div().w(px(*depth as f32 * 12.0))))
+                    .child(
+                        div()
+                            .text_color(theme::fg_muted())
+                            .text_size(px(10.))
+                            .child(SharedString::from(symbol_kind_label(item.kind))),
+                    )
+                    .child(div().text_color(theme::fg()).child(SharedString::from(item.name.clone())));
+                (content.into_any_element(), Some(detail))
+            }
+            PickerRow::Tab(index) => (
+                div()
+                    .child(div().text_color(theme::fg()).child(SharedString::from(file_name(&self.tabs[*index].path))))
+                    .into_any_element(),
+                Some(self.tabs[*index].path.display().to_string()),
+            ),
+            PickerRow::Dock(_, label) => (
+                div().child(div().text_color(theme::fg()).child(SharedString::from(label))).into_any_element(),
+                Some("dock".to_owned()),
             ),
         };
         row_shell(content, secondary)
@@ -4112,4 +4638,12 @@ mod focus_chain_tests {
         assert!(action_lands(&workbench, &mut cx), "actions died after dismissing the menu");
         drop(holder);
     }
+}
+
+/// Flattens a hierarchical outline into (item, depth) rows, depth-first.
+fn flatten_outline(items: &[OutlineItem], depth: usize) -> Vec<(OutlineItem, usize)> {
+    items
+        .iter()
+        .flat_map(|item| std::iter::once((item.clone(), depth)).chain(flatten_outline(&item.children, depth + 1)))
+        .collect()
 }

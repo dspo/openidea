@@ -21,6 +21,7 @@ mod keymap;
 #[allow(dead_code)]
 mod keymap_data;
 mod markdown;
+mod navigation;
 mod perf;
 mod run_panel;
 mod semantic;
