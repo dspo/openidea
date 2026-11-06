@@ -38,6 +38,8 @@ actions!(
         HideActiveToolWindow,
         MaximizeToolWindow,
         ToggleCommit,
+        TrustProject,
+        DontOpenProject,
         // M9 navigation habits.
         RecentFiles,
         RecentLocations,

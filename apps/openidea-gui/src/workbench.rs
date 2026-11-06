@@ -282,6 +282,14 @@ struct UsagesAnswer {
     locations: Vec<ide_core::Location>,
 }
 
+/// The Project trust prompt (M10): a directory outside the trusted list
+/// waits here until the user decides (Trust opens it, Esc/the button does
+/// not — IDEA's face, minus the settings shortcut).
+struct TrustPrompt {
+    path: PathBuf,
+    focus: FocusHandle,
+}
+
 /// One queued toast: flushed to the window's notification stack at the next
 /// render (the bus pump has no window).
 struct Toast {
@@ -381,6 +389,11 @@ pub struct Workbench {
     /// The settings overlay (⌘,) and its focus handle (Esc closes it).
     settings_overlay: Option<SettingsOverlay>,
     settings_focus: FocusHandle,
+    /// The Project trust prompt (M10), its focus handle, and the deferred
+    /// seed (the prompt opens from the bus / startup with no window).
+    trust_prompt: Option<TrustPrompt>,
+    trust_focus: FocusHandle,
+    trust_focus_pending: Cell<bool>,
     /// Set when a bus message closed an overlay: the next render hands the
     /// focus back to the editor (or the tree).
     restore_focus_pending: Cell<bool>,
@@ -425,7 +438,16 @@ pub struct Workbench {
 }
 
 impl Workbench {
-    pub fn new(host: Option<Arc<Host>>, bus: Bus, settings: settings::Settings, cx: &mut Context<Self>) -> Self {
+    /// `pending_trust` is a startup root the trust gate held back (M10):
+    /// the prompt shows over the welcome view; Trust continues through
+    /// `open_project`.
+    pub fn new(
+        host: Option<Arc<Host>>,
+        pending_trust: Option<PathBuf>,
+        bus: Bus,
+        settings: settings::Settings,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let bookmarks = navigation::Bookmarks::from_map(settings.bookmarks.clone());
         // The M10 stripe model's view of the persisted layout: a visible tree
         // with no recorded left window means Project is the raised one (the
@@ -488,6 +510,11 @@ impl Workbench {
             last_edit_memory: None,
             commit_window: None,
             commit_window_sub: None,
+            trust_prompt: pending_trust
+                .as_ref()
+                .map(|path| TrustPrompt { path: path.clone(), focus: cx.focus_handle() }),
+            trust_focus: cx.focus_handle(),
+            trust_focus_pending: Cell::new(pending_trust.is_some()),
             save_flow: Cell::new(None),
             closed_tabs: Vec::new(),
             tasks: Vec::new(),
@@ -653,6 +680,19 @@ impl Workbench {
     /// reseeds the tree and git, and records the recent. The welcome view's
     /// open-folder answer and future multi-project faces all land here.
     fn open_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        // The Project trust gate (M10): an interactive open of a directory
+        // outside the trusted list prompts first (the startup env/recents
+        // flow predates the gate and stays trusted this milestone).
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+        let trusted = self.settings.trusted_projects.iter().any(|seen| {
+            Path::new(seen).canonicalize().map(|p| p == canonical).unwrap_or(*seen == canonical.display().to_string())
+        });
+        if !trusted {
+            self.trust_prompt = Some(TrustPrompt { path: canonical, focus: self.trust_focus.clone() });
+            self.trust_focus_pending.set(true);
+            cx.notify();
+            return;
+        }
         let host = {
             let _runtime = tokio::runtime::Handle::current().enter();
             Host::open(&root, self.bus.sink(), tokio::runtime::Handle::current())
@@ -1271,7 +1311,9 @@ impl Workbench {
     /// path lands here — a focus left on an unmounted element silences all
     /// action dispatch (the M3 death), so nothing may strand it.
     fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(prompt) = &self.tree_prompt {
+        if let Some(prompt) = &self.trust_prompt {
+            window.focus(&prompt.focus.clone(), cx);
+        } else if let Some(prompt) = &self.tree_prompt {
             window.focus(&prompt.input.read(cx).presentation().focus_handle().clone(), cx);
         } else if let Some(confirm) = self.tree_confirm.as_ref().map(|confirm| confirm.focus.clone()) {
             window.focus(&confirm, cx);
@@ -1484,6 +1526,13 @@ impl Workbench {
     /// pane's own Esc chain never sees it, and ⌘F — an Editor-context action
     /// — is out of reach).
     fn on_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        // The Project trust gate: Esc declines (IDEA's Don't Open).
+        if let Some(prompt) = self.trust_prompt.take() {
+            let _ = prompt;
+            self.restore_focus(window, cx);
+            cx.notify();
+            return;
+        }
         // The Esc-chain trace (M8): which surface is topmost and who holds the
         // focus — the soak's diagnostic for "an Esc did nothing".
         let pane_focused = self
@@ -3282,6 +3331,105 @@ impl Workbench {
 
     /// The settings panel (⌘,): Esc or a click outside closes; changes
     /// persist immediately.
+    /// The Project trust dialog (M10): the directory outside the trusted
+    /// list, Trust opens it (and remembers), Esc / Don't Open does not.
+    fn render_trust_prompt(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let prompt = self.trust_prompt.as_ref()?;
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::black().opacity(0.35))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| {
+                        // A click outside keeps the prompt up (IDEA's modal face);
+                        // the decision is Trust or Don't Open.
+                        let _ = this;
+                        let _ = window;
+                        let _ = cx;
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(460.0))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(theme::border())
+                        .rounded(px(6.0))
+                        .bg(theme::raised_bg())
+                        .key_context("TrustPrompt")
+                        .track_focus(&prompt.focus)
+                        .on_action(cx.listener(|this, _: &acts::TrustProject, window, cx| {
+                            this.on_trust_project(&acts::TrustProject, window, cx)
+                        }))
+                        .on_action(cx.listener(|this, _: &acts::DontOpenProject, window, cx| {
+                            this.on_dont_open_project(&acts::DontOpenProject, window, cx)
+                        }))
+                        .child(
+                            div()
+                                .px_4()
+                                .pt_3()
+                                .text_size(px(14.))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme::fg())
+                                .child(SharedString::from(strings::TRUST_TITLE)),
+                        )
+                        .child(
+                            div()
+                                .px_4()
+                                .pt_1()
+                                .text_size(px(12.))
+                                .text_color(theme::fg())
+                                .child(SharedString::from(prompt.path.display().to_string())),
+                        )
+                        .child(
+                            div()
+                                .px_4()
+                                .pt_1()
+                                .pb_2()
+                                .text_size(px(12.))
+                                .text_color(theme::fg_muted())
+                                .child(SharedString::from(strings::TRUST_HINT)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap_2()
+                                .px_3()
+                                .py_2()
+                                .border_t_1()
+                                .border_color(theme::border())
+                                .child(
+                                    Button::new("trust-decline")
+                                        .label(strings::TRUST_DECLINE)
+                                        .xsmall()
+                                        .ghost()
+                                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                            this.on_dont_open_project(&acts::DontOpenProject, window, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("trust-accept")
+                                        .label(strings::TRUST_ACCEPT)
+                                        .xsmall()
+                                        .primary()
+                                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                            this.on_trust_project(&acts::TrustProject, window, cx)
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_settings(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         self.settings_overlay.as_ref()?;
         let font = self.settings.font_size;
@@ -3626,6 +3774,13 @@ impl Render for Workbench {
         if self.diff_focus_pending.replace(false) {
             window.focus(&self.diff_focus, cx);
         }
+        // The trust prompt (like the delete confirm) takes the focus once
+        // rendered, so Esc lands on its Don't-open handler.
+        if self.trust_focus_pending.replace(false)
+            && let Some(prompt) = &self.trust_prompt
+        {
+            window.focus(&prompt.focus.clone(), cx);
+        }
         // The toast queue drains here (the window exists from now on).
         self.flush_toasts(window, cx);
         // A bus message closed an overlay (the commit landed): focus returns
@@ -3682,6 +3837,8 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_hide_active_tool_window))
             .on_action(cx.listener(Self::on_maximize_tool_window))
             .on_action(cx.listener(Self::on_toggle_commit))
+            .on_action(cx.listener(Self::on_trust_project))
+            .on_action(cx.listener(Self::on_dont_open_project))
             .on_action(cx.listener(Self::on_reopen_closed_tab))
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_cancel))
@@ -3764,6 +3921,7 @@ impl Render for Workbench {
             .children(self.render_commit(cx))
             .children(self.render_tree_prompt(cx))
             .children(self.render_tree_confirm(cx))
+            .children(self.render_trust_prompt(cx))
             .children(self.render_settings(cx))
     }
 }
@@ -3825,6 +3983,31 @@ impl Workbench {
             welcome = welcome.child(list);
         }
         welcome.into_any_element()
+    }
+
+    /// Trusts the prompted directory and opens it.
+    fn on_trust_project(&mut self, _: &acts::TrustProject, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = self.trust_prompt.take() else { return };
+        self.trust_prompt_accepted(&prompt.path, window, cx);
+    }
+
+    fn trust_prompt_accepted(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let seen = canonical.display().to_string();
+        if !self.settings.trusted_projects.contains(&seen) {
+            self.settings.trusted_projects.push(seen);
+            settings::save(&self.settings);
+        }
+        self.restore_focus(window, cx);
+        self.open_project(canonical, cx);
+    }
+
+    /// Declines: the prompt drops, nothing opens (the welcome view stays).
+    fn on_dont_open_project(&mut self, _: &acts::DontOpenProject, window: &mut Window, cx: &mut Context<Self>) {
+        if self.trust_prompt.take().is_some() {
+            self.restore_focus(window, cx);
+            cx.notify();
+        }
     }
 
     /// The open-folder dialog (the welcome button; ⌘O routes here too while
@@ -5728,7 +5911,7 @@ mod focus_chain_tests {
     fn mount(cx: &mut TestAppContext) -> (Entity<Workbench>, VisualTestContext) {
         let (bus, _rx) = Bus::channel();
         let (workbench, visual) =
-            cx.add_window_view(|_, cx| Workbench::new(None, bus, settings::Settings::default(), cx));
+            cx.add_window_view(|_, cx| Workbench::new(None, None, bus, settings::Settings::default(), cx));
         (workbench, visual.clone())
     }
 

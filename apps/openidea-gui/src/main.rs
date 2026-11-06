@@ -34,7 +34,7 @@ mod theme;
 mod toolwindow;
 mod workbench;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{App, AppContext as _, WindowBounds, WindowOptions, px, size};
@@ -166,11 +166,31 @@ fn main() {
                 // ties). A persisted user override replaces a row's keys.
                 keymap::bind(cx, &app_settings.keymap_overrides);
                 let (bus, rx) = Bus::channel();
+                // The Project trust gate (M10): a startup root outside the
+                // trusted list waits in the trust prompt instead of opening
+                // (the scripted-session env names an operator-chosen project
+                // and keeps its auto-trust, which the harnesses rely on).
+                let startup_from_env = std::env::var_os("OPENIDEA_GUI_PROJECT").is_some();
+                let startup_root = initial_project(&app_settings);
+                let untrusted_startup = startup_root.as_ref().and_then(|root| {
+                    let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+                    let trusted = startup_from_env
+                        || app_settings
+                            .trusted_projects
+                            .iter()
+                            .any(|seen| Path::new(seen).canonicalize().map(|p| p == canonical).unwrap_or(false));
+                    (!trusted).then_some(canonical)
+                });
+                eprintln!(
+                    "[trust] startup root={:?} from_env={trusted_env} untrusted={untrusted_startup:?})",
+                    startup_root,
+                    trusted_env = startup_from_env,
+                );
                 // The manager must be constructed inside the runtime's context so
                 // it captures this handle for its background tasks.
                 let host = {
                     let _runtime = tokio::runtime::Handle::current().enter();
-                    initial_project(&app_settings).and_then(|root| {
+                    startup_root.clone().filter(|_| untrusted_startup.is_none()).and_then(|root| {
                         match Host::open(&root, bus.sink(), tokio::runtime::Handle::current()) {
                             Ok(host) => {
                                 let host = Arc::new(host);
@@ -193,7 +213,8 @@ fn main() {
                     settings::push_recent(&mut app_settings.recent_projects, &root.root);
                     settings::save(&app_settings);
                 }
-                let workbench = cx.new(|cx| Workbench::new(host.clone(), bus.clone(), app_settings, cx));
+                let workbench =
+                    cx.new(|cx| Workbench::new(host.clone(), untrusted_startup, bus.clone(), app_settings, cx));
                 // The Quit action persists the session (tabs + carets) on the
                 // graceful path (M8); registered here so it can reach the
                 // workbench entity.

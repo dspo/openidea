@@ -45,6 +45,9 @@ pub struct Settings {
     pub bookmarks: BTreeMap<String, Vec<u32>>,
     /// Recent commit messages (M10's Commit window history), newest first.
     pub commit_messages: Vec<String>,
+    /// Projects the user trusted (M10's Project trust dialog), canonicalized.
+    /// An interactive open of a directory outside this list prompts first.
+    pub trusted_projects: Vec<String>,
 }
 
 /// One project's restored session (M8): the tabs in open order, the active
@@ -111,6 +114,7 @@ impl Default for Settings {
             keymap_overrides: BTreeMap::new(),
             bookmarks: BTreeMap::new(),
             commit_messages: Vec::new(),
+            trusted_projects: Vec::new(),
         }
     }
 }
@@ -132,6 +136,8 @@ struct Store {
     bookmarks: BTreeMap<String, Vec<u32>>,
     #[serde(default)]
     commit_messages: Vec<String>,
+    #[serde(default)]
+    trusted_projects: Vec<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -332,6 +338,7 @@ fn from_store(store: Store) -> Settings {
         keymap_overrides: store.keymap_overrides,
         bookmarks: store.bookmarks,
         commit_messages: store.commit_messages,
+        trusted_projects: store.trusted_projects,
     }
 }
 
@@ -369,6 +376,7 @@ pub fn save(settings: &Settings) {
         keymap_overrides: settings.keymap_overrides.clone(),
         bookmarks: settings.bookmarks.clone(),
         commit_messages: settings.commit_messages.clone(),
+        trusted_projects: settings.trusted_projects.clone(),
     };
     let Ok(json) = serde_json::to_string_pretty(&store) else { return };
     if let Some(parent) = path.parent()
@@ -582,6 +590,7 @@ mod tests {
             keymap_overrides: BTreeMap::from([("file.save".to_owned(), vec!["Ctrl+S".to_owned()])]),
             bookmarks: BTreeMap::from([("/tmp/x.go".to_owned(), vec![3, 9])]),
             commit_messages: vec!["initial".to_owned()],
+            trusted_projects: vec!["/tmp/m10-trusted".to_owned()],
         };
         let store = Store {
             recent_projects: settings.recent_projects.clone(),
@@ -600,6 +609,7 @@ mod tests {
             keymap_overrides: settings.keymap_overrides.clone(),
             bookmarks: settings.bookmarks.clone(),
             commit_messages: settings.commit_messages.clone(),
+            trusted_projects: settings.trusted_projects.clone(),
         };
         let back: Store = serde_json::from_str(&serde_json::to_string(&store).unwrap()).unwrap();
         assert_eq!(back.recent_projects, settings.recent_projects);
@@ -613,6 +623,8 @@ mod tests {
         assert_eq!(layout.maximized, None);
         // The commit history round-trips (M10).
         assert_eq!(back.commit_messages, vec!["initial".to_owned()]);
+        // Trusted projects round-trip (M10).
+        assert_eq!(back.trusted_projects, vec!["/tmp/m10-trusted".to_owned()]);
         assert_eq!(back.font_size, Some(16.0));
         // The session round-trips verbatim (M8).
         assert_eq!(back.session, settings.session);
