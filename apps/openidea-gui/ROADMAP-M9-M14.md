@@ -77,12 +77,25 @@ Commit 工具窗、project trust、Structure/Bookmarks 窗。实现全部在 app
 
 ## M11 — 终端 + 调试器（≈M2+M3 量级，预计续传一次）
 
-（内容同前版：vte 入 app 侧接线 + Terminal 工具窗；DAP 断点/单步/变量/条件断点；
-Services 窗最小面。**fork 修订**：`vte` 依赖加在 app crate，不改 `ide-terminal`；
-调试适配器以 `languages/*.toml` 现状声明为准——rust=codelldb、python、ts/js 的
-LSP+debugger 均已声明，**目标零 toml 改动**，确需改的先评估同步冲突。）
+**终端（技术路线已定）：libghostty-vt 核心 + 自绘 GPUI element**，架构照
+`~/projects/dspo/manox-app/crates/steer-ghostty`（用户自有代码，可参考/复用；
+该路线在 Steer 中已淘汰手搓模拟方案；JetBrains 亦在向 ghostty 迁移集成终端）：
+- PTY 仍走 `ide-terminal`（portable-pty，与 steer-ghostty 同款接缝）；模拟核心
+  用 Ghostty 的 libghostty-vt（MIT）：pin rev + 手抄 FFI 纪律（sys/key_consts
+  随 rev 同步演进）+ build.rs 的 zig 工具链/tarball/盖章缓存方案照搬。
+- 自绘 GPUI element 渲染 render-state 快照；GPUI 键位→ghostty key 事件映射；
+  OSC 标题镜像；`theme.rs` 调色板桥接 ghostty 颜色；IME 经 M0 验证路径。
+- 终端实现落位 `apps/openidea-gui/` 内（path 依赖子 crate），根 exclude 不动。
+- 语义测试采用确定性 TestProcess 思路；首次 zig 构建成本与缓存效果入报告。
+- Terminal 工具窗：bottom、"Local × + ▾" header 形态、多 tab、随前台会话 cwd。
 
-**出口**：五语言各一条断点调试实跑；终端多 tab transcript；会话入 Services 窗。
+**调试器**：gutter 断点（⌘F8）、Debug 工具窗（Variables/Watches/Call Stack/
+Console）、F7/F8/F9、条件断点；launch/attach 并入 run 配置体系。适配器以
+`languages/*.toml` 现状声明为准（go=delve、rust=codelldb、python、ts/js 均已
+声明），**目标零 toml 改动**。**Services 工具窗最小面**（run/debug 会话统一入列）。
+
+**出口**：五语言各一条「断点→单步→看变量→继续」实跑；终端多 tab transcript +
+语义抽查（vim/htop/less 类全屏应用、真彩色、超链接）；会话入 Services 窗。
 
 ## M12 — 测试树 + 检查（≈M3 量级）
 
