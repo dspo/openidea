@@ -59,6 +59,10 @@ ide-vcs = { path = "../../crates/ide-vcs" }
 ide-search = { path = "../../crates/ide-search" }
 # The charset constant for ide-vcs's TextEncoding (UTF-8 documents only here).
 encoding_rs = "0.8"
+# The app-side LSP server options overlay (M9's fork move: the gopls opt-ins
+# `languages/go.toml` used to carry) builds a `toml::Value`; same major as
+# the workspace pin (0.9).
+toml = "0.9"
 # The grammar Language values come from ide-language; this must resolve to the
 # same tree-sitter the main workspace pins (0.25.10) so the types unify.
 tree-sitter = "=0.25.10"
