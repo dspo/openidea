@@ -292,6 +292,30 @@ enum Command {
     Paste,
     Cancel,
     ToggleHud,
+    // M9's edit habits (the IDEA 编辑段): each lands in its own undo step
+    // ([`Cause::Structure`]) unless noted.
+    Duplicate,
+    CommentLine,
+    CommentBlock,
+    ExtendSelection,
+    ShrinkSelection,
+    MoveLines(i8),
+    MoveStatements(i8),
+    DeleteLine,
+    FindStep(isize),
+    Replace,
+    ScrollCenter,
+    Fold,
+    Unfold,
+    FoldAll,
+    UnfoldAll,
+    StartNewLineBelow,
+    StartNewLineAbove,
+    JoinLines,
+    ToggleCase,
+    Complete,
+    CloneCaret(i8),
+    ParameterInfo,
 }
 
 /// Why an edit batch happened; decides undo grouping and caret mapping.
@@ -313,6 +337,11 @@ enum Cause {
     /// A document format (⌘⌥L): its own undo step (a whole-file rewrite must
     /// not merge into typing), selections kept (clamped).
     Format,
+    /// The M9 line-structure edits (duplicate, comment, move, join,
+    /// delete-line, toggle-case): one batch per invocation, selections ride
+    /// along clamped (the commands that want placed cursors set them
+    /// explicitly through the cursored apply).
+    Structure,
     /// A live-template expansion: its own undo step (Esc/undo removes the
     /// whole expansion); the session's stops manage the cursors.
     Template,
@@ -464,6 +493,283 @@ impl Buffer {
         let change = TextChange { from: start as u32, to: end as u32, insert: new_text.to_owned() };
         let len = utf16_len(new_text);
         (start..start + len, change)
+    }
+
+    // -- M9 edit habit transforms (the IDEA 编辑段) --------------------------
+    //
+    // Pure change generators for the edit commands: they read the buffer and
+    // return pre-batch changes plus post-batch caret placements, so the unit
+    // tests pin the shapes without a pane.
+
+    /// The touched lines of a selection set (indent_lines' rule: a caret at
+    /// column 0 does not count the line below), deduplicated ascending.
+    fn touched_lines_of(&self, selections: &[Selection]) -> Vec<u32> {
+        let mut lines = Vec::new();
+        for selection in selections {
+            let (start, end) = selection.normalized();
+            let first = self.line_of(start);
+            let last = if end > start { self.line_of(end - 1) } else { first };
+            for line in first..=last {
+                if lines.last() != Some(&line) {
+                    lines.push(line);
+                }
+            }
+        }
+        lines
+    }
+
+    /// Consecutive touched lines merge into inclusive blocks.
+    fn contiguous_blocks(lines: Vec<u32>) -> Vec<(u32, u32)> {
+        let mut blocks: Vec<(u32, u32)> = Vec::new();
+        for line in lines {
+            match blocks.last_mut() {
+                Some((_, end)) if *end + 1 == line => *end = line,
+                _ => blocks.push((line, line)),
+            }
+        }
+        blocks
+    }
+
+    /// ⌘D: a selection duplicates right after itself (the copy selected); a
+    /// bare caret duplicates its line below (the caret lands on the copy at
+    /// the same column).
+    fn duplicate_edits(&self, selections: &[Selection]) -> (Vec<TextChange>, Vec<Selection>) {
+        let mut changes = Vec::new();
+        let mut placed = Vec::new();
+        for selection in selections {
+            let (start, end) = selection.normalized();
+            if end > start {
+                let text = self.slice_utf16(start..end);
+                changes.push(TextChange { from: end as u32, to: end as u32, insert: text.clone() });
+                let copied = text.chars().map(char::len_utf16).sum::<usize>();
+                placed.push(Selection::caret(end).with_head(end + copied));
+            } else {
+                let span = self.line_span(self.line_of(start));
+                let text = self.slice_utf16(span.clone());
+                changes.push(TextChange { from: span.end as u32, to: span.end as u32, insert: format!("\n{text}") });
+                placed.push(Selection::caret(span.end + 1 + (start - span.start)));
+            }
+        }
+        (changes, placed)
+    }
+
+    /// ⌘/: toggles the line comment on every touched line — all commented
+    /// lines lose it, otherwise every non-blank one gains it.
+    fn comment_line_edits(&self, selections: &[Selection], token: &str) -> Vec<TextChange> {
+        let lines = self.touched_lines_of(selections);
+        let commented = lines.iter().all(|line| {
+            let text = self.slice_utf16(self.line_span(*line));
+            let content = text.trim_start();
+            content.is_empty() || content.starts_with(token)
+        });
+        let mut changes = Vec::new();
+        for line in lines {
+            let span = self.line_span(line);
+            let text = self.slice_utf16(span.clone());
+            let indent = text.len() - text.trim_start().len();
+            // Blank lines never move: no stray comment marks, clean round-trip.
+            if text.trim().is_empty() {
+                continue;
+            }
+            if commented {
+                // Drop the token plus the space after it (when we wrote one).
+                let mut at = indent + utf16_len(token);
+                if text[at..].starts_with(' ') {
+                    at += 1;
+                }
+                changes.push(TextChange {
+                    from: (span.start + indent) as u32,
+                    to: (span.start + at) as u32,
+                    insert: String::new(),
+                });
+            } else {
+                changes.push(TextChange {
+                    from: (span.start + indent) as u32,
+                    to: (span.start + indent) as u32,
+                    insert: format!("{token} "),
+                });
+            }
+        }
+        changes
+    }
+
+    /// ⌘⌥/: wraps each selection in the block comment; a wrapped selection
+    /// unwraps. Caret-only selections do nothing.
+    fn comment_block_edits(&self, selections: &[Selection], open: &str, close: &str) -> Vec<TextChange> {
+        let mut changes = Vec::new();
+        for selection in selections {
+            let (start, end) = selection.normalized();
+            if end <= start {
+                continue;
+            }
+            let text = self.slice_utf16(start..end);
+            let trimmed = text.trim();
+            let open_len = utf16_len(open);
+            let close_len = utf16_len(close);
+            if trimmed.starts_with(open) && trimmed.ends_with(close) && trimmed.len() >= open_len + close_len {
+                // Unwrap: the wrapper sits at the trimmed bounds; the range
+                // peels the tokens (comment tokens are ASCII, so byte and
+                // UTF-16 lengths agree) and the insert also drops our padding
+                // spaces, restoring the pre-wrap text.
+                let head_ws = text.len() - text.trim_start().len();
+                let tail_ws = text.len() - text.trim_end().len();
+                let from = start + head_ws + open_len;
+                let to = end - tail_ws - close_len;
+                let mut inner = text[head_ws + open.len()..text.len() - tail_ws - close.len()].to_owned();
+                if let Some(stripped) = inner.strip_prefix(' ') {
+                    inner = stripped.to_owned();
+                }
+                if let Some(stripped) = inner.strip_suffix(' ') {
+                    inner = stripped.to_owned();
+                }
+                if !inner.is_empty() {
+                    changes.push(TextChange { from: from as u32, to: to as u32, insert: inner });
+                }
+            } else {
+                changes.push(TextChange { from: start as u32, to: start as u32, insert: format!("{open} ") });
+                changes.push(TextChange { from: end as u32, to: end as u32, insert: format!(" {close}") });
+            }
+        }
+        changes
+    }
+
+    /// One line-block's ⌥⇧↑ / ⌥⇧↓ move: the adjacent line's run swaps across,
+    /// returning the pre-batch change pair and the caret shift for the
+    /// selections inside the block. `None` at the document edges.
+    fn move_block_edits(&self, block: (u32, u32), delta: i8) -> Option<(Vec<TextChange>, i64)> {
+        let (start_line, end_line) = block;
+        match delta {
+            -1 => {
+                if start_line == 0 {
+                    return None;
+                }
+                let above = self.line_span(start_line - 1);
+                let moved = (above.start as u32, (above.end + 1) as u32);
+                // The last document line has no newline to land on: the moved
+                // line drops its own and the block gains one.
+                let at_last = end_line + 1 >= self.line_count();
+                let at = if at_last { self.utf16_len() as u32 } else { (self.line_span(end_line).end + 1) as u32 };
+                let mut text = self.slice_utf16(moved.0 as usize..moved.1 as usize);
+                let insert = if at_last {
+                    text.pop();
+                    format!("\n{text}")
+                } else {
+                    text
+                };
+                Some((
+                    vec![
+                        TextChange { from: moved.0, to: moved.1, insert: String::new() },
+                        TextChange { from: at, to: at, insert },
+                    ],
+                    -(moved.1 as i64 - moved.0 as i64),
+                ))
+            }
+            1 => {
+                // The neighbor must have a trailing newline to move, so the
+                // phantom empty line a trailing `\n` creates never moves.
+                if end_line + 2 >= self.line_count() {
+                    return None;
+                }
+                let at = self.line_span(start_line).start as u32;
+                let below = self.line_span(end_line + 1);
+                let moved = (below.start as u32, (below.end + 1) as u32);
+                Some((
+                    vec![
+                        TextChange { from: at, to: at, insert: self.slice_utf16(moved.0 as usize..moved.1 as usize) },
+                        TextChange { from: moved.0, to: moved.1, insert: String::new() },
+                    ],
+                    moved.1 as i64 - moved.0 as i64,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// ⌘⌫: deletes every touched block (first line start to last line's end,
+    /// newline included); the caret lands where the block started.
+    fn delete_line_edits(&self, blocks: &[(u32, u32)]) -> (Vec<TextChange>, Vec<Selection>) {
+        let mut changes = Vec::new();
+        let mut placed = Vec::new();
+        let mut deleted_before: i64 = 0;
+        for (start_line, end_line) in blocks {
+            let from = self.line_span(*start_line).start as u32;
+            let bottom = self.line_span(*end_line);
+            let is_last = *end_line + 1 >= self.line_count();
+            let to = if is_last { bottom.end as u32 } else { (bottom.end + 1) as u32 };
+            changes.push(TextChange { from, to, insert: String::new() });
+            // Post-batch: everything before this block is already deleted.
+            placed.push(Selection::caret((from as i64 + deleted_before).max(0) as usize));
+            deleted_before -= (to - from) as i64;
+        }
+        (changes, placed)
+    }
+
+    /// ⌃⇧J: joins each block (a caret-only block takes the line below),
+    /// newline plus indentation replaced by one space; the caret lands at the
+    /// block's first joint.
+    fn join_edits(&self, blocks: &[(u32, u32)]) -> (Vec<TextChange>, Vec<Selection>) {
+        let mut changes = Vec::new();
+        let mut placed = Vec::new();
+        let mut deleted_before: i64 = 0;
+        for (start_line, end_line) in blocks {
+            let last_line = if end_line == start_line { end_line + 1 } else { *end_line };
+            if last_line >= self.line_count() {
+                continue;
+            }
+            // One joint per line; pre-batch positions, post-batch caret.
+            let mut first_joint = None;
+            for line in (start_line + 1)..=last_line {
+                let span = self.line_span(line);
+                let text = self.slice_utf16(span.clone());
+                let indent = text.len() - text.trim_start().len();
+                let from = (span.start - 1) as u32;
+                let to = (span.start + indent) as u32;
+                let insert = if indent == 0 && text.is_empty() { String::new() } else { " ".to_owned() };
+                changes.push(TextChange { from, to, insert });
+                if first_joint.is_none() {
+                    first_joint = Some(from);
+                }
+            }
+            if let Some(from) = first_joint {
+                placed.push(Selection::caret((from as i64 + deleted_before).max(0) as usize + 1));
+            }
+            deleted_before -= (last_line - start_line) as i64; // one newline per joint
+        }
+        (changes, placed)
+    }
+
+    /// ⌘⇧U: lower-case text upper-cases, upper-case or mixed lower-cases (a
+    /// bare caret takes the word at it).
+    fn toggle_case_edits(&self, selections: &[Selection]) -> Vec<TextChange> {
+        let mut ranges = Vec::new();
+        for selection in selections {
+            let (start, end) = selection.normalized();
+            if end > start {
+                ranges.push((start, end));
+            } else {
+                let word_start = self.word_start(start);
+                let word_end = self.word_end(start);
+                if word_end > word_start {
+                    ranges.push((word_start, word_end));
+                }
+            }
+        }
+        ranges.sort();
+        let mut changes = Vec::new();
+        for (start, end) in ranges {
+            let text = self.slice_utf16(start..end);
+            // All-lower (or non-alphabetic) text upper-cases; anything else
+            // (upper, mixed) lower-cases — IDEA's rule.
+            let toggled = if text.chars().all(|c| !c.is_alphabetic() || c.is_lowercase()) {
+                text.to_uppercase()
+            } else {
+                text.to_lowercase()
+            };
+            if toggled != text {
+                changes.push(TextChange { from: start as u32, to: end as u32, insert: toggled });
+            }
+        }
+        changes
     }
 }
 
@@ -742,8 +1048,10 @@ pub struct EditorPane {
     max_line_w: Cell<f32>,
     /// The document's indent policy (Tab / Enter / Shift-Tab).
     indent: Indent,
-    /// The language's line comment (Enter's `{`-detection strips it).
+    /// The language's line comment (Enter's `{`-detection strips it, ⌘/).
     line_comment: Option<String>,
+    /// The language's block comment pair (⌘⌥/).
+    block_comment: Option<(String, String)>,
     focused_once: Cell<bool>,
     /// Syntax highlighting (phase 3): the query, the incrementally parsed
     /// tree, and the whole-document spans the paint path slices per line.
@@ -778,6 +1086,9 @@ pub struct EditorPane {
     parse_generation: u32,
     // Multi-cursor state (phase 4).
     selections: Vec<Selection>,
+    /// ⌥↑ growth history: each extend pushes the previous shapes; ⌥↓ pops.
+    /// Any edit clears it (the offsets are stale).
+    shrink_stack: Vec<Vec<Selection>>,
     drag: Cell<Option<Drag>>,
     undo: Vec<UndoGroup>,
     redo: Vec<UndoGroup>,
@@ -846,6 +1157,7 @@ impl EditorPane {
         let language = info.language.clone();
         let indent = indent_for(&info, &host.languages);
         let line_comment = host.languages.get(&language).and_then(|config| config.line_comment);
+        let block_comment = host.languages.get(&language).and_then(|config| config.block_comment);
         let mut pane = Self {
             host,
             doc_id: info.id,
@@ -858,6 +1170,7 @@ impl EditorPane {
             max_line_w: Cell::new(0.0),
             indent,
             line_comment,
+            block_comment,
             focused_once: Cell::new(false),
             highlighter: None,
             language,
@@ -874,6 +1187,7 @@ impl EditorPane {
             pending_edits: Vec::new(),
             parse_generation: 0,
             selections: vec![Selection::caret(utf16_len(&info.text))],
+            shrink_stack: Vec::new(),
             drag: Cell::new(None),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -1281,6 +1595,37 @@ impl EditorPane {
     /// and to the backend, feed the syntax tree, record the undo entry (per
     /// `Cause`), and map the cursors through the batch.
     fn apply_edits(&mut self, changes: Vec<TextChange>, cause: Cause, cx: &mut gpui::Context<Self>) {
+        self.apply_edits_cursored(changes, cause, None, cx);
+    }
+
+    /// [`Self::apply_edits`] with explicit post-batch cursors: the commands
+    /// that place carets themselves (duplicate, the line moves) hand them in,
+    /// and the undo entry records exactly what was left on screen.
+    fn apply_edits_cursored(
+        &mut self,
+        changes: Vec<TextChange>,
+        cause: Cause,
+        cursors: Option<Vec<Selection>>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let mut cursors = cursors;
+        if let Some(placed) = &cursors {
+            // The placements speak in pre-batch offsets; map each through the
+            // batch the way the insert path does (before `changes` moves).
+            let mut mapped = Vec::with_capacity(placed.len());
+            for selection in placed {
+                let head = shift_offset(selection.head, &changes);
+                let anchor =
+                    if selection.anchor == selection.head { head } else { shift_offset(selection.anchor, &changes) };
+                mapped.push(Selection {
+                    anchor,
+                    head,
+                    reversed: selection.reversed || head < anchor,
+                    goal_col: selection.goal_col,
+                });
+            }
+            cursors = Some(mapped);
+        }
         if self.read_only {
             return;
         }
@@ -1328,15 +1673,23 @@ impl EditorPane {
             }
         }
         let selections_before = std::mem::take(&mut self.selections);
-        let selections_after = match cause {
-            Cause::Typing | Cause::Delete | Cause::Paste => Selection::after_inserts(&changes),
-            // Mechanical/indent/format/replace batches keep the caller's
-            // cursors: they are restored (undo/redo), ride along (indentation
-            // at line starts), stay put (format, replace — the find flow
-            // re-selects what it wants) or clamp (IME, patches) afterwards.
-            Cause::ImeCommit | Cause::Mechanical | Cause::Indent | Cause::Format | Cause::Template | Cause::Replace => {
-                selections_before.clone()
-            }
+        let selections_after = match cursors.take() {
+            Some(placed) => placed,
+            None => match cause {
+                Cause::Typing | Cause::Delete | Cause::Paste => Selection::after_inserts(&changes),
+                // Mechanical/indent/structure/format/replace batches keep the
+                // caller's cursors: they are restored (undo/redo), ride along
+                // (indentation at line starts), stay put (format, replace —
+                // the find flow re-selects what it wants) or clamp (IME,
+                // patches) afterwards.
+                Cause::ImeCommit
+                | Cause::Mechanical
+                | Cause::Indent
+                | Cause::Format
+                | Cause::Template
+                | Cause::Replace
+                | Cause::Structure => selections_before.clone(),
+            },
         };
         self.selections = normalize_selections(
             selections_after.into_iter().map(|s| clamp_selection(s, self.buf.utf16_len())).collect(),
@@ -1344,6 +1697,8 @@ impl EditorPane {
         if !matches!(cause, Cause::Mechanical) {
             self.push_undo(UndoEntry { changes, inverse, selections_before, selections_after: Vec::new() }, cause);
         }
+        // The shrink stack speaks in offsets an edit invalidated.
+        self.shrink_stack.clear();
         self.last_edit =
             Some((std::time::Instant::now(), matches!(cause, Cause::Typing | Cause::Delete | Cause::ImeCommit)));
         self.hover.set(None);
@@ -3106,7 +3461,31 @@ impl EditorPane {
                 | Command::Paste
                 | Command::Tab
                 | Command::Outdent
-                | Command::ToggleHud => return,
+                | Command::ToggleHud
+                // The M9 edit habits: modal-surface swallows them like the
+                // rest (the handlers below never see them here).
+                | Command::Duplicate
+                | Command::CommentLine
+                | Command::CommentBlock
+                | Command::ExtendSelection
+                | Command::ShrinkSelection
+                | Command::MoveLines(_)
+                | Command::MoveStatements(_)
+                | Command::DeleteLine
+                | Command::FindStep(_)
+                | Command::Replace
+                | Command::ScrollCenter
+                | Command::Fold
+                | Command::Unfold
+                | Command::FoldAll
+                | Command::UnfoldAll
+                | Command::StartNewLineBelow
+                | Command::StartNewLineAbove
+                | Command::JoinLines
+                | Command::ToggleCase
+                | Command::Complete
+                | Command::CloneCaret(_)
+                | Command::ParameterInfo => return,
             }
         }
         if matches!(self.rename, Some(RenameFlow::Preview { .. })) {
@@ -3260,7 +3639,387 @@ impl EditorPane {
                 self.collapse_cursors(cx)
             }
             Command::ToggleHud => unreachable!("handled above"),
+            // -- M9 edit habits ---------------------------------------------------
+            Command::Duplicate => self.duplicate(cx),
+            Command::CommentLine => self.comment_line(cx),
+            Command::CommentBlock => self.comment_block(cx),
+            Command::ExtendSelection => self.extend_selection(cx),
+            Command::ShrinkSelection => self.shrink_selection(cx),
+            Command::MoveLines(delta) => self.move_lines(delta, cx),
+            Command::MoveStatements(delta) => self.move_lines(delta, cx),
+            Command::DeleteLine => self.delete_line(cx),
+            Command::FindStep(delta) => {
+                // IDEA's Find Next with nothing to walk: find the word at the
+                // caret first; without a word the find bar opens instead.
+                if self.find_hits.is_none() && !self.open_find_word(cx) {
+                    self.open_find(window, cx);
+                }
+                self.find_step(delta, cx);
+            }
+            Command::Replace => self.open_replace(window, cx),
+            Command::ScrollCenter => self.scroll_center(cx),
+            Command::Fold => self.fold_at_caret(cx),
+            Command::Unfold => self.unfold_at_caret(cx),
+            Command::FoldAll => self.fold_all(cx),
+            Command::UnfoldAll => {
+                self.folds.clear();
+                self.clamp_scroll();
+                cx.notify();
+            }
+            Command::StartNewLineBelow => self.start_new_line(1, cx),
+            Command::StartNewLineAbove => self.start_new_line(-1, cx),
+            Command::JoinLines => self.join_lines(cx),
+            Command::ToggleCase => self.toggle_case(cx),
+            Command::Complete => self.force_completion(cx),
+            Command::CloneCaret(delta) => self.clone_caret(delta, cx),
+            Command::ParameterInfo => self.request_signature_help(cx),
         }
+    }
+
+    // -- M9 edit habits (the IDEA 编辑段) ------------------------------------
+    //
+    // The shapes live as pure Buffer transforms (unit-tested there); these
+    // wrappers land them as one batch in its own undo step, handing the
+    // post-batch caret placements to the cursored apply.
+
+    /// The lines a selection set touches, deduplicated and ascending.
+    fn touched_lines(&self) -> Vec<u32> {
+        self.buf.touched_lines_of(&self.selections)
+    }
+
+    /// ⌘D: a selection duplicates right after itself (the copy selected); a
+    /// bare caret duplicates its line below (the caret lands on the copy at
+    /// the same column).
+    fn duplicate(&mut self, cx: &mut gpui::Context<Self>) {
+        let (changes, placed) = self.buf.duplicate_edits(&self.selections);
+        self.apply_edits_cursored(changes, Cause::Structure, Some(placed), cx);
+    }
+
+    /// ⌘/: toggles the language's line comment on every touched line.
+    fn comment_line(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(token) = self.line_comment.clone() else { return };
+        let changes = self.buf.comment_line_edits(&self.selections, &token);
+        self.apply_edits(changes, Cause::Structure, cx);
+    }
+
+    /// ⌘⌥/: wraps the selection in the language's block comment; a wrapped
+    /// selection unwraps. Caret-only selections do nothing (there is nothing
+    /// to wrap).
+    fn comment_block(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some((open, close)) = self.block_comment.clone() else { return };
+        let changes = self.buf.comment_block_edits(&self.selections, &open, &close);
+        self.apply_edits(changes, Cause::Structure, cx);
+    }
+
+    /// ⌥↑: the selection grows — the smallest syntax node that strictly
+    /// contains it (the tree-sitter parse), falling back to the word, then
+    /// the line. Each growth remembers the previous shape for ⌥↓.
+    fn extend_selection(&mut self, cx: &mut gpui::Context<Self>) {
+        let mut grown = Vec::new();
+        for selection in &self.selections {
+            let (start, end) = selection.normalized();
+            let (next_start, next_end) = self.expand_range(start, end);
+            grown.push(Selection::caret(next_start).with_head(next_end));
+        }
+        let next = normalize_selections(grown);
+        if next == self.selections {
+            return;
+        }
+        self.shrink_stack.push(self.selections.clone());
+        self.selections = next;
+        self.clamp_scroll_to_primary();
+        cx.notify();
+    }
+
+    /// ⌥↓: pops the last extend (the shrink stack), like IDEA's shrink
+    /// selection.
+    fn shrink_selection(&mut self, cx: &mut gpui::Context<Self>) {
+        if let Some(previous) = self.shrink_stack.pop() {
+            self.selections =
+                normalize_selections(previous.into_iter().map(|s| clamp_selection(s, self.buf.utf16_len())).collect());
+            self.clamp_scroll_to_primary();
+            cx.notify();
+        }
+    }
+
+    /// The next selection shape for one range: the smallest syntax node that
+    /// strictly contains it, else the word at the caret, else the line.
+    fn expand_range(&self, start: usize, end: usize) -> (usize, usize) {
+        if let Some((next_start, next_end)) = self.syntax_range_around(start, end)
+            && (next_start, next_end) != (start, end)
+        {
+            return (next_start, next_end);
+        }
+        if end > start {
+            // The word/line fallback: the lines the selection touches.
+            let first = self.buf.line_of(start);
+            let last = self.buf.line_of(end.saturating_sub(1));
+            return (self.buf.line_start(first), self.buf.line_span(last).end);
+        }
+        let word_start = self.buf.word_start(start);
+        let word_end = self.buf.word_end(start);
+        if word_end > word_start {
+            return (word_start, word_end);
+        }
+        let span = self.buf.line_span(self.buf.line_of(start));
+        (span.start, span.end)
+    }
+
+    /// The smallest tree-sitter node range strictly containing the UTF-16
+    /// range (a node equal to the input does not count — growth must move).
+    fn syntax_range_around(&self, start: usize, end: usize) -> Option<(usize, usize)> {
+        let tree = self.tree.as_ref()?;
+        let rope = self.buf.doc.rope();
+        let to_byte = |utf16: usize| -> usize {
+            let utf16 = utf16.min(rope.len_utf16_cu());
+            rope.byte_to_char(rope.utf16_cu_to_char(utf16))
+        };
+        let to_utf16 = |byte: usize| -> usize {
+            let byte = byte.min(rope.len_bytes());
+            rope.char_to_utf16_cu(rope.byte_to_char(byte))
+        };
+        // A bare caret cannot strictly contain; widen to cover one char so a
+        // node can claim the position.
+        let (start_b, end_b) = if end > start {
+            (to_byte(start), to_byte(end))
+        } else {
+            let at = to_byte(start);
+            (at, (at + 1).min(rope.len_bytes()))
+        };
+        let mut node = tree.root_node();
+        loop {
+            let mut deeper = None;
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                let range = child.byte_range();
+                if range.start <= start_b && end_b <= range.end && !(range.start == start_b && range.end == end_b) {
+                    deeper = Some(child);
+                    break;
+                }
+            }
+            match deeper {
+                Some(child) => node = child,
+                None => break,
+            }
+        }
+        let range = node.byte_range();
+        // Empty ranges are not selections.
+        if range.end <= range.start {
+            return None;
+        }
+        Some((to_utf16(range.start), to_utf16(range.end)))
+    }
+
+    /// ⌥⇧↑ / ⌥⇧↓: every touched-line block swaps with the adjacent line
+    /// (blocks keep their inner order; the caret rides its line). ⌘⇧↑ /
+    /// ⌘⇧↓ ride the same move at the line level (the statement-level move
+    /// stays on the deferred list — it needs the parse).
+    fn move_lines(&mut self, delta: i8, cx: &mut gpui::Context<Self>) {
+        if delta == 0 {
+            return;
+        }
+        let blocks = Buffer::contiguous_blocks(self.touched_lines());
+        // Per block: the pre-batch change pair, the moved region (for the
+        // collision check across blocks), and the caret shift for selections
+        // inside the block.
+        let mut changes: Vec<TextChange> = Vec::new();
+        let mut regions: Vec<(u32, u32)> = Vec::new();
+        let mut shifts: Vec<((u32, u32), i64)> = Vec::new();
+        for block in blocks {
+            let Some((batch, shift)) = self.buf.move_block_edits(block, delta) else { continue };
+            // The moved region: the block's swap covers both change ranges.
+            let moved = (
+                batch.iter().map(|c| c.from).min().unwrap_or(0),
+                batch.iter().map(|c| c.to.max(c.from)).max().unwrap_or(0),
+            );
+            // A block whose moved region intersects an earlier block's is
+            // skipped (they would fight over the same newline).
+            if regions.iter().any(|(from, to)| moved.0 < *to && *from < moved.1) {
+                continue;
+            }
+            regions.push(moved);
+            shifts.push((block, shift));
+            changes.extend(batch);
+        }
+        // Carets inside a moved block ride it (the block moves as one run, so
+        // columns are preserved); carets outside stay put.
+        let mut placed = Vec::new();
+        for selection in &self.selections {
+            let line = self.buf.line_of(selection.head);
+            let shift =
+                shifts.iter().find(|(lines, _)| line >= lines.0 && line <= lines.1).map(|(_, s)| *s).unwrap_or(0);
+            if shift == 0 {
+                placed.push(selection.clone());
+            } else {
+                placed.push(Selection {
+                    anchor: (selection.anchor as i64 + shift).max(0) as usize,
+                    head: (selection.head as i64 + shift).max(0) as usize,
+                    reversed: selection.reversed,
+                    goal_col: selection.goal_col,
+                });
+            }
+        }
+        self.apply_edits_cursored(changes, Cause::Structure, Some(placed), cx);
+    }
+
+    /// ⌘⌫: deletes every touched line; the caret lands where the block
+    /// started.
+    fn delete_line(&mut self, cx: &mut gpui::Context<Self>) {
+        let blocks = Buffer::contiguous_blocks(self.touched_lines());
+        if blocks.is_empty() {
+            return;
+        }
+        let (changes, placed) = self.buf.delete_line_edits(&blocks);
+        self.apply_edits_cursored(changes, Cause::Structure, Some(placed), cx);
+    }
+
+    /// ⇧Enter / ⌘⌥Enter: a new line below or above the caret's line, carrying
+    /// the line's own indentation; the caret rides into the new line.
+    fn start_new_line(&mut self, delta: i8, cx: &mut gpui::Context<Self>) {
+        let mut changes = Vec::new();
+        let mut placed = Vec::new();
+        for selection in &self.selections {
+            let span = self.buf.line_span(self.buf.line_of(selection.head));
+            let text = self.buf.slice_utf16(span.clone());
+            let indent = &text[..text.len() - text.trim_start().len()];
+            if delta > 0 {
+                changes.push(TextChange { from: span.end as u32, to: span.end as u32, insert: format!("\n{indent}") });
+                placed.push(Selection::caret(span.end + 1 + indent.chars().map(char::len_utf16).sum::<usize>()));
+            } else {
+                changes.push(TextChange {
+                    from: span.start as u32,
+                    to: span.start as u32,
+                    insert: format!("{indent}\n"),
+                });
+                placed.push(Selection::caret(span.start + indent.chars().map(char::len_utf16).sum::<usize>() + 1));
+            }
+        }
+        self.apply_edits_cursored(changes, Cause::Structure, Some(placed), cx);
+    }
+
+    /// ⌃⇧J: joins the touched lines (a caret-only selection joins with the
+    /// line below); the caret lands at the first joint.
+    fn join_lines(&mut self, cx: &mut gpui::Context<Self>) {
+        let blocks = Buffer::contiguous_blocks(self.touched_lines());
+        let (changes, placed) = self.buf.join_edits(&blocks);
+        self.apply_edits_cursored(changes, Cause::Structure, Some(placed), cx);
+    }
+
+    /// ⌘⇧U: lower-case text upper-cases, upper-case or mixed lower-cases.
+    fn toggle_case(&mut self, cx: &mut gpui::Context<Self>) {
+        let changes = self.buf.toggle_case_edits(&self.selections);
+        self.apply_edits(changes, Cause::Structure, cx);
+    }
+
+    /// ⌃L: the caret line centers in the view.
+    fn scroll_center(&mut self, cx: &mut gpui::Context<Self>) {
+        let caret = self.selections.first().map_or(0, |s| s.head);
+        let caret_line = self.display_of_line(self.buf.line_of(caret)) as f32;
+        let visible =
+            self.geometry.get().map_or(20.0, |g| (g.height - px(theme::TEXT_INSET) * 2.0) / g.line_height).max(1.0);
+        self.scroll.set(caret_line - visible / 2.0);
+        self.clamp_scroll();
+        cx.notify();
+    }
+
+    /// ⌘-: folds the candidate at the caret line (an unfold when it already
+    /// hides one).
+    fn fold_at_caret(&mut self, cx: &mut gpui::Context<Self>) {
+        let caret = self.selections.first().map_or(0, |s| s.head);
+        let line = self.buf.line_of(caret);
+        if let Some(at) = self.folds.iter().position(|f| line >= f.start_line && line <= f.end_line) {
+            self.folds.remove(at);
+        } else {
+            self.toggle_fold(line, cx);
+            return;
+        }
+        self.clamp_scroll();
+        cx.notify();
+    }
+
+    /// ⌘=: unfolds the range the caret sits in (nothing when none does).
+    fn unfold_at_caret(&mut self, cx: &mut gpui::Context<Self>) {
+        let caret = self.selections.first().map_or(0, |s| s.head);
+        let line = self.buf.line_of(caret);
+        let before = self.folds.len();
+        self.folds.retain(|f| !(line >= f.start_line && line <= f.end_line));
+        if self.folds.len() != before {
+            self.clamp_scroll();
+            cx.notify();
+        }
+    }
+
+    /// ⌘⇧-: folds every top-level candidate (nested ones hide with their
+    /// parents).
+    fn fold_all(&mut self, cx: &mut gpui::Context<Self>) {
+        for (start, end) in self.fold_candidates.clone() {
+            let top_level = self.fold_candidates.iter().all(|&(s, e)| (s == start && e == end) || s > start || e < end);
+            if top_level && self.folds.iter().all(|f| f.start_line != start) {
+                self.folds.push(Fold { start_line: start, end_line: end });
+            }
+        }
+        self.folds.sort_by_key(|f| f.start_line);
+        self.clamp_scroll();
+        cx.notify();
+    }
+
+    /// ⌘G / ⌘⇧G with nothing to walk: find the word at the caret first (the
+    /// matches paint; the bar stays closed, like a Find-in-Files arrival).
+    /// False when there is no word to find.
+    fn open_find_word(&mut self, cx: &mut gpui::Context<Self>) -> bool {
+        let caret = self.selections.first().map_or(0, |s| s.head);
+        let (start, end) = (self.buf.word_start(caret), self.buf.word_end(caret));
+        if end <= start {
+            return false;
+        }
+        self.show_find_hits(self.buf.slice_utf16(start..end), cx);
+        true
+    }
+
+    /// ⌥⌥↑ / ⌥⌥↓ (the chord): a new caret on the display line above/below the
+    /// primary caret, same column.
+    fn clone_caret(&mut self, delta: i8, cx: &mut gpui::Context<Self>) {
+        let Some(primary) = self.selections.first().cloned() else { return };
+        let caret_line = self.buf.line_of(primary.head);
+        let target_display = self.display_of_line(caret_line) as i64 + delta as i64;
+        if target_display < 0 || target_display >= self.display_count() as i64 {
+            return;
+        }
+        let (target_line, fold) = self.resolve_display(target_display as u32);
+        // A folded placeholder row takes the caret to its fold's start line.
+        let target_line = fold.map_or(target_line, |f| f.start_line);
+        let col = primary.head - self.buf.line_span(caret_line).start;
+        let span = self.buf.line_span(target_line);
+        let at = (span.start + col).min(span.end);
+        let mut selections = self.selections.clone();
+        selections.push(Selection::caret(at));
+        selections.sort_by_key(|s| s.head);
+        self.selections = normalize_selections(selections);
+        cx.notify();
+    }
+
+    /// ⌘R: the find bar with its replace row up.
+    fn open_replace(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        if let Some(bar) = &mut self.find_bar {
+            bar.replace_visible = true;
+            cx.notify();
+            return;
+        }
+        self.open_find(window, cx);
+        if let Some(bar) = &mut self.find_bar {
+            bar.replace_visible = true;
+        }
+        cx.notify();
+    }
+
+    /// ⌃Space: the completion request right away (the typed-word filter the
+    /// debounced path applies does not gate the explicit one).
+    fn force_completion(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.completion.is_some() {
+            self.close_completion(cx);
+            return;
+        }
+        self.request_completion(None, cx);
     }
 
     // -- keys ---------------------------------------------------------------
@@ -3741,6 +4500,25 @@ impl EditorPane {
 /// replacement of its inserted text with the original. `strip_inserts` (an
 /// IME commit) deletes instead of restoring, so undo removes the whole
 /// composition.
+/// Maps a pre-batch UTF-16 offset through an ascending change batch into
+/// post-batch coordinates: offsets inside a replaced range land after the
+/// inserted text, later offsets shift by the batch.
+fn shift_offset(offset: usize, changes: &[TextChange]) -> usize {
+    let mut shift: i64 = 0;
+    for change in changes {
+        let (from, to) = (change.from as usize, change.to as usize);
+        let inserted: usize = change.insert.chars().map(char::len_utf16).sum();
+        if offset < from {
+            break;
+        }
+        if offset < to {
+            return (from as i64 + shift + inserted as i64).max(0) as usize;
+        }
+        shift += inserted as i64 - (to - from) as i64;
+    }
+    (offset as i64 + shift).max(0) as usize
+}
+
 fn inverse_changes(changes: &[TextChange], originals: &[String], strip_inserts: bool) -> Vec<TextChange> {
     let mut inverse = Vec::with_capacity(changes.len());
     let mut delta: i64 = 0;
@@ -4090,6 +4868,77 @@ impl Render for EditorPane {
             }))
             .on_action(cx.listener(|this, _: &acts::SelectDocEnd, window, cx| {
                 this.command(Command::Move(Motion::DocEnd, true), window, cx)
+            }))
+            // M9 edit habits (the IDEA 编辑段).
+            .on_action(
+                cx.listener(|this, _: &acts::DuplicateLine, window, cx| this.command(Command::Duplicate, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &acts::CommentLine, window, cx| this.command(Command::CommentLine, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &acts::CommentBlock, window, cx| this.command(Command::CommentBlock, window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &acts::ExtendSelection, window, cx| {
+                this.command(Command::ExtendSelection, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::ShrinkSelection, window, cx| {
+                this.command(Command::ShrinkSelection, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &acts::MoveLineUp, window, cx| this.command(Command::MoveLines(-1), window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &acts::MoveLineDown, window, cx| this.command(Command::MoveLines(1), window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &acts::MoveStatementUp, window, cx| {
+                this.command(Command::MoveStatements(-1), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::MoveStatementDown, window, cx| {
+                this.command(Command::MoveStatements(1), window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &acts::DeleteLine, window, cx| this.command(Command::DeleteLine, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &acts::FindNext, window, cx| this.command(Command::FindStep(1), window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &acts::FindPrevious, window, cx| this.command(Command::FindStep(-1), window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &acts::Replace, window, cx| this.command(Command::Replace, window, cx)))
+            .on_action(
+                cx.listener(|this, _: &acts::ScrollCenter, window, cx| this.command(Command::ScrollCenter, window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &acts::Fold, window, cx| this.command(Command::Fold, window, cx)))
+            .on_action(cx.listener(|this, _: &acts::Unfold, window, cx| this.command(Command::Unfold, window, cx)))
+            .on_action(cx.listener(|this, _: &acts::FoldAll, window, cx| this.command(Command::FoldAll, window, cx)))
+            .on_action(
+                cx.listener(|this, _: &acts::UnfoldAll, window, cx| this.command(Command::UnfoldAll, window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &acts::StartNewLineBelow, window, cx| {
+                this.command(Command::StartNewLineBelow, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::StartNewLineAbove, window, cx| {
+                this.command(Command::StartNewLineAbove, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &acts::JoinLines, window, cx| this.command(Command::JoinLines, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &acts::ToggleCase, window, cx| this.command(Command::ToggleCase, window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &acts::Complete, window, cx| this.command(Command::Complete, window, cx)))
+            .on_action(
+                cx.listener(|this, _: &acts::ParameterInfo, window, cx| {
+                    this.command(Command::ParameterInfo, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &acts::CloneCaretAbove, window, cx| {
+                this.command(Command::CloneCaret(-1), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &acts::CloneCaretBelow, window, cx| {
+                this.command(Command::CloneCaret(1), window, cx)
             }))
             // Hover tooltip: a plain-text bubble under the hovered diagnostic.
             .children(self.render_hover_tooltip(cx))
@@ -5898,5 +6747,175 @@ mod tests {
         // Without folds everything is identity.
         assert_eq!(display_count(&[], 7), 7);
         assert_eq!(resolve_display(&[], 7, 6), (6, None));
+    }
+
+    // -- M9 edit habit transforms --------------------------------------------
+
+    fn buffer(text: &str) -> Buffer {
+        Buffer::new(text)
+    }
+
+    fn selection_at(offset: usize) -> Selection {
+        Selection::caret(offset)
+    }
+
+    fn selection_range(start: usize, end: usize) -> Selection {
+        Selection::caret(start).with_head(end)
+    }
+
+    /// Applies a pre-batch change set to a test buffer (the pane's apply
+    /// pipeline minus the backend, undo and syntax feeding).
+    fn apply(buf: &mut Buffer, changes: Vec<TextChange>) {
+        let version = buf.doc.version();
+        let set = ChangeSet { changes };
+        buf.doc.apply_detailed(version, &set).expect("test batch applies");
+    }
+
+    fn text(buf: &Buffer) -> String {
+        buf.slice_utf16(0..buf.utf16_len())
+    }
+
+    #[test]
+    fn duplicate_edits_copy_line_below_with_the_caret_on_the_copy() {
+        let mut buf = buffer("alpha\nbeta\n");
+        let (changes, placed) = buf.duplicate_edits(&[selection_at(2)]);
+        assert_eq!(changes, vec![tc(5, 5, "\nalpha")]);
+        // The copy's start plus the caret's own column (2).
+        assert_eq!(placed, vec![selection_at(8)]);
+        apply(&mut buf, changes);
+        assert_eq!(text(&buf), "alpha\nalpha\nbeta\n");
+        // A selection duplicates right after itself, the copy selected.
+        let mut buf = buffer("ab cd\n");
+        let (changes, placed) = buf.duplicate_edits(&[selection_range(3, 5)]);
+        assert_eq!(changes, vec![tc(5, 5, "cd")]);
+        assert_eq!(placed, vec![selection_range(5, 7)]);
+        apply(&mut buf, changes);
+        assert_eq!(text(&buf), "ab cdcd\n");
+    }
+
+    #[test]
+    fn comment_line_toggles_over_the_whole_set() {
+        // Not every line commented: every non-blank line gains the token
+        // after its indent (blank lines never move).
+        let mut buf = buffer("a\n  b\n\nc");
+        let changes = buf.comment_line_edits(&[selection_range(0, buf.utf16_len())], "//");
+        assert_eq!(changes, vec![tc(0, 0, "// "), tc(4, 4, "// "), tc(7, 7, "// ")]);
+        apply(&mut buf, changes);
+        assert_eq!(text(&buf), "// a\n  // b\n\n// c");
+        // Every commented line: the tokens (and the space) come back off.
+        let all = buf.utf16_len();
+        let changes = buf.comment_line_edits(&[selection_range(0, all)], "//");
+        apply(&mut buf, changes);
+        assert_eq!(text(&buf), "a\n  b\n\nc");
+    }
+
+    #[test]
+    fn comment_block_wraps_then_unwraps() {
+        let mut buf = buffer("x = 1;");
+        let changes = buf.comment_block_edits(&[selection_range(0, 6)], "/*", "*/");
+        assert_eq!(changes, vec![tc(0, 0, "/* "), tc(6, 6, " */")]);
+        apply(&mut buf, changes);
+        assert_eq!(text(&buf), "/* x = 1; */");
+        let all = buf.utf16_len();
+        let changes = buf.comment_block_edits(&[selection_range(0, all)], "/*", "*/");
+        apply(&mut buf, changes);
+        assert_eq!(text(&buf), "/*x = 1;*/");
+    }
+
+    #[test]
+    fn move_block_swaps_with_the_neighbor_line() {
+        // Up.
+        let mut buf = buffer("l1\nl2\nl3\n");
+        let Some((changes, shift)) = buf.move_block_edits((1, 1), -1) else { panic!("moves inside the document") };
+        assert_eq!(shift, -3);
+        apply(&mut buf, changes);
+        assert_eq!(text(&buf), "l2\nl1\nl3\n");
+        // Down.
+        let mut buf = buffer("l1\nl2\nl3\n");
+        let Some((changes, shift)) = buf.move_block_edits((0, 0), 1) else { panic!("moves inside the document") };
+        assert_eq!(shift, 3);
+        apply(&mut buf, changes);
+        assert_eq!(text(&buf), "l2\nl1\nl3\n");
+        // A multi-line block moves as one run.
+        let mut buf = buffer("l1\nl2\nl3\nl4\n");
+        let Some((changes, _)) = buf.move_block_edits((1, 2), -1) else { panic!("moves inside the document") };
+        apply(&mut buf, changes);
+        assert_eq!(text(&buf), "l2\nl3\nl1\nl4\n");
+    }
+
+    #[test]
+    fn move_block_refuses_the_document_edges_and_keeps_the_last_newline() {
+        let buf = buffer("l1\nl2\nl3\n");
+        assert!(buf.move_block_edits((0, 0), -1).is_none(), "nothing above line 0");
+        assert!(buf.move_block_edits((2, 2), 1).is_none(), "nothing below the last line");
+        assert!(buf.move_block_edits((1, 1), 0).is_none(), "no move, no batch");
+        // The last line carries no newline: moving up writes the separator.
+        let mut buf = buffer("l1\nl2");
+        let Some((changes, _)) = buf.move_block_edits((1, 1), -1) else { panic!("line above exists") };
+        apply(&mut buf, changes);
+        assert_eq!(text(&buf), "l2\nl1");
+    }
+
+    #[test]
+    fn delete_line_removes_the_block_and_parks_the_caret_at_its_start() {
+        let mut buf = buffer("a\nb\nc\n");
+        let blocks = Buffer::contiguous_blocks(vec![1]);
+        let (changes, placed) = buf.delete_line_edits(&blocks);
+        assert_eq!(changes, vec![tc(2, 4, "")]);
+        assert_eq!(placed, vec![selection_at(2)]);
+        apply(&mut buf, changes);
+        assert_eq!(text(&buf), "a\nc\n");
+        // Two far-apart lines in one batch: the second caret shifts back.
+        let mut buf = buffer("a\nb\nc\nd\n");
+        let blocks = Buffer::contiguous_blocks(vec![0, 2]);
+        let (changes, placed) = buf.delete_line_edits(&blocks);
+        apply(&mut buf, changes);
+        assert_eq!(text(&buf), "b\nd\n");
+        assert_eq!(placed, vec![selection_at(0), selection_at(2)]);
+    }
+
+    #[test]
+    fn join_edits_replaces_the_newline_and_indent_with_one_space() {
+        let mut buf = buffer("fn a() {\n    x\n}");
+        let blocks = Buffer::contiguous_blocks(vec![0]);
+        let (changes, placed) = buf.join_edits(&blocks);
+        assert_eq!(changes, vec![tc(8, 13, " ")]);
+        assert_eq!(placed, vec![selection_at(9)]);
+        apply(&mut buf, changes);
+        assert_eq!(text(&buf), "fn a() { x\n}");
+    }
+
+    #[test]
+    fn toggle_case_edits_upper_lower_and_word_at_caret() {
+        let mut buf = buffer("abc DEF");
+        let changes = buf.toggle_case_edits(&[selection_range(0, 3), selection_range(4, 7)]);
+        assert_eq!(changes, vec![tc(0, 3, "ABC"), tc(4, 7, "def")]);
+        apply(&mut buf, changes);
+        assert_eq!(text(&buf), "ABC def");
+        // A bare caret takes the word at it.
+        let buf = buffer("hello world");
+        let changes = buf.toggle_case_edits(&[selection_at(7)]);
+        assert_eq!(changes, vec![tc(6, 11, "WORLD")]);
+    }
+
+    #[test]
+    fn shift_offset_maps_through_a_batch() {
+        let changes = vec![tc(2, 5, "xyz"), tc(8, 8, "ab")];
+        // Before the first change: unmoved.
+        assert_eq!(shift_offset(0, &changes), 0);
+        // Inside the replaced range: after the insert.
+        assert_eq!(shift_offset(3, &changes), 5);
+        // After the replacement: shifted by 0 (3 inserted, 3 removed) then +2.
+        assert_eq!(shift_offset(6, &changes), 6);
+        assert_eq!(shift_offset(9, &changes), 11);
+        // The clamps hold.
+        assert_eq!(shift_offset(5, &changes), 5);
+    }
+
+    #[test]
+    fn contiguous_blocks_merge_runs() {
+        assert_eq!(Buffer::contiguous_blocks(vec![3, 4, 5, 9, 12]), vec![(3, 5), (9, 9), (12, 12)]);
+        assert_eq!(Buffer::contiguous_blocks(vec![1]), vec![(1, 1)]);
+        assert!(Buffer::contiguous_blocks(Vec::new()).is_empty());
     }
 }

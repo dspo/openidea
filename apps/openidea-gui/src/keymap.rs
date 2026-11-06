@@ -117,8 +117,37 @@ pub static BINDINGS: &[Binding] = &[
     binding!("shift-alt-right", "editor::SelectWordRight", Some("Editor"), None),
     binding!("shift-cmd-left", "editor::SelectLineHome", Some("Editor"), None),
     binding!("shift-cmd-right", "editor::SelectLineEnd", Some("Editor"), None),
-    binding!("shift-cmd-up", "editor::SelectDocStart", Some("Editor"), None),
-    binding!("shift-cmd-down", "editor::SelectDocEnd", Some("Editor"), None),
+    // (The doc-edge selects lost ⇧⌘↑/⌘↓ to IDEA's move-statement habit; the
+    // actions stay for the ⌘↑/⌘↓+⇧ chording and future rebinds.)
+    // -- M9 edit habits (the IDEA 编辑段) -------------------------------------
+    binding!("cmd-d", "editor::DuplicateLine", Some("Editor"), Some("code.duplicateLine")),
+    binding!("cmd-backspace", "editor::DeleteLine", Some("Editor"), Some("code.deleteLine")),
+    binding!("cmd-/", "editor::CommentLine", Some("Editor"), Some("code.commentLine")),
+    binding!("alt-cmd-/", "editor::CommentBlock", Some("Editor"), Some("code.commentBlock")),
+    // The preset's alternate form, Ctrl+Shift+/: the platform reports the
+    // shifted character (the rule the converter and the test pin).
+    binding!("ctrl-?", "editor::CommentBlock", Some("Editor"), Some("code.commentBlock")),
+    binding!("alt-up", "editor::ExtendSelection", Some("Editor"), Some("code.extendSelection")),
+    binding!("alt-down", "editor::ShrinkSelection", Some("Editor"), Some("code.shrinkSelection")),
+    binding!("alt-shift-up", "editor::MoveLineUp", Some("Editor"), Some("code.moveLineUp")),
+    binding!("alt-shift-down", "editor::MoveLineDown", Some("Editor"), Some("code.moveLineDown")),
+    binding!("shift-cmd-up", "editor::MoveStatementUp", Some("Editor"), Some("code.moveStatementUp")),
+    binding!("shift-cmd-down", "editor::MoveStatementDown", Some("Editor"), Some("code.moveStatementDown")),
+    binding!("ctrl-shift-j", "editor::JoinLines", Some("Editor"), Some("code.joinLines")),
+    binding!("shift-cmd-u", "editor::ToggleCase", Some("Editor"), Some("code.toggleCase")),
+    binding!("shift-enter", "editor::StartNewLineBelow", Some("Editor"), Some("code.startNewLine")),
+    binding!("alt-cmd-enter", "editor::StartNewLineAbove", Some("Editor"), Some("code.startNewLineBefore")),
+    binding!("ctrl-space", "editor::Complete", Some("Editor"), Some("code.completion")),
+    binding!("cmd-p", "editor::ParameterInfo", Some("Editor"), Some("code.parameterInfo")),
+    binding!("cmd-", "editor::Fold", Some("Editor"), Some("code.fold")),
+    binding!("cmd-=", "editor::Unfold", Some("Editor"), Some("code.unfold")),
+    binding!("cmd-_", "editor::FoldAll", Some("Editor"), Some("code.foldAll")),
+    binding!("cmd-+", "editor::UnfoldAll", Some("Editor"), Some("code.unfoldAll")),
+    binding!("ctrl-l", "editor::ScrollCenter", Some("Editor"), Some("editor.scrollToCenter")),
+    binding!("cmd-r", "editor::Replace", Some("Editor"), Some("find.replaceInFile")),
+    binding!("cmd-g", "editor::FindNext", Some("Editor"), Some("find.next")),
+    binding!("shift-cmd-g", "editor::FindPrevious", Some("Editor"), Some("find.previous")),
+    // ⌥⌥↑ / ⌥⌥↓ ride the Chord gestures (see GESTURES), not keystroke rows.
     // -- palette list navigation ---------------------------------------------
     binding!("up", "palette::SelectPrev", Some("Palette"), None),
     binding!("down", "palette::SelectNext", Some("Palette"), None),

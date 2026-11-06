@@ -1016,9 +1016,23 @@ impl Workbench {
         self.chord.reset();
         match idea_id {
             "navigate.searchEverywhere" => self.open_picker(PickerMode::Everywhere, window, cx),
+            // The clone-caret rows act on the focused editor through the
+            // action system (their follow-up keystroke is deliberately not a
+            // keymap row: bare ⌥ never becomes a keystroke).
+            "editor.cloneCaretAbove" => self.dispatch_by_name("editor::CloneCaretAbove", window, cx),
+            "editor.cloneCaretBelow" => self.dispatch_by_name("editor::CloneCaretBelow", window, cx),
             // Phase 4 owns the not-yet-available face; for now the row is only
             // tracked (the chord must not wedge the tracker's state).
             _ => eprintln!("[keymap] gesture {idea_id} has no face yet"),
+        }
+    }
+
+    /// Builds and dispatches an action by its registered name (the chord
+    /// gestures' bridge to the focused surface).
+    fn dispatch_by_name(&mut self, name: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        match cx.build_action(name, None) {
+            Ok(action) => window.dispatch_action(action, cx),
+            Err(e) => self.toast(NotifyLevel::Error, format!("{name} cannot run: {e}")),
         }
     }
 
