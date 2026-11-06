@@ -98,8 +98,24 @@ fn install_panic_hook() {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
         );
         let entry = settings::crash_entry(&utc, &thread, &payload, &location);
+        // The first frames ride the entry (M9's IME crash stayed a mystery
+        // because the log carried payload + location only): force_capture
+        // works without RUST_BACKTRACE, and the cost is panic-path only.
+        let backtrace_text = std::backtrace::Backtrace::force_capture().to_string();
+        let frames: Vec<&str> =
+            backtrace_text.lines().skip_while(|line| !line.contains("openidea_gui")).take(14).collect();
+        let mut blob = entry.clone();
+        if frames.is_empty() {
+            blob.push_str("  (no openidea_gui frames — run with RUST_BACKTRACE=1 for the full trace)\n");
+        } else {
+            for frame in frames {
+                blob.push_str("  ");
+                blob.push_str(frame.trim_start());
+                blob.push('\n');
+            }
+        }
         eprintln!("[crash] {entry}crash log: <data dir>/openidea-gui/crash.log");
-        settings::append_crash_log(&entry);
+        settings::append_crash_log(&blob);
         settings::mark_unclean_exit(Some(&payload));
         default_hook(info);
     }));
