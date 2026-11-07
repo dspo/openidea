@@ -341,6 +341,12 @@ pub struct Workbench {
     /// producer's list; the merged view reaches the pane). Sorted by position
     /// for the pane's line lookups.
     diagnostics: HashMap<PathBuf, HashMap<String, Vec<Diagnostic>>>,
+    /// The Problems window's severity filter (M12): 0 all, 1 errors,
+    /// 2 warnings (the header's chips; session-local like IDEA's).
+    problems_filter: Cell<u8>,
+    /// The F2/⇧F2 walker's current target (and a row click's): the window
+    /// highlights it, the two sections follow the active file.
+    problems_cursor: std::cell::RefCell<Option<(PathBuf, u32, u32)>>,
     bus: Bus,
     /// The root's own focus handle: the fallback sink when nothing else is
     /// mounted to take the focus (e.g. after ⌘1 hides a focused tree — a
@@ -512,6 +518,8 @@ impl Workbench {
             toast_seen: HashMap::new(),
             servers: Vec::new(),
             diagnostics: HashMap::new(),
+            problems_filter: Cell::new(0),
+            problems_cursor: std::cell::RefCell::new(None),
             bus,
             root_focus: cx.focus_handle(),
             picker: None,
@@ -1397,6 +1405,15 @@ impl Workbench {
             .values()
             .flat_map(|by_source| by_source.values().flatten())
             .filter(|d| d.severity == Severity::Error)
+            .count()
+    }
+
+    /// The warning count across files (the Problems header's totals).
+    fn warning_count(&self) -> usize {
+        self.diagnostics
+            .values()
+            .flat_map(|by_source| by_source.values().flatten())
+            .filter(|d| d.severity == Severity::Warning)
             .count()
     }
 
@@ -2613,6 +2630,8 @@ impl Workbench {
         if let Some((path, pos, message)) = errors.get(next) {
             eprintln!("[nav] error {next}/{}: {}", errors.len(), message);
             self.jump_with_nav(navigation::Location::new(path.clone(), pos.line, pos.col), cx);
+            // The Problems window follows the walker (M12's linkage face).
+            self.problems_cursor.replace(Some((path.clone(), pos.line, pos.col)));
         }
     }
 
@@ -5157,22 +5176,112 @@ impl Workbench {
     /// The Problems window's body: every diagnostic across files, sorted by
     /// path then position; a click opens the file at the row.
     fn render_problems_body(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let rows = self.all_diagnostics();
-        if rows.is_empty() {
+        let filter = self.problems_filter.get();
+        let matches = |severity: Severity| match filter {
+            1 => severity == Severity::Error,
+            2 => severity == Severity::Warning,
+            _ => true,
+        };
+        let all = self.all_diagnostics();
+        if all.is_empty() {
             return self.render_window_placeholder(strings::TW_NO_PROBLEMS);
         }
-        let rows: Vec<_> = rows
-            .into_iter()
-            .map(|(path, d)| {
-                let (icon, color) = match d.severity {
-                    Severity::Error => (IconName::CircleAlert, theme::error()),
-                    Severity::Warning => (IconName::TriangleAlert, theme::warning()),
-                    _ => (IconName::Info, theme::fg_muted()),
-                };
-                let line = d.range.start.line;
-                let col = d.range.start.col;
-                let label = format!("{}:{}", line + 1, col + 1);
-                let jump_path = path.clone();
+        let active = self.active_tab().map(|tab| tab.path.clone());
+        // The two-level aggregate (M12): the active file's rows first, the
+        // project's under them; each section headers with its count.
+        let (current, rest): (Vec<_>, Vec<_>) =
+            all.into_iter().filter(|(_, d)| matches(d.severity)).partition(|(path, _)| active.as_ref() == Some(path));
+        let mut body = div().id("problems-body").flex_1().min_h_0().flex().flex_col();
+        // The severity filter chips (IDEA's Problems filter face).
+        let chip = |this: &mut Self, id: &'static str, label: &'static str, value: u8| {
+            let selected = this.problems_filter.get() == value;
+            div()
+                .id(SharedString::from(id))
+                .px_2()
+                .h_5()
+                .rounded(px(4.0))
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .when(selected, |c| c.bg(theme::selected_bg()))
+                .when(!selected, |c| c.hover(|h| h.bg(theme::raised_bg())))
+                .text_color(if selected { theme::fg() } else { theme::fg_muted() })
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.problems_filter.set(value);
+                    cx.notify();
+                }))
+                .child(SharedString::from(label))
+        };
+        body = body
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .h_7()
+                    .border_b_1()
+                    .border_color(theme::border())
+                    .text_size(px(11.))
+                    .child(chip(self, "problems-all", "All", 0))
+                    .child(chip(self, "problems-errors", "Errors", 1))
+                    .child(chip(self, "problems-warnings", "Warnings", 2))
+                    .child(div().flex_1())
+                    .child(div().text_color(theme::fg_muted()).child(SharedString::from(format!(
+                        "{} errors · {} warnings",
+                        self.error_count(),
+                        self.warning_count()
+                    )))),
+            )
+            .child(
+                div()
+                    .id("window-scroll-problems")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(self.render_problems_section("current file", current, cx))
+                    .children(self.render_problems_section("project", rest, cx)),
+            );
+        body.into_any_element()
+    }
+
+    /// One aggregate section: the file-group header (name + count) and its
+    /// rows (a click jumps; the F2 walker's target highlights).
+    fn render_problems_section(
+        &mut self,
+        label: &str,
+        rows: Vec<(PathBuf, Diagnostic)>,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        let cursor = self.problems_cursor.borrow().clone();
+        let mut out = vec![
+            div()
+                .h(px(20.0))
+                .px_2()
+                .mt_1()
+                .flex()
+                .items_center()
+                .text_size(px(10.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme::fg_muted())
+                .child(SharedString::from(format!("{label} · {}", rows.len())))
+                .into_any_element(),
+        ];
+        for (path, d) in rows {
+            let (icon, color) = match d.severity {
+                Severity::Error => (IconName::CircleAlert, theme::error()),
+                Severity::Warning => (IconName::TriangleAlert, theme::warning()),
+                _ => (IconName::Info, theme::fg_muted()),
+            };
+            let line = d.range.start.line;
+            let col = d.range.start.col;
+            let label = format!("{}:{}", line + 1, col + 1);
+            let jump_path = path.clone();
+            let on_cursor = cursor.as_ref() == Some(&(path.clone(), line, col));
+            out.push(
                 div()
                     .id(SharedString::from(format!("problem-row-{}-{line}-{col}", path.display())))
                     .h(px(24.0))
@@ -5181,8 +5290,10 @@ impl Workbench {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .when(on_cursor, |row| row.bg(theme::selected_bg()))
                     .hover(|this| this.bg(theme::raised_bg()))
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.problems_cursor.replace(Some((jump_path.clone(), line, col)));
                         this.push_nav(cx);
                         this.open_path(&jump_path, cx);
                         this.jump_active_to(line, col, cx);
@@ -5204,10 +5315,10 @@ impl Workbench {
                             .text_color(theme::fg_muted())
                             .child(SharedString::from(label)),
                     )
-                    .into_any_element()
-            })
-            .collect();
-        div().id("window-scroll-bookmarks").flex_1().min_h_0().overflow_y_scroll().children(rows).into_any_element()
+                    .into_any_element(),
+            );
+        }
+        out
     }
 
     /// The Find Usages window's body: the last references answer.
