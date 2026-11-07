@@ -1252,6 +1252,15 @@ impl Workbench {
         self.toggle_window("terminal", cx);
     }
 
+    fn on_new_terminal_tab(&mut self, _: &acts::NewTerminalTab, _window: &mut Window, cx: &mut Context<Self>) {
+        // No project, nothing to host a session in — the toast says so.
+        if self.host.is_none() {
+            return;
+        }
+        self.spawn_terminal(cx);
+        self.open_window("terminal", cx);
+    }
+
     /// Spawns one shell session: the front session's reported cwd (OSC 7)
     /// when it has one, the project root otherwise. The view's events (OSC
     /// title/pwd, exit) ride the entity subscription into the tab row.
@@ -3986,6 +3995,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_maximize_tool_window))
             .on_action(cx.listener(Self::on_toggle_commit))
             .on_action(cx.listener(Self::on_toggle_terminal))
+            .on_action(cx.listener(Self::on_new_terminal_tab))
             .on_action(cx.listener(Self::on_trust_project))
             .on_action(cx.listener(Self::on_dont_open_project))
             .on_action(cx.listener(Self::on_reopen_closed_tab))

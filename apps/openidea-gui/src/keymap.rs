@@ -85,6 +85,7 @@ pub static BINDINGS: &[Binding] = &[
     binding!("cmd-0", "workbench::ToggleCommit", None, Some("toolwindow.commit")),
     // M11: the terminal window rides the preset's Alt+F12 row.
     binding!("alt-f12", "workbench::ToggleTerminal", None, Some("toolwindow.terminal")),
+    binding!("ctrl-cmd-t", "workbench::NewTerminalTab", None, None),
     binding!("shift-escape", "workbench::HideActiveToolWindow", None, Some("toolwindow.hideActive")),
     // The preset's Meta+Shift+' converts to the shifted face (the macOS
     // physical-key rule: ⌘⇧' produces `"` and drops the shift).
