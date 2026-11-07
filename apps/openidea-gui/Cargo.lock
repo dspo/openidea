@@ -4159,7 +4159,7 @@ dependencies = [
 
 [[package]]
 name = "ide-core"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "dunce",
  "encoding_rs",
@@ -4175,7 +4175,7 @@ dependencies = [
 
 [[package]]
 name = "ide-extension"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -4194,7 +4194,7 @@ dependencies = [
 
 [[package]]
 name = "ide-index"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "blake3",
  "dunce",
@@ -4214,7 +4214,7 @@ dependencies = [
 
 [[package]]
 name = "ide-jsonrpc"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "encoding_rs",
  "futures",
@@ -4230,7 +4230,7 @@ dependencies = [
 
 [[package]]
 name = "ide-language"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "blake3",
  "ide-core",
@@ -4284,7 +4284,7 @@ dependencies = [
 
 [[package]]
 name = "ide-lsp"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "dunce",
  "futures",
@@ -4309,7 +4309,7 @@ dependencies = [
 
 [[package]]
 name = "ide-run"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "dunce",
  "encoding_rs",
@@ -4330,7 +4330,7 @@ dependencies = [
 
 [[package]]
 name = "ide-search"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "globset",
  "grep-matcher",
@@ -4347,7 +4347,7 @@ dependencies = [
 
 [[package]]
 name = "ide-text"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "ide-core",
  "ropey 1.6.1",
@@ -4358,7 +4358,7 @@ dependencies = [
 
 [[package]]
 name = "ide-vcs"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "blake3",
  "dunce",
@@ -4379,7 +4379,7 @@ dependencies = [
 
 [[package]]
 name = "ide-vfs"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "chardetng",
  "dunce",
@@ -4399,7 +4399,7 @@ dependencies = [
 
 [[package]]
 name = "ide-workspace"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "blake3",
  "dunce",
