@@ -109,6 +109,16 @@ impl TermShared {
     }
 }
 
+/// The grid's screen geometry at the last paint (the cmd-click's cell map
+/// for the OSC 8 hyperlink face).
+#[derive(Clone, Copy)]
+pub struct GridMetrics {
+    pub cell_w: f32,
+    pub line_h: f32,
+    pub origin_x: f32,
+    pub origin_y: f32,
+}
+
 pub struct GhosttyView {
     shared: Arc<TermShared>,
     process: Arc<dyn TerminalProcess>,
@@ -129,6 +139,9 @@ pub struct GhosttyView {
     /// Focus on the first render only; afterwards click-to-focus, so the
     /// terminal never steals the workbench's focus on repaints.
     focused_once: Cell<bool>,
+    /// The grid's screen geometry at the last paint (cell advance, row
+    /// height, the grid's origin): the cmd-click's cell mapping (OSC 8).
+    grid_metrics: Cell<Option<GridMetrics>>,
     /// Live OSC title, mirrored by the pump on the UI thread.
     live_title: RefCell<Option<String>>,
     /// Live working directory (OSC 7), mirrored by the pump.
@@ -243,6 +256,7 @@ impl GhosttyView {
                 composing: Cell::new(false),
                 key_interceptor: None,
                 focused_once: Cell::new(false),
+                grid_metrics: Cell::new(None),
                 live_title: RefCell::new(None),
                 live_cwd: RefCell::new(None),
                 exited: Cell::new(false),
@@ -529,14 +543,44 @@ impl Render for GhosttyView {
             .track_focus(&self.focus)
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
                     window.focus(&this.focus, cx);
+                    // cmd-click on an OSC 8 hyperlink opens it (the mouse
+                    // tracking programs keep their clicks; the modifier
+                    // bypasses them -- IDEA/ghostty's own convention).
+                    if event.modifiers.platform
+                        && let Some(metrics) = this.grid_metrics.get()
+                    {
+                        let col = (f32::from(event.position.x) - metrics.origin_x) / metrics.cell_w;
+                        let row = (f32::from(event.position.y) - metrics.origin_y) / metrics.line_h;
+                        if col >= 0.0
+                            && row >= 0.0
+                            && let Some(uri) =
+                                this.shared.inner.lock().unwrap().term.hyperlink_uri_at(col as u16, row as u32)
+                        {
+                            eprintln!("[terminal] cmd-click {uri}");
+                            open_uri(&uri);
+                        }
+                    }
                 }),
             )
             .on_key_down(cx.listener(Self::on_key))
             .on_scroll_wheel(cx.listener(Self::on_wheel))
             .bg(gpui_color(self.theme.bg))
             .child(GhosttyElement { view: cx.entity() })
+    }
+}
+
+/// Opens a URI with the platform's handler (`open` / `xdg-open`); a plain
+/// detached spawn (the child lives on its own; failures just log).
+fn open_uri(uri: &str) {
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(not(target_os = "macos"))]
+    let program = "xdg-open";
+    let result = std::process::Command::new(program).arg(uri).spawn();
+    if let Err(e) = result {
+        eprintln!("[terminal] open {uri}: {e}");
     }
 }
 
@@ -756,6 +800,12 @@ impl Element for GhosttyElement {
 
         self.view.update(cx, |v, _| {
             v.prepare_grid(cols, rows, (f32::from(cell_w) as u32).max(1), (f32::from(line_h) as u32).max(1));
+            v.grid_metrics.set(Some(GridMetrics {
+                cell_w: cell_w.into(),
+                line_h: line_h.into(),
+                origin_x: bounds.origin.x.into(),
+                origin_y: bounds.origin.y.into(),
+            }));
         });
 
         // Snapshot the grid under the lock, then release before shaping.
