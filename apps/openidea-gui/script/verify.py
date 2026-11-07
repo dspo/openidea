@@ -3,10 +3,22 @@
 
 Launches the app in an isolated scripted session (its own settings store, a
 /tmp scratch project) and drives it through the M5–M7 synthetic-input
-discipline: CGEvents for modifiers/navigation/keystrokes, **clipboard paste
-for all text** (the user's IME composes printable synthetic keys, so paste is
-the only trustworthy text channel). Screenshots are window-scoped, never
-full-screen.
+discipline: synthesized modifier/navigation/keystrokes, **clipboard paste
+for all text** where an IME may compose printable synthetic keys, so paste is
+the only trustworthy text channel (on the headless Linux session there is no
+IME, so raw typing is trustworthy there instead). Screenshots are
+window-scoped, never full-screen.
+
+Two drivers, both first-class — the project develops on macOS AND Fedora, so
+neither path may be removed (the takeover rule):
+  darwin — CGEvents posted to the app process (Quartz), screencapture -l,
+           pbcopy; the macOS keycode table.
+  linux  — a private headless sway session (WLR_BACKENDS=headless), window
+           focus via swaymsg, window-scoped grim captures, text/keys via
+           wtype (Wayland virtual-keyboard; no uinput and no root needed).
+           The budget gate is not meaningful on this driver (software
+           rendering + budgets.json holds macOS baselines) — verify.sh
+           skips stage 3 there until Fedora baselines are calibrated.
 
 Modes:
   perf  — the budget scenario: HUD samples, completion first frame, Find
@@ -19,63 +31,455 @@ Only processes this script starts are killed.
 """
 
 import argparse
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-import Quartz
-
 APP_TITLE = "OpenIDEA"
 
-# Keycodes (macOS virtual keys) for everything we post.
-KEY = {
-    "f12": 111,
-    "f6": 97,
-    "f2": 120,
-    "f3": 99,
-    "v": 9,
-    "z": 6,
-    "f": 3,
-    "o": 31,
-    "w": 13,
-    "t": 17,
-    "1": 18,
-    "2": 19,
-    "3": 20,
-    "4": 21,
-    "0": 29,
-    "5": 23,
-    "6": 22,
-    "7": 26,
-    "8": 28,
-    "9": 25,
-    "r": 15,
-    "d": 2,
-    "k": 40,
-    "s": 1,
-    "enter": 36,
-    "escape": 53,
-    "tab": 48,
-    "down": 125,
-    "up": 126,
-    "right": 124,
-    "left": 123,
-    "cmd_down": 125,
-    "cmd_up": 126,
-    "period": 47,
-    "comma": 43,
-    "backspace": 51,
-    "i": 34,
-    "l": 37,
-}
+# ---------------------------------------------------------------------------
+# Platform constants. The scenario code below only ever uses these symbolic
+# names (KEY["f12"], FLAG_SHIFT, ...), so both drivers satisfy the same
+# surface. FLAG_* are driver-native modifier identifiers.
+# ---------------------------------------------------------------------------
+IS_MACOS = sys.platform == "darwin"
+IS_LINUX = sys.platform == "linux"
 
-FLAG_CMD = Quartz.kCGEventFlagMaskCommand
-FLAG_SHIFT = Quartz.kCGEventFlagMaskShift
-FLAG_CTRL = Quartz.kCGEventFlagMaskControl
-FLAG_ALT = Quartz.kCGEventFlagMaskAlternate
+if IS_MACOS:
+    import Quartz
+
+    # Keycodes (macOS virtual keys) for everything we post.
+    KEY = {
+        "f12": 111,
+        "f6": 97,
+        "f2": 120,
+        "f3": 99,
+        "v": 9,
+        "z": 6,
+        "f": 3,
+        "o": 31,
+        "w": 13,
+        "t": 17,
+        "1": 18,
+        "2": 19,
+        "3": 20,
+        "4": 21,
+        "0": 29,
+        "5": 23,
+        "6": 22,
+        "7": 26,
+        "8": 28,
+        "9": 25,
+        "r": 15,
+        "d": 2,
+        "k": 40,
+        "s": 1,
+        "enter": 36,
+        "escape": 53,
+        "tab": 48,
+        "down": 125,
+        "up": 126,
+        "right": 124,
+        "left": 123,
+        "cmd_down": 125,
+        "cmd_up": 126,
+        "period": 47,
+        "comma": 43,
+        "backspace": 51,
+        "i": 34,
+        "l": 37,
+    }
+
+    FLAG_CMD = Quartz.kCGEventFlagMaskCommand
+    FLAG_SHIFT = Quartz.kCGEventFlagMaskShift
+    FLAG_CTRL = Quartz.kCGEventFlagMaskControl
+    FLAG_ALT = Quartz.kCGEventFlagMaskAlternate
+else:
+    # xkb keysym names for wtype. IDEA's habit layer maps ⌘→Ctrl on
+    # non-macOS platforms, so FLAG_CMD synthesizes Ctrl here — the first
+    # gate's keymap leg is exactly the check that this lands.
+    KEY = {
+        "f12": "F12",
+        "f6": "F6",
+        "f2": "F2",
+        "f3": "F3",
+        "v": "v",
+        "z": "z",
+        "f": "f",
+        "o": "o",
+        "w": "w",
+        "t": "t",
+        "1": "1",
+        "2": "2",
+        "3": "3",
+        "4": "4",
+        "0": "0",
+        "5": "5",
+        "6": "6",
+        "7": "7",
+        "8": "8",
+        "9": "9",
+        "r": "r",
+        "d": "d",
+        "k": "k",
+        "s": "s",
+        "enter": "Return",
+        "escape": "Escape",
+        "tab": "Tab",
+        "down": "Down",
+        "up": "Up",
+        "right": "Right",
+        "left": "Left",
+        "cmd_down": "Down",
+        "cmd_up": "Up",
+        "period": "period",
+        "comma": "comma",
+        "backspace": "BackSpace",
+        "i": "i",
+        "l": "l",
+    }
+
+    # Bit flags (scenarios combine them with `|` on both platforms), mapped
+    # to wtype modifier names here.
+    FLAG_CMD = 1
+    FLAG_SHIFT = 2
+    FLAG_CTRL = 4
+    FLAG_ALT = 8
+    MOD_NAMES = {FLAG_CMD: "ctrl", FLAG_SHIFT: "shift", FLAG_CTRL: "ctrl", FLAG_ALT: "alt"}
+
+
+# -- platform drivers -------------------------------------------------------
+#
+# Each driver implements the same surface on the Session: ensure_session /
+# amend_env (before the app spawns), find_window / window_bounds / activate /
+# screenshot / post_key / type_char / paste / scroll / shutdown (after).
+
+
+class MacDriver:
+    """The original macOS implementation: CGEvents to the app process,
+    screencapture -l for window-scoped shots, pbcopy for text."""
+
+    def ensure_session(self, s):
+        pass
+
+    def amend_env(self, env):
+        pass
+
+    def find_window(self, s, timeout=30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            windows = Quartz.CGWindowListCopyWindowInfo(
+                Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
+                Quartz.kCGNullWindowID,
+            )
+            for w in windows:
+                owner = w.get("kCGWindowOwnerName", "")
+                title = w.get("kCGWindowName", "")
+                if APP_TITLE in str(owner) or APP_TITLE in str(title):
+                    wid = w.get("kCGWindowNumber")
+                    if wid is not None and w.get("kCGWindowOwnerPID") == s.proc.pid:
+                        return int(wid)
+            time.sleep(0.5)
+        raise RuntimeError("app window not found")
+
+    def window_bounds(self, s):
+        windows = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
+        for w in windows:
+            if w.get("kCGWindowNumber") == s.window_id:
+                b = w.get("kCGWindowBounds")
+                return (b["X"], b["Y"], b["Width"], b["Height"])
+        raise RuntimeError("window vanished")
+
+    def activate(self, s):
+        subprocess.run(["osascript", "-e", f'tell application "System Events" to set frontmost of (first process whose unix id is {s.proc.pid}) to true'], check=False)
+        time.sleep(0.4)
+
+    def screenshot(self, s, path):
+        """Window-scoped capture only (never full-screen)."""
+        subprocess.run(["caffeinate", "-u", "-t", "1"], check=False)
+        r = subprocess.run(["screencapture", "-o", "-l", str(s.window_id), str(path)], capture_output=True)
+        ok = r.returncode == 0 and Path(path).exists() and Path(path).stat().st_size > 10_000
+        return ok
+
+    def post_key(self, s, key, flags=0, down_up=True):
+        code = KEY[key]
+        down = Quartz.CGEventCreateKeyboardEvent(None, code, True)
+        if flags:
+            Quartz.CGEventSetFlags(down, flags)
+        Quartz.CGEventPostToPid(s.proc.pid, down)
+        if down_up:
+            up = Quartz.CGEventCreateKeyboardEvent(None, code, False)
+            if flags:
+                Quartz.CGEventSetFlags(up, flags)
+            Quartz.CGEventPostToPid(s.proc.pid, up)
+        time.sleep(0.06)
+
+    def type_char(self, s, ch):
+        """One printable character through the raw fallback channel: may be
+        composed by the IME or double-inserted (the M5 record); used only
+        where the exact count does not matter (a completion trigger)."""
+        ev = Quartz.CGEventCreateKeyboardEvent(None, KEY["period"], True)
+        Quartz.CGEventKeyboardSetUnicodeString(ev, len(ch), ch)
+        Quartz.CGEventPostToPid(s.proc.pid, ev)
+        up = Quartz.CGEventCreateKeyboardEvent(None, KEY["period"], False)
+        Quartz.CGEventKeyboardSetUnicodeString(up, len(ch), ch)
+        Quartz.CGEventPostToPid(s.proc.pid, up)
+        time.sleep(0.06)
+
+    def paste(self, s, text):
+        """The trustworthy text channel: clipboard + ⌘V (bypasses the IME)."""
+        p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+        p.communicate(text.encode())
+        self.post_key(s, "v", FLAG_CMD)
+
+    def scroll(self, s, dy=-40, count=5, interval=0.05):
+        """Scroll-wheel events (pixel units) at the editor's center. The
+        cursor moves there first — posted wheel events land at the cursor."""
+        x, y, w, h = self.window_bounds(s)
+        cx, cy = x + w / 2, y + h * 0.45
+        move = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, Quartz.CGPointMake(cx, cy), Quartz.kCGMouseButtonLeft)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, move)
+        time.sleep(0.05)
+        for _ in range(count):
+            ev = Quartz.CGEventCreateScrollWheelEvent(None, Quartz.kCGScrollEventUnitPixel, 1, dy)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+            time.sleep(interval)
+
+    def shutdown(self, s):
+        pass
+
+
+class LinuxDriver:
+    """A private headless sway session per script run: the app connects to
+    its own compositor (no effect on the user's desktop), grim takes
+    window-scoped captures, wtype synthesizes keys/text through the Wayland
+    virtual-keyboard protocol (no uinput, no root — ydotool's uinput events
+    never reach a headless sway, which has no libinput backend)."""
+
+    OUTPUT_W = 1600
+    OUTPUT_H = 1000
+
+    def __init__(self):
+        self.sway = None
+        self.wayland_display = None
+        self.sway_sock = None
+        self.output = None
+
+    # -- session lifecycle --
+
+    def ensure_session(self, s):
+        if self.sway is not None:
+            return
+        runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+        before = set(os.listdir(runtime))
+        config = s.outdir / f"{s.name}-sway-config"
+        config.write_text("bar {\n  mode invisible\n}\n")
+        env = dict(os.environ)
+        env["WLR_BACKENDS"] = "headless"
+        env["WLR_LIBINPUT_NO_DEVICES"] = "1"
+        self.sway = subprocess.Popen(
+            ["sway", "-c", str(config)],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if self.sway.poll() is not None:
+                raise RuntimeError(f"headless sway exited early (code {self.sway.returncode})")
+            new = set(os.listdir(runtime)) - before
+            wl = sorted(n for n in new if re.fullmatch(r"wayland-\d+", n))
+            ipc = sorted(n for n in new if n.startswith("sway-ipc."))
+            if wl and ipc:
+                self.wayland_display = wl[-1]
+                self.sway_sock = str(runtime / ipc[-1])
+                break
+            time.sleep(0.2)
+        if not self.wayland_display:
+            raise RuntimeError("headless sway did not expose its sockets in time")
+        # A virtual output to render and capture on (recent sway may have
+        # created one already; create_output then is a no-op-ish extra we
+        # simply don't select).
+        outs = json.loads(self._swaymsg("-t", "get_outputs"))
+        if all(o["name"].startswith("__") for o in outs):
+            self._swaymsg("create_output")
+            time.sleep(0.5)
+            outs = json.loads(self._swaymsg("-t", "get_outputs"))
+        self.output = next(o["name"] for o in outs if not o["name"].startswith("__"))
+        # One argv string (swaymsg's own getopt would swallow `--custom`);
+        # no position clause — a sole output already sits at the origin and
+        # `position 0,0` is a sway parse error. --custom because the
+        # headless output advertises no mode list.
+        self._swaymsg(f"output {self.output} mode --custom {self.OUTPUT_W}x{self.OUTPUT_H}")
+        time.sleep(0.5)
+
+    def amend_env(self, env):
+        env["WAYLAND_DISPLAY"] = self.wayland_display
+
+    def shutdown(self, s):
+        if self.sway and self.sway.poll() is None:
+            try:
+                self._swaymsg("exit")
+                self.sway.wait(timeout=5)
+            except Exception:
+                self.sway.terminate()
+                try:
+                    self.sway.wait(timeout=5)
+                except Exception:
+                    self.sway.kill()
+        self.sway = None
+        self.wayland_display = None
+        self.sway_sock = None
+
+    def _env(self):
+        env = dict(os.environ)
+        env["WAYLAND_DISPLAY"] = self.wayland_display
+        return env
+
+    def _swaymsg(self, *args):
+        return subprocess.run(
+            ["swaymsg", "-s", self.sway_sock, *args],
+            env=self._env(),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+
+    # -- window --
+
+    def _find_node(self, s, node):
+        if node.get("pid") == s.proc.pid and node.get("type") in ("con", "floating_con"):
+            return node
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            hit = self._find_node(s, child)
+            if hit is not None:
+                return hit
+        return None
+
+    def find_window(self, s, timeout=30):
+        """Returns the container id, and remembers the output hosting it.
+        The window is anchored at (0, 0) of the global layout (sway's tree
+        JSON no longer carries absolute x/y, and grim crops in global
+        coordinates) — deterministic in this private session."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            tree = json.loads(self._swaymsg("-t", "get_tree"))
+            for output in tree.get("nodes", []):
+                if output.get("name", "").startswith("__"):
+                    continue
+                node = self._find_node(s, output)
+                if node is not None and node.get("name"):
+                    self.output = output["name"]
+                    self._swaymsg(f"[con_id={node['id']}] floating enable")
+                    self._swaymsg(f"[con_id={node['id']}] move position 0 0")
+                    time.sleep(0.3)
+                    return node["id"]
+            time.sleep(0.5)
+        raise RuntimeError("app window not found in the sway tree")
+
+    def window_bounds(self, s):
+        tree = json.loads(self._swaymsg("-t", "get_tree"))
+        node = self._find_node(s, tree)
+        if node is None:
+            raise RuntimeError("window vanished")
+        g = node["geometry"]
+        return (0, 0, g["width"], g["height"])
+
+    def activate(self, s):
+        if s.window_id is not None:
+            self._swaymsg(f"[con_id={s.window_id}] focus")
+        time.sleep(0.2)
+
+    def screenshot(self, s, path):
+        """Window-scoped capture only (never full-screen): the window is
+        anchored at the origin (see find_window), so grim the virtual
+        output once and crop to the window's own rectangle. (grim 1.5 has
+        no geometry argument, hence the crop step.)"""
+        x, y, w, h = self.window_bounds(s)
+        full = Path(path).with_suffix(".full.png")
+        r = subprocess.run(["grim", "-o", self.output, str(full)], env=self._env(), capture_output=True)
+        if r.returncode != 0:
+            return False
+        subprocess.run(
+            ["convert", str(full), "-crop", f"{w}x{h}+{x}+{y}", "+repage", str(path)],
+            capture_output=True,
+        )
+        full.unlink(missing_ok=True)
+        ok = Path(path).exists() and Path(path).stat().st_size > 10_000
+        return ok
+
+    # -- input channels (wtype over the virtual-keyboard protocol) --
+
+    def _wtype(self, *args):
+        if not shutil.which("wtype"):
+            raise RuntimeError(
+                "wtype is not installed — `sudo dnf install wtype` (the key/text synthesis "
+                "channel on the headless Wayland session; ydotool's uinput events cannot "
+                "reach a headless sway)"
+            )
+        r = subprocess.run(["wtype", *args], env=self._env(), capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"wtype failed: {r.stderr.strip()}")
+        return r
+
+    def post_key(self, s, key, flags=0, down_up=True):
+        mods = []
+        for bit in (FLAG_CMD, FLAG_SHIFT, FLAG_CTRL, FLAG_ALT):
+            if flags & bit:
+                name = MOD_NAMES[bit]
+                if name not in mods:
+                    mods.append(name)
+        cmd = []
+        for m in mods:
+            cmd += ["-M", m]
+        cmd += ["-P", KEY[key]]
+        if down_up:
+            cmd += ["-p", KEY[key]]
+        for m in reversed(mods):
+            cmd += ["-m", m]
+        self._wtype(*cmd)
+        time.sleep(0.06)
+
+    def type_char(self, s, ch):
+        """One printable character. On the headless session there is no IME
+        to compose it, so a keysym press is exact — the macOS caveat does
+        not apply here."""
+        self._wtype(KEY["period"] if ch == "." else ch)
+        time.sleep(0.06)
+
+    def paste(self, s, text):
+        """Text channel: wl-copy + Ctrl+V when wl-copy exists (parity with
+        the macOS clipboard discipline, and IME-safe for later IME legs);
+        raw wtype typing otherwise, which on this IME-less session is exact."""
+        if shutil.which("wl-copy"):
+            p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE, env=self._env())
+            p.communicate(text.encode())
+            self.post_key(s, "v", FLAG_CMD)
+        else:
+            self._wtype(text)
+
+    def scroll(self, s, dy=-40, count=5, interval=0.05):
+        """Wheel events at the editor's center: swaymsg warps the cursor,
+        wlrctl scrolls. Only the perf scenario needs this; the sign follows
+        wlrctl's convention (positive dy scrolls content up)."""
+        if not shutil.which("wlrctl"):
+            raise RuntimeError("wlrctl is not installed (`sudo dnf install wlrctl`) — needed for the scroll leg")
+        x, y, w, h = self.window_bounds(s)
+        cx, cy = int(x + w / 2), int(y + h * 0.45)
+        subprocess.run(["swaymsg", "-s", self.sway_sock, "seat", "seat0", "cursor", "move", "warp", str(cx), str(cy)], env=self._env(), capture_output=True)
+        step = max(1, abs(dy) // 40)
+        for _ in range(count):
+            subprocess.run(["wlrctl", "pointer", "scroll", str(-step if dy < 0 else step)], env=self._env(), capture_output=True)
+            time.sleep(interval)
+
+
+def make_driver():
+    return MacDriver() if IS_MACOS else LinuxDriver()
 
 
 class Session:
@@ -96,11 +500,13 @@ class Session:
         self.proc = None
         self.transcript_path = self.outdir / f"{name}-transcript.log"
         self.window_id = None
+        self.driver = make_driver()
 
     # -- lifecycle ---------------------------------------------------------
 
     def start(self, wait_markers=("first paint",), timeout=90):
         self.outdir.mkdir(parents=True, exist_ok=True)
+        self.driver.ensure_session(self)
         env = dict(os.environ)
         if self.env_project:
             env["OPENIDEA_GUI_PROJECT"] = self.project
@@ -110,6 +516,7 @@ class Session:
             env["OPENIDEA_GUI_OPEN"] = self.open_file
         env.pop("OPENIDEA_GUI_TEST_PANIC", None)
         env.update(self.extra_env)
+        self.driver.amend_env(env)
         # A scripted session's own store starts clean (truncate, never
         # append — the samplers parse it whole). A store handed in through
         # extra_env (the session-restore and crash-toast legs) is SHARED —
@@ -163,90 +570,42 @@ class Session:
                     self.proc.wait(timeout=5)
         if getattr(self, "_transcript", None):
             self._transcript.close()
+        self.driver.shutdown(self)
 
     # -- window ------------------------------------------------------------
 
     def _find_window(self, timeout=30):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            windows = Quartz.CGWindowListCopyWindowInfo(
-                Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
-                Quartz.kCGNullWindowID,
-            )
-            for w in windows:
-                owner = w.get("kCGWindowOwnerName", "")
-                title = w.get("kCGWindowName", "")
-                if APP_TITLE in str(owner) or APP_TITLE in str(title):
-                    wid = w.get("kCGWindowNumber")
-                    if wid is not None and w.get("kCGWindowOwnerPID") == self.proc.pid:
-                        return int(wid)
-            time.sleep(0.5)
-        raise RuntimeError("app window not found")
+        return self.driver.find_window(self, timeout=timeout)
 
     def window_bounds(self):
-        windows = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
-        for w in windows:
-            if w.get("kCGWindowNumber") == self.window_id:
-                b = w.get("kCGWindowBounds")
-                return (b["X"], b["Y"], b["Width"], b["Height"])
-        raise RuntimeError("window vanished")
+        return self.driver.window_bounds(self)
 
     def activate(self):
-        subprocess.run(["osascript", "-e", f'tell application "System Events" to set frontmost of (first process whose unix id is {self.proc.pid}) to true'], check=False)
-        time.sleep(0.4)
+        self.driver.activate(self)
 
     def screenshot(self, path):
         """Window-scoped capture only (never full-screen)."""
-        subprocess.run(["caffeinate", "-u", "-t", "1"], check=False)
-        r = subprocess.run(["screencapture", "-o", "-l", str(self.window_id), str(path)], capture_output=True)
-        ok = r.returncode == 0 and Path(path).exists() and Path(path).stat().st_size > 10_000
-        return ok
+        return self.driver.screenshot(self, path)
 
     # -- input channels ----------------------------------------------------
 
     def post_key(self, key, flags=0, down_up=True):
-        code = KEY[key]
-        down = Quartz.CGEventCreateKeyboardEvent(None, code, True)
-        if flags:
-            Quartz.CGEventSetFlags(down, flags)
-        Quartz.CGEventPostToPid(self.proc.pid, down)
-        if down_up:
-            up = Quartz.CGEventCreateKeyboardEvent(None, code, False)
-            if flags:
-                Quartz.CGEventSetFlags(up, flags)
-            Quartz.CGEventPostToPid(self.proc.pid, up)
-        time.sleep(0.06)
+        self.driver.post_key(self, key, flags, down_up)
 
     def type_char(self, ch):
         """One printable character through the raw fallback channel: may be
         composed by the IME or double-inserted (the M5 record); used only
         where the exact count does not matter (a completion trigger)."""
-        ev = Quartz.CGEventCreateKeyboardEvent(None, KEY["period"], True)
-        Quartz.CGEventKeyboardSetUnicodeString(ev, len(ch), ch)
-        Quartz.CGEventPostToPid(self.proc.pid, ev)
-        up = Quartz.CGEventCreateKeyboardEvent(None, KEY["period"], False)
-        Quartz.CGEventKeyboardSetUnicodeString(up, len(ch), ch)
-        Quartz.CGEventPostToPid(self.proc.pid, up)
-        time.sleep(0.06)
+        self.driver.type_char(self, ch)
 
     def paste(self, text):
         """The trustworthy text channel: clipboard + ⌘V (bypasses the IME)."""
-        p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-        p.communicate(text.encode())
-        self.post_key("v", FLAG_CMD)
+        self.driver.paste(self, text)
 
     def scroll(self, dy=-40, count=5, interval=0.05):
         """Scroll-wheel events (pixel units) at the editor's center. The
         cursor moves there first — posted wheel events land at the cursor."""
-        x, y, w, h = self.window_bounds()
-        cx, cy = x + w / 2, y + h * 0.45
-        move = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, Quartz.CGPointMake(cx, cy), Quartz.kCGMouseButtonLeft)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, move)
-        time.sleep(0.05)
-        for _ in range(count):
-            ev = Quartz.CGEventCreateScrollWheelEvent(None, Quartz.kCGScrollEventUnitPixel, 1, dy)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-            time.sleep(interval)
+        self.driver.scroll(self, dy, count, interval)
 
     # -- sampling ----------------------------------------------------------
 
@@ -540,8 +899,6 @@ def main():
     if args.mode == "perf":
         result = run_perf(args.binary, args.project, args.open, args.outdir, args.name, args.release, args.scroll_seconds)
         out = Path(args.outdir) / f"{args.name}-measured.json"
-        import json
-
         out.write_text(json.dumps(result, indent=2))
         print(json.dumps(result, indent=2))
     elif args.mode == "smoke":
@@ -550,8 +907,6 @@ def main():
         sys.exit(0 if all(st["shot"] for st in states) else 1)
     elif args.mode == "soak":
         rows = run_soak(args.binary, args.project, args.open, args.outdir, args.name, args.minutes)
-        import json
-
         out = Path(args.outdir) / f"{args.name}-rss.json"
         out.write_text(json.dumps(rows, indent=2))
         print(json.dumps(rows, indent=2))

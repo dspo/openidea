@@ -24,12 +24,21 @@ cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test --quiet
 
-# A locked screen cannot drive stages 2–3: stop with a clear message rather
-# than a pile of capture failures.
-if [ -n "${CGSSessionScreenIsLocked:-}" ]; then
-  echo "== stage 2/3 skipped: the screen is locked (CGSSessionScreenIsLocked set)"
-  echo "   unlock and re-run for the smoke + budget legs."
-  exit 0
+# Platform dispatch. Both machines are first-class development
+# environments, so each keeps its own stage-2/3 gating; neither may be
+# removed. macOS: a locked screen cannot drive stages 2–3 (stop with a
+# clear message); the budget gate runs against perf/budgets.json.
+# Linux: the smoke runs in a private headless sway session (no lock
+# concept); the budget gate is deferred — budgets.json holds macOS
+# baselines and the headless session renders on lavapipe, so absolute
+# numbers would false-fail until Fedora baselines are calibrated
+# (M8_VERIFY_BUDGET=force runs it anyway).
+if [ "$(uname)" = "Darwin" ]; then
+  if [ -n "${CGSSessionScreenIsLocked:-}" ]; then
+    echo "== stage 2/3 skipped: the screen is locked (CGSSessionScreenIsLocked set)"
+    echo "   unlock and re-run for the smoke + budget legs."
+    exit 0
+  fi
 fi
 
 echo "== stage 2: screenshot smoke"
@@ -37,6 +46,14 @@ echo "== stage 2: screenshot smoke"
 python3 script/verify.py smoke --binary target/debug/openidea-gui \
   --project . --open src/main.rs \
   --outdir "$OUT" --name smoke >/dev/null
+
+if [ "$(uname)" != "Darwin" ] && [ "${M8_VERIFY_BUDGET:-}" != "force" ]; then
+  echo "== stage 3 skipped on Linux: perf/budgets.json is the macOS baseline and"
+  echo "   the headless session renders on lavapipe — recalibrate before gating"
+  echo "   (M8_VERIFY_BUDGET=force to run it regardless)."
+  echo "== verify: stages 1–2 green (evidence in $OUT)"
+  exit 0
+fi
 
 echo "== stage 3: budget gate (Go module scenario, debug + release)"
 SCRATCH=$(mktemp -d /tmp/m8-budget-XXXXXX)
