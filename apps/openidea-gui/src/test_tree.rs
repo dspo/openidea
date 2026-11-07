@@ -140,6 +140,10 @@ pub struct TestRunShared {
     /// The output tail (capped) the finish parsers read (pytest's FAILURES
     /// section and the JSON reports ride the accumulated stream).
     tail: std::sync::Mutex<String>,
+    /// A chunk's trailing fragment without its newline yet (ide-run batches
+    /// at ~8 ms — chunk boundaries land mid-line, so the streaming parse
+    /// joins fragments across chunks the way the Run dock's panel does).
+    pending: std::sync::Mutex<String>,
     /// Where the runner's report file lands (`--outputFile` of the JSON
     /// reporters), if the derived command asked for one.
     report_file: Option<PathBuf>,
@@ -154,11 +158,13 @@ impl TestRunShared {
             state: std::sync::Mutex::new(TestRunState { phase: TestPhase::Starting, ..Default::default() }),
             parser: std::sync::Mutex::new(RunnerParser::new(runner)),
             tail: std::sync::Mutex::new(String::new()),
+            pending: std::sync::Mutex::new(String::new()),
             report_file,
         }
     }
 
-    /// One output chunk: stdout lines stream-parse; both streams join the tail.
+    /// One output chunk: stdout lines stream-parse (joined across chunk
+    /// boundaries); both streams join the tail.
     pub fn feed(&self, stream: crate::run_panel::Stream, text: &str) {
         {
             let mut tail = self.tail.lock().unwrap();
@@ -166,20 +172,38 @@ impl TestRunShared {
             trim_cap(&mut tail);
         }
         if stream == crate::run_panel::Stream::Stdout {
+            let complete = {
+                let mut pending = self.pending.lock().unwrap();
+                pending.push_str(text);
+                match pending.rfind('\n') {
+                    Some(pos) => {
+                        let whole = pending[..=pos].to_owned();
+                        *pending = pending[pos + 1..].to_owned();
+                        whole
+                    }
+                    None => return, // one fragment short of a line so far
+                }
+            };
             let mut parser = self.parser.lock().unwrap();
             let mut state = self.state.lock().unwrap();
             state.phase = TestPhase::Running;
-            for line in text.lines() {
+            for line in complete.lines() {
                 parser.line(line, &mut state);
             }
             state.recount();
         }
     }
 
-    /// The run exited: whole-document parsers over the tail (and the report
-    /// file the derived command asked for), then the totals settle.
+    /// The run exited: the trailing fragment joins, whole-document parsers
+    /// run over the tail (and the report file the derived command asked
+    /// for), then the totals settle.
     pub fn finish(&self) {
-        let tail = self.tail.lock().unwrap().clone();
+        let tail = {
+            let mut tail = self.tail.lock().unwrap();
+            let fragment = self.pending.lock().unwrap().clone();
+            tail.push_str(&fragment);
+            tail.clone()
+        };
         let report = self.report_file.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
         let mut parser = self.parser.lock().unwrap();
         let mut state = self.state.lock().unwrap();
@@ -202,7 +226,7 @@ fn trim_cap(buf: &mut String) {
 // ---------------------------------------------------------------------------
 
 /// The four parser families (one per acceptance leg; ts and js share the
-/// JSON-report family).
+/// JSON-report face, with per-runner CLI flags).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Runner {
     /// `go test -json` NDJSON events.
@@ -212,27 +236,48 @@ pub enum Runner {
     Cargo,
     /// `pytest -v` rows + the FAILURES section at finish.
     Pytest,
-    /// vitest / jest `--outputFile` JSON (the jest shape; vitest 5 matches).
-    JsJson,
+    /// vitest: `--reporter=json --outputFile` (the jest report shape).
+    Vitest,
+    /// jest: `--json --outputFile`.
+    Jest,
 }
 
-/// The runner family for a test-tagged configuration (the pure face; the npm
-/// script body — vitest vs jest — is the caller's lookup,
-/// [`runner_from_script_body`]).
+/// The runner family for a test-tagged configuration from its shape alone.
+/// The npm-script family needs the package body — [`resolve_runner`].
 pub fn runner_for(config: &ide_run::RunConfig) -> Option<Runner> {
     match config.kind.as_str() {
         "go" if config.args.first().map(String::as_str) == Some("test") => Some(Runner::Go),
         "cargo" if config.args.first().map(String::as_str) == Some("test") => Some(Runner::Cargo),
         "pytest" => Some(Runner::Pytest),
-        "npm" | "pnpm" | "yarn" | "bun" | "deno" if config.is_test => Some(Runner::JsJson),
         _ => None,
     }
 }
 
-/// vitest vs jest from a package.json script body (both speak the same
-/// report face; `None` = neither, the caller falls back to the report face).
-pub fn runner_from_script_body(body: &str) -> Option<Runner> {
-    (body.contains("vitest") || body.contains("jest")).then_some(Runner::JsJson)
+/// The runner for a test-tagged configuration: the shape's family, or —
+/// for the npm-script family — vitest vs jest from package.json's script
+/// body (the detector's test scripts are `npm run <script>` rows).
+pub fn resolve_runner(config: &ide_run::RunConfig, root: &Path) -> Option<Runner> {
+    match runner_for(config) {
+        Some(runner) => Some(runner),
+        None if config.is_test && npm_script(config).is_some() => Some(js_runner(root, npm_script(config).as_deref())),
+        _ => None,
+    }
+}
+
+/// vitest vs jest from the project's package.json (the `test` script when
+/// the configuration's own script name is unknown; vitest is the default
+/// face — both report the same JSON shape).
+pub fn js_runner(root: &Path, script: Option<&str>) -> Runner {
+    let vitest = std::fs::read_to_string(root.join("package.json"))
+        .ok()
+        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+        .and_then(|pkg| pkg.get("scripts").and_then(Value::as_object).cloned())
+        .and_then(|scripts| {
+            let key = script.unwrap_or("test");
+            scripts.get(key).and_then(Value::as_str).map(str::to_owned)
+        })
+        .is_some_and(|body| body.contains("vitest"));
+    if vitest { Runner::Vitest } else { Runner::Jest }
 }
 
 /// The script a `npm run <script>`-shaped config names (the rerun builder
@@ -303,11 +348,18 @@ pub fn test_run_config(
                 TestFilter::All => {}
             }
         }
-        Runner::JsJson => {
-            // The structured face: a JSON report written next to the run.
-            if let Some(file) = report_file {
-                out.args.push("--outputFile".into());
-                out.args.push(file.to_string_lossy().into_owned());
+        // The structured face: npx drives the runner directly (the script
+        // wrapper's flag-forwarding dance avoided) with a JSON report
+        // written next to the run.
+        Runner::Vitest | Runner::Jest => {
+            let binary = if runner == Runner::Vitest { "vitest" } else { "jest" };
+            out.command = "npx".into();
+            out.args = vec![binary.into()];
+            if runner == Runner::Vitest {
+                // vitest defaults to watch mode; every face is one-shot.
+                out.args.push("run".into());
+            } else {
+                out.args.push("--json".into());
             }
             match filter {
                 TestFilter::Case { name, file, .. } => {
@@ -318,9 +370,16 @@ pub fn test_run_config(
                     out.args.push(name.clone());
                 }
                 // A suite rerun re-runs its file (the runner's selection
-                // unit; the `-t` face narrows per case only).
+                // unit; the `-t` face narrows per case only). The caller
+                // passes the suite's file part as `name`.
                 TestFilter::Suite { name } => out.args.push(name.clone()),
                 TestFilter::All => {}
+            }
+            let reporter = if runner == Runner::Vitest { "--reporter=json" } else { "--json" };
+            if let Some(file) = report_file {
+                out.args.push(reporter.into());
+                out.args.push("--outputFile".into());
+                out.args.push(file.to_string_lossy().into_owned());
             }
         }
     }
@@ -362,7 +421,7 @@ impl RunnerParser {
             Runner::Go => self.go_line(line, state),
             Runner::Cargo => self.cargo_line(line, state),
             Runner::Pytest => self.pytest_line(line, state),
-            Runner::JsJson => {} // the report parses at finish
+            Runner::Vitest | Runner::Jest => {} // the report parses at finish
         }
     }
 
@@ -376,7 +435,7 @@ impl RunnerParser {
                 }
             }
             Runner::Pytest => pytest_failures(stdout, state),
-            Runner::JsJson => json_report(if report.trim().is_empty() { stdout } else { report }, state),
+            Runner::Vitest | Runner::Jest => json_report(if report.trim().is_empty() { stdout } else { report }, state),
         }
     }
 }
@@ -392,21 +451,28 @@ impl RunnerParser {
         let elapsed = event.get("Elapsed").and_then(Value::as_f64).map(|s| s * 1000.0);
         let suite = suite_or_new(state, package);
         if test.is_empty() {
-            // Package-level events: a bare `fail` = build/run failure.
+            // Package-level events. A bare `fail` after failed cases is just
+            // the test binary's non-zero exit; alone (no case failed) it is
+            // the build/run failure face and becomes a synthesized case.
             if action == "fail" {
-                let text = self.go_outputs.entry(String::new()).or_default().clone();
-                suite.state = TestState::Failed;
-                suite.cases.push(TestCase {
-                    id: format!("{package} (build)"),
-                    name: "package failed".into(),
-                    state: TestState::Failed,
-                    duration_ms: elapsed,
-                    message: Some(go_first_output(&text).unwrap_or_else(|| "build failed".into())),
-                    file: None,
-                    line: None,
-                    expected: None,
-                    actual: None,
-                });
+                let any_failed = suite.cases.iter().any(|c| c.state == TestState::Failed);
+                if !any_failed {
+                    let text = self.go_outputs.entry(String::new()).or_default().clone();
+                    suite.state = TestState::Failed;
+                    suite.cases.push(TestCase {
+                        id: format!("{package} (build)"),
+                        name: "package failed".into(),
+                        state: TestState::Failed,
+                        duration_ms: elapsed,
+                        message: Some(go_first_output(&text).unwrap_or_else(|| "build failed".into())),
+                        file: None,
+                        line: None,
+                        expected: None,
+                        actual: None,
+                    });
+                } else {
+                    suite.state = TestState::Failed;
+                }
             } else if action == "output"
                 && let Some(out) = event.get("Output").and_then(Value::as_str)
             {
@@ -1176,7 +1242,7 @@ isTest = true
 {"Time":"2026-11-07T22:52:35.391490+08:00","Action":"skip","Package":"m12/goapp/calc","Test":"TestSkipped","Elapsed":0}
 {"Time":"2026-11-07T22:52:35.391500+08:00","Action":"run","Package":"m12/goapp/calc","Test":"TestPass"}
 {"Time":"2026-11-07T22:52:35.391508+08:00","Action":"pass","Package":"m12/goapp/calc","Test":"TestPass","Elapsed":0}
-{"Time":"2026-11-07T22:52:35.392740+08:00","Action":"pass","Package":"m12/goapp/calc","Elapsed":0.538}
+{"Time":"2026-11-07T22:52:35.392740+08:00","Action":"fail","Package":"m12/goapp/calc","Elapsed":0.538}
 "#;
 
     #[test]
@@ -1486,11 +1552,12 @@ isTest = true
 "#,
         )
         .expect("row parses");
-        let report = test_run_config(&npm, Runner::JsJson, &TestFilter::All, Some(Path::new("/tmp/report.json")));
-        assert_eq!(report.args, vec!["run", "test", "--outputFile", "/tmp/report.json"]);
+        let vitest = test_run_config(&npm, Runner::Vitest, &TestFilter::All, Some(Path::new("/tmp/report.json")));
+        assert_eq!(vitest.command, "npx");
+        assert_eq!(vitest.args, vec!["vitest", "run", "--reporter=json", "--outputFile", "/tmp/report.json"]);
         let case = test_run_config(
             &npm,
-            Runner::JsJson,
+            Runner::Vitest,
             &TestFilter::Case {
                 id: "broken case".into(),
                 name: "broken case".into(),
@@ -1498,12 +1565,14 @@ isTest = true
             },
             None,
         );
-        assert_eq!(case.args, vec!["run", "test", "src/math.test.ts", "-t", "broken case"]);
+        // No report file, no reporter flags (the human stream stays).
+        assert_eq!(case.args, ["vitest", "run", "src/math.test.ts", "-t", "broken case"]);
     }
 
     #[test]
     fn runner_derivation_maps_the_tagged_kinds() {
-        assert_eq!(runner_for(&go_config()), Some(Runner::Go));
+        let go = go_config();
+        assert_eq!(runner_for(&go), Some(Runner::Go));
         let cargo: ide_run::RunConfig = toml::from_str(
             r#"
 id = "cargo:test"
@@ -1531,7 +1600,8 @@ isTest = true
 "#,
         )
         .expect("row parses");
-        assert_eq!(runner_for(&npm), Some(Runner::JsJson));
+        // The npm family resolves through the package body (see resolve_runner).
+        assert_eq!(runner_for(&npm), None);
         assert_eq!(npm_script(&npm).as_deref(), Some("test"));
         let plain: ide_run::RunConfig = toml::from_str(
             r#"
@@ -1547,9 +1617,16 @@ isTest = false
         )
         .expect("row parses");
         assert_eq!(runner_for(&plain), None);
-        assert_eq!(runner_from_script_body("vitest run"), Some(Runner::JsJson));
-        assert_eq!(runner_from_script_body("jest --coverage"), Some(Runner::JsJson));
-        assert_eq!(runner_from_script_body("node build.js"), None);
+        // resolve_runner reads the script body: vitest and jest faces.
+        let dir = std::env::temp_dir().join(format!("openidea-gui-js-runner-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"scripts": {"test": "vitest run"}}"#).unwrap();
+        assert_eq!(resolve_runner(&npm, &dir), Some(Runner::Vitest));
+        std::fs::write(dir.join("package.json"), r#"{"scripts": {"test": "jest"}}"#).unwrap();
+        assert_eq!(resolve_runner(&npm, &dir), Some(Runner::Jest));
+        std::fs::remove_dir_all(&dir).ok();
+        // A go config resolves from its shape without touching the disk.
+        assert_eq!(resolve_runner(&go, &dir), Some(Runner::Go));
     }
 
     // -- the gutter scanner ---------------------------------------------------
@@ -1613,6 +1690,19 @@ isTest = false
         let state = shared.state.lock().unwrap();
         assert_eq!(state.phase, TestPhase::Finished);
         assert_eq!(state.summary, TestSummary { passed: 4, failed: 1, skipped: 1 });
+    }
+
+    #[test]
+    fn chunks_split_mid_line_still_parse() {
+        // ide-run batches at ~8 ms: a chunk boundary can land inside a
+        // `pytest -v` row; the streaming parse joins fragments.
+        let shared = TestRunShared::new(Runner::Pytest, None);
+        let (a, b) = PYTEST_V.split_at(PYTEST_V.len() / 2);
+        shared.feed(Stream::Stdout, a);
+        shared.feed(Stream::Stdout, b);
+        shared.finish();
+        let state = shared.state.lock().unwrap();
+        assert_eq!(state.summary, TestSummary { passed: 5, failed: 2, skipped: 1 }, "every row parsed exactly once");
     }
 
     #[test]
