@@ -44,6 +44,12 @@ actions!(
         // + button with the mouse; the keymap face exists for scripted
         // verification and discoverability (the ⌃⌘R precedent).
         NewTerminalTab,
+        // M11: the debugger — the preset's run.debug row (⌃D, the M4 note's
+        // deferred retarget) and the stepping trio the preset pins to F7/F8/F9.
+        Debug,
+        DebugStepInto,
+        DebugStepOver,
+        DebugResume,
         TrustProject,
         DontOpenProject,
         // M9 navigation habits.
@@ -77,6 +83,11 @@ actions!(editor, [ToggleReplace]);
 actions!(
     editor,
     [
+        // M11: gutter breakpoints (the preset's debug.toggleBreakpoint ⌘F8
+        // and the condition editor on ⌥⌘F8 — IDEA has no preset row for the
+        // condition face; the keymap row exists for discoverability).
+        ToggleBreakpoint,
+        BreakpointCondition,
         TogglePerfHud,
         CursorLeft,
         CursorRight,
@@ -211,6 +222,10 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("workbench::ToggleCommit", "Commit", "VCS", "⌘0"),
     action_info!("workbench::ToggleTerminal", "Terminal", "View", "⌥F12"),
     action_info!("workbench::NewTerminalTab", "New Terminal Tab", "View", "⌃⌘T"),
+    action_info!("workbench::Debug", "Debug…", "Run", "⌃D"),
+    action_info!("workbench::DebugStepInto", "Step Into", "Run", "F7"),
+    action_info!("workbench::DebugStepOver", "Step Over", "Run", "F8"),
+    action_info!("workbench::DebugResume", "Resume", "Run", "F9"),
     action_info!("editor::Paste", "Paste", "Edit", "⌘V"),
     action_info!("editor::TabIndent", "Indent / Expand Template", "Edit", "⇥"),
     action_info!("editor::OutdentLine", "Outdent Line", "Edit", "⇧⇥"),
@@ -247,6 +262,8 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("editor::ScrollCenter", "Scroll to Center", "View", "⌃L"),
     action_info!("editor::CloneCaretAbove", "Clone Caret Above", "Edit", "⌥⌥↑"),
     action_info!("editor::CloneCaretBelow", "Clone Caret Below", "Edit", "⌥⌥↓"),
+    action_info!("editor::ToggleBreakpoint", "Toggle Breakpoint", "Run", "⌘F8"),
+    action_info!("editor::BreakpointCondition", "Conditional Breakpoint…", "Run", "⌥⌘F8"),
     action_info!("editor::TogglePerfHud", "Toggle Perf HUD", "View", "F12"),
 ];
 

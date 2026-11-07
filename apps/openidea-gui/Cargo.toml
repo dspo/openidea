@@ -97,6 +97,8 @@ serde_json = "1"
 # linked via its build.rs) behind a self-drawn GPUI element, as a sub-crate
 # of this app tree (the root exclude already covers the whole directory).
 terminal-ghostty = { path = "terminal-ghostty" }
+# The debug session's stop path signals the adapter process directly (libc).
+libc = "0.2"
 
 [dev-dependencies]
 # The headless gpui harness (TestAppContext / VisualTestContext): the M7

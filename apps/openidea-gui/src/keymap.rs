@@ -72,7 +72,15 @@ pub static BINDINGS: &[Binding] = &[
     binding!("cmd-f2", "workbench::StopRun", None, Some("run.stop")),
     // ⌃D stays Show Diff here (run.debug needs a debugger — M11; the preset
     // row's keys belong to that milestone's action).
-    binding!("ctrl-d", "workbench::ShowDiff", None, None),
+    // M11: ⌃D retires Show Diff for the preset's run.debug (the M4 note's
+    // deferred retarget); Show Diff stays a palette/menu action.
+    binding!("ctrl-d", "workbench::Debug", None, Some("run.debug")),
+    // The stepping trio + the breakpoint toggle, exactly the preset's keys.
+    binding!("f7", "workbench::DebugStepInto", None, Some("debug.stepInto")),
+    binding!("f8", "workbench::DebugStepOver", None, Some("debug.stepOver")),
+    binding!("f9", "workbench::DebugResume", None, Some("debug.resume")),
+    binding!("cmd-f8", "editor::ToggleBreakpoint", Some("Editor"), Some("debug.toggleBreakpoint")),
+    binding!("alt-cmd-f8", "editor::BreakpointCondition", Some("Editor"), None),
     binding!("cmd-k", "workbench::Commit", None, Some("vcs.commit")),
     binding!("shift-cmd-f", "workbench::FindInFiles", None, Some("find.inPath")),
     binding!("cmd-1", "workbench::ToggleTree", None, Some("toolwindow.project")),
@@ -637,9 +645,6 @@ mod tests {
     #[test]
     fn bound_keys_agree_with_the_preset() {
         let exceptions: &[(&str, &str)] = &[
-            // The app's Show Diff predates run.debug; ⌃D is diff today, the
-            // debugger lands in M11 and the row retargets then.
-            ("workbench::ShowDiff", "ctrl-d"),
             // IDEA leaves reopen-closed-tab unbound; the app keeps its M7 ⇧⌘T.
             ("workbench::ReopenClosedTab", "shift-cmd-t"),
         ];

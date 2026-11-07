@@ -143,6 +143,23 @@ pub enum BusMessage {
         line: u32,
         col_utf16: u32,
     },
+    /// The debug session's state moved (M11): the Debug window's repaint
+    /// signal (stop, continue, output, exit — the reader thread cannot
+    /// touch gpui entities).
+    DebugUpdated,
+    /// A debug start attempt settled (the DAP handshake ran on a background
+    /// thread); the workbench stores the session and raises the Debug window.
+    DebugStarted {
+        name: String,
+        result: IdeResult<std::sync::Arc<crate::debug::DebugSession>>,
+    },
+    /// The editor's breakpoint set changed (⌘F8 / ⌥⌘F8): persist to settings
+    /// and push to the live session.
+    BreakpointsChanged {
+        path: PathBuf,
+        lines: Vec<u32>,
+        conditions: Vec<(u32, String)>,
+    },
 }
 
 /// The UI end of the event bus. Cheap to clone; `send` never blocks

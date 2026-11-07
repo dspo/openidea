@@ -30,6 +30,7 @@ pub const TERMINAL_NEW_TAB: &str = "New Tab";
 pub const TERMINAL_CLOSE_ALL: &str = "Close All Sessions";
 pub const TERMINAL_SPAWN_FAILED: &str = "Cannot start the shell";
 pub const TERMINAL_EXITED: &str = "exited";
+pub const PICKER_DEBUG_PLACEHOLDER: &str = "Debug configuration";
 pub const RUN_STARTING: &str = "starting…";
 pub const RUN_RUNNING: &str = "running · ";
 pub const RUN_EXIT_CODE: &str = "exit code";

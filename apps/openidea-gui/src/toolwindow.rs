@@ -90,8 +90,8 @@ pub const WINDOWS: &[WindowDesc] = &[
     window!("usages", "Find Usages", Search, Bottom, 2, None, OnUse, None, true),
     window!("run", "Run", Play, Bottom, 3, Some(4), Shown, Some("toolwindow.run"), true),
     // -- deferred (data rows only; the milestone that lights them) -----------
-    window!("debug", "Debug", Bug, Bottom, 4, Some(5), Shown, Some("toolwindow.debug"), false),
-    window!("services", "Services", Server, Bottom, 5, Some(8), Shown, Some("toolwindow.services"), false),
+    window!("debug", "Debug", Bug, Bottom, 4, Some(5), Shown, Some("toolwindow.debug"), true),
+    window!("services", "Services", Server, Bottom, 5, Some(8), Shown, Some("toolwindow.services"), true),
     window!("git", "Git", GitBranch, Bottom, 6, Some(9), Shown, Some("toolwindow.git"), false),
     window!("terminal", "Terminal", SquareTerminal, Bottom, 7, None, OnUse, Some("toolwindow.terminal"), true),
     window!("database", "Database", Database, Right, 0, None, Shown, None, false),
@@ -220,9 +220,9 @@ mod tests {
         for (digit, id) in expect {
             assert_eq!(l.slot_window(digit).map(|d| d.id), Some(id), "slot {digit}");
         }
-        // Deferred slots stay dark: no lit window answers 5 / 8 / 9 yet.
-        assert!(l.slot_window(5).is_none());
-        assert!(l.slot_window(8).is_none());
+        // M11 lights Debug (⌘5) and Services (⌘8); Git's ⌘9 stays dark.
+        assert_eq!(l.slot_window(5).map(|d| d.id), Some("debug"));
+        assert_eq!(l.slot_window(8).map(|d| d.id), Some("services"));
         assert!(l.slot_window(9).is_none());
     }
 
@@ -248,7 +248,11 @@ mod tests {
         // Project's button was hidden by the user.
         assert_eq!(left, vec!["bookmarks", "structure", "commit"]);
         let bottom: Vec<&str> = l.stripe_buttons(Anchor::Bottom).iter().map(|(d, _)| d.id).collect();
-        assert_eq!(bottom, vec!["problems", "run"], "find is OnUse and unused; usages has no button yet");
+        assert_eq!(
+            bottom,
+            vec!["problems", "run", "debug", "services"],
+            "find is OnUse and unused; usages has no button yet; M11 lights debug/services"
+        );
     }
 
     #[test]
@@ -257,7 +261,7 @@ mod tests {
         used.used = true;
         let l = layout(&[("find", used)], None, None);
         let bottom: Vec<&str> = l.stripe_buttons(Anchor::Bottom).iter().map(|(d, _)| d.id).collect();
-        assert_eq!(bottom, vec!["problems", "find", "run"]);
+        assert_eq!(bottom, vec!["problems", "find", "run", "debug", "services"]);
     }
 
     #[test]

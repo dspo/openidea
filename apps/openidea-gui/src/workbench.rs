@@ -40,9 +40,11 @@ use ide_vfs::EntryKind;
 
 use crate::actions as acts;
 use crate::actions::{
-    Cancel, CloseTab, FindInFiles, GoToFile, OpenFile, Redo, Run, Save, SearchEverywhere, ShowDiff, StopRun, Undo,
+    Cancel, CloseTab, DebugResume, DebugStepInto, DebugStepOver, FindInFiles, GoToFile, OpenFile, Redo, Run, Save,
+    SearchEverywhere, ShowDiff, StopRun, Undo,
 };
 use crate::bus::{Bus, BusMessage};
+use crate::debug::{self, DebugSession};
 use crate::diff_view::{self, DiffLine};
 use crate::editor::EditorPane;
 use crate::file_tree::{FileTree, Row};
@@ -68,6 +70,8 @@ enum DockPage {
     Usages,
     // M11: the integrated terminal (its window carries the session tabs).
     Terminal,
+    // M11: the debug session's face (the ⌘5 window).
+    Debug,
 }
 
 /// An active dock/tree drag (M7): which handle, where the press started, and
@@ -129,6 +133,9 @@ enum PickerMode {
     Everywhere,
     /// Run configurations (⌃R): pick one, or type a one-off shell command.
     Run,
+    /// ⌃D: the same list, but a pick starts a debug session (the run
+    /// configuration's adapter drives it).
+    Debug,
     // M9 navigation habits: everything below lists workbench state
     // synchronously (no index calls behind it).
     /// ⌘E — recently opened files.
@@ -356,6 +363,13 @@ pub struct Workbench {
     /// until the user closes its tab (kill = the sweep) or the project closes.
     terminals: Vec<TerminalTab>,
     active_terminal: usize,
+    /// The live debug session (M11), if any: the DAP client handle whose
+    /// shared state the Debug window renders. One session at a time (the
+    /// MVP face; the Services window lists it beside the runs).
+    debug: Option<Arc<DebugSession>>,
+    /// The watch input created at debug-pick time (a window-having context)
+    /// and slotted into the session when DebugStarted lands.
+    pending_watch_input: Option<gpui::Entity<InputState>>,
     /// The Find-in-Files dock page (M5), from the first ⇧⌘F until the
     /// project closes; searches run through the bus (the workbench owns the
     /// dirty-buffer snapshot).
@@ -505,6 +519,8 @@ impl Workbench {
             runs: Vec::new(),
             terminals: Vec::new(),
             active_terminal: 0,
+            debug: None,
+            pending_watch_input: None,
             find_panel: None,
             dock_page: DockPage::Run(0),
             drag: Cell::new(None),
@@ -880,12 +896,171 @@ impl Workbench {
         self.open_picker(PickerMode::Run, window, cx);
     }
 
+    /// ⌃D: the Debug palette — the run configurations an adapter tags, one
+    /// pick starts a debug session (IDEA's run.debug).
+    fn on_debug(&mut self, _: &acts::Debug, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_picker(PickerMode::Debug, window, cx);
+    }
+
+    /// Starts a debug session for `config`: the adapter row the config's
+    /// tag names, the launch face the kind derives, the breakpoint set —
+    /// all resolved on the background thread (the DAP handshake blocks
+    /// there); the answer rides DebugStarted.
+    fn start_debug(&mut self, config: RunConfig, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(host) = self.host.clone() else { return };
+        // A live session restarts (IDEA's re-debug face).
+        if let Some(session) = self.debug.take() {
+            session.stop();
+            self.clear_execution_lines(cx);
+        }
+        let adapter_name = config.debug_adapter.clone().unwrap_or_else(|| {
+            // A config without a tag falls back to its language's row (the
+            // target program's extension decides).
+            String::new()
+        });
+        let Some(dbg_cfg) = host
+            .languages
+            .all()
+            .into_iter()
+            .find_map(|lang| lang.debugger.clone().filter(|d| adapter_name.is_empty() || d.adapter == adapter_name))
+            .or_else(|| host.languages.all().into_iter().find_map(|lang| lang.debugger.clone()))
+        else {
+            self.toast(NotifyLevel::Warning, "No debug adapter for this configuration");
+            return;
+        };
+        let Some(start) = debug::debug_start(&config, &host.root) else {
+            self.toast(NotifyLevel::Warning, "This configuration cannot start a debug session");
+            return;
+        };
+        let breakpoints: debug::FileBreakpointSet = self
+            .settings
+            .breakpoints
+            .iter()
+            .filter(|(path, bp)| !bp.lines.is_empty() && Path::new(path.as_str()).starts_with(&host.root))
+            .map(|(path, bp)| (PathBuf::from(path.as_str()), bp.lines.clone(), bp.conditions.clone()))
+            .collect();
+        let spec = debug::adapter_spec(&dbg_cfg, debug::free_port());
+        // The watch input is created here (a window-having context) and
+        // slots into the session when its start settles.
+        self.pending_watch_input = Some(cx.new(|cx| InputState::new(window, cx).placeholder("watch expression")));
+        let bus = self.bus.clone();
+        let runtime = host.runtime.clone();
+        let config_name = config.name.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let mut start = start;
+                // cargo's build prep: the executable the JSON stream names.
+                if let Some(build) = start.build_command.take() {
+                    let output =
+                        std::process::Command::new(&build[0]).args(&build[1..]).current_dir(&start.target.cwd).output();
+                    let outcome = match output {
+                        Ok(out) => {
+                            let text = String::from_utf8_lossy(&out.stdout).into_owned()
+                                + String::from_utf8_lossy(&out.stderr).as_ref();
+                            debug::cargo_executable(&text)
+                                .ok_or_else(|| "cargo build produced no executable".to_string())
+                        }
+                        Err(e) => Err(format!("cargo build: {e}")),
+                    };
+                    match outcome {
+                        Ok(exe) => start.target.program = exe,
+                        Err(e) => {
+                            bus.send(BusMessage::DebugStarted {
+                                name: config_name.clone(),
+                                result: Err(ide_core::IdeError::internal(e)),
+                            });
+                            return;
+                        }
+                    }
+                }
+                let session = debug::DebugSession::start(
+                    spec,
+                    start.target,
+                    breakpoints,
+                    config_name.clone(),
+                    debug::DebugEvents::new(bus.clone()),
+                    runtime,
+                );
+                bus.send(BusMessage::DebugStarted { name: config_name, result: session.map(Arc::new) });
+            })
+            .detach();
+    }
+
+    /// The stopped frame's line lands on the matching pane (the execution
+    /// marker); a continue clears every pane's marker.
+    fn sync_debug_faces(&mut self, cx: &mut Context<Self>) {
+        let stopped = self.debug.as_ref().and_then(|d| d.shared.state.lock().unwrap().stopped_at.clone());
+        if let Some((path, line)) = stopped {
+            for tab in &mut self.tabs {
+                if tab.path == path {
+                    tab.pane.update(cx, |pane, cx| pane.set_execution_line(Some(line), cx));
+                } else {
+                    tab.pane.update(cx, |pane, cx| pane.set_execution_line(None, cx));
+                }
+            }
+        } else {
+            self.clear_execution_lines(cx);
+        }
+        cx.notify();
+    }
+
+    fn clear_execution_lines(&mut self, cx: &mut Context<Self>) {
+        for tab in &mut self.tabs {
+            tab.pane.update(cx, |pane, cx| pane.set_execution_line(None, cx));
+        }
+    }
+
+    /// Pushes the current breakpoint set into every open pane (the gutter
+    /// dots; the pane's own toggle updates through the bus round trip).
+    fn push_breakpoints(&mut self, cx: &mut Context<Self>) {
+        for tab in &mut self.tabs {
+            let bp = self.settings.breakpoints.get(&tab.path.to_string_lossy().into_owned()).cloned();
+            tab.pane.update(cx, |pane, cx| pane.set_breakpoints(bp, cx));
+        }
+        cx.notify();
+    }
+
+    /// The stepping trio: F7/F8/F9 against the live session's stopped
+    /// thread. With no session they are inert (IDEA grays them; the action
+    /// registry keeps them discoverable).
+    fn on_debug_step_into(&mut self, _: &DebugStepInto, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.debug_step(debug::StepKind::Into);
+    }
+
+    fn on_debug_step_over(&mut self, _: &DebugStepOver, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.debug_step(debug::StepKind::Over);
+    }
+
+    fn on_debug_resume(&mut self, _: &DebugResume, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.debug_step(debug::StepKind::Resume);
+    }
+
+    fn debug_step(&self, kind: debug::StepKind) {
+        let Some(session) = &self.debug else { return };
+        let Some(thread) = session.stopped_thread() else { return };
+        match kind {
+            debug::StepKind::Into => session.step_in(thread),
+            debug::StepKind::Over => session.step_over(thread),
+            debug::StepKind::Resume => session.continue_run(thread),
+        }
+    }
+
+    /// Stops the debug session (the Debug window's stop button and the
+    /// Services row's).
+    fn stop_debug(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.debug.take() {
+            session.stop();
+            self.clear_execution_lines(cx);
+            cx.notify();
+        }
+    }
+
     /// ⌃⌘R: stops a live run — the selected run tab's, else the first live
     /// one (the dock's Stop button in keymap form).
     fn on_stop_run(&mut self, _: &StopRun, _window: &mut Window, cx: &mut Context<Self>) {
         let selected = match self.dock_page {
             DockPage::Run(index) => self.runs.get(index).cloned(),
-            DockPage::Find | DockPage::Problems | DockPage::Usages | DockPage::Terminal => None,
+            DockPage::Find | DockPage::Problems | DockPage::Usages | DockPage::Terminal | DockPage::Debug => None,
         };
         let target = selected
             .filter(|panel| panel.read(cx).running())
@@ -935,6 +1110,7 @@ impl Workbench {
             DockPage::Find => self.find_panel.is_some(),
             DockPage::Usages => self.usages.is_some(),
             DockPage::Terminal => !self.terminals.is_empty(),
+            DockPage::Debug => self.debug.is_some(),
             DockPage::Problems | DockPage::Run(_) => true,
         };
         if !page_live {
@@ -958,7 +1134,7 @@ impl Workbench {
             self.settings.layout.windows.get(desc.id).cloned().unwrap_or_else(|| WindowState::defaults(desc));
         if desc.id == "project" {
             state.visible = self.settings.layout.tree_visible;
-        } else if matches!(desc.id, "find" | "problems" | "usages" | "run" | "terminal") {
+        } else if matches!(desc.id, "find" | "problems" | "usages" | "run" | "terminal" | "debug") {
             state.visible = self.settings.layout.dock_visible && self.dock_page == self.page_for(desc.id);
         }
         state
@@ -981,6 +1157,7 @@ impl Workbench {
             "find" => DockPage::Find,
             "usages" => DockPage::Usages,
             "terminal" => DockPage::Terminal,
+            "debug" => DockPage::Debug,
             _ => DockPage::Run(self.runs.len().saturating_sub(1)),
         }
     }
@@ -993,6 +1170,7 @@ impl Workbench {
             DockPage::Problems => Some("problems"),
             DockPage::Usages => Some("usages"),
             DockPage::Terminal => Some("terminal"),
+            DockPage::Debug => Some("debug"),
         }
     }
 
@@ -1000,7 +1178,9 @@ impl Workbench {
     /// fields, not the map) and persists.
     fn set_win_state(&mut self, desc: &WindowDesc, state: WindowState, cx: &mut Context<Self>) {
         let stored = match desc.id {
-            "project" | "find" | "problems" | "usages" | "run" | "terminal" => WindowState { visible: false, ..state },
+            "project" | "find" | "problems" | "usages" | "run" | "terminal" | "debug" => {
+                WindowState { visible: false, ..state }
+            }
             _ => state,
         };
         self.settings.layout.windows.insert(desc.id.to_owned(), stored);
@@ -1775,6 +1955,7 @@ impl Workbench {
             PickerMode::Files => strings::PICKER_FILE_PLACEHOLDER,
             PickerMode::Everywhere => strings::PICKER_EVERYWHERE_PLACEHOLDER,
             PickerMode::Run => strings::PICKER_RUN_PLACEHOLDER,
+            PickerMode::Debug => strings::PICKER_DEBUG_PLACEHOLDER,
             PickerMode::RecentFiles => "recent files",
             PickerMode::RecentLocations => "recent locations",
             PickerMode::Bookmarks => "bookmarks",
@@ -1787,7 +1968,7 @@ impl Workbench {
         window.focus(&input.read(cx).presentation().focus_handle().clone(), cx);
         // Run mode caches the configuration list once at open (the detector
         // reads package.json / Cargo.toml / …; fixture-scale work).
-        let configs = if mode == PickerMode::Run {
+        let configs = if matches!(mode, PickerMode::Run | PickerMode::Debug) {
             self.host.as_ref().map(|host| host.run_configs()).unwrap_or_else(|| Ok(Vec::new())).unwrap_or_default()
         } else {
             Vec::new()
@@ -1862,6 +2043,7 @@ impl Workbench {
         if matches!(
             mode,
             PickerMode::Run
+                | PickerMode::Debug
                 | PickerMode::RecentFiles
                 | PickerMode::RecentLocations
                 | PickerMode::Bookmarks
@@ -2036,6 +2218,25 @@ impl Workbench {
         let matches_query = |text: &str| query.is_empty() || fuzzy::match_text(text, query).is_some();
         match picker.mode {
             PickerMode::Run => self.run_rows().0,
+            // The Debug palette lists only the configs a debug adapter tags.
+            PickerMode::Debug => self
+                .picker
+                .as_ref()
+                .map(|picker| {
+                    picker
+                        .configs
+                        .iter()
+                        .filter(|config| config.debug_adapter.is_some())
+                        .filter(|config| {
+                            query.is_empty()
+                                || fuzzy::match_text(&config.name, query).is_some()
+                                || fuzzy::match_text(&config.command, query).is_some()
+                        })
+                        .cloned()
+                        .map(|config| PickerRow::Run(Box::new(config)))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
             PickerMode::RecentFiles => self
                 .recent_files
                 .iter()
@@ -2139,6 +2340,7 @@ impl Workbench {
             return;
         }
         let Some(row) = self.picker_rows().get(selected).cloned() else { return };
+        let debug_pick = self.picker.as_ref().is_some_and(|picker| picker.mode == PickerMode::Debug);
         match row {
             PickerRow::File(file) => {
                 let path = file.path.0;
@@ -2169,11 +2371,19 @@ impl Workbench {
             }
             PickerRow::Run(config) => {
                 self.close_picker(window, cx);
-                self.start_run(*config, cx);
+                if debug_pick {
+                    self.start_debug(*config, window, cx);
+                } else {
+                    self.start_run(*config, cx);
+                }
             }
             PickerRow::Shell(line) => {
                 self.close_picker(window, cx);
-                self.start_run(shell_config(line), cx);
+                if debug_pick {
+                    self.start_debug(shell_config(line), window, cx);
+                } else {
+                    self.start_run(shell_config(line), cx);
+                }
             }
             // -- M9 navigation rows -------------------------------------
             PickerRow::RecentFile(path) => {
@@ -2535,7 +2745,7 @@ impl Workbench {
     fn run_status(&self, cx: &Context<Self>) -> Option<(String, gpui::Hsla)> {
         let selected = match self.dock_page {
             DockPage::Run(index) => self.runs.get(index),
-            DockPage::Find | DockPage::Problems | DockPage::Usages | DockPage::Terminal => None,
+            DockPage::Find | DockPage::Problems | DockPage::Usages | DockPage::Terminal | DockPage::Debug => None,
         };
         let panel = selected
             .or_else(|| self.runs.iter().find(|panel| panel.read(cx).running()))
@@ -2666,6 +2876,7 @@ impl Workbench {
             stale: false,
             pinned: false,
         });
+        self.push_breakpoints(cx);
         self.active = Some(self.tabs.len() - 1);
         // Every open feeds the index's recency (the empty palette query lists
         // recent files) and the workbench's own ⌘E list.
@@ -2813,6 +3024,42 @@ impl Workbench {
                         cx.notify();
                     } else if !pending {
                         self.caret_notify.set((last, true));
+                    }
+                }
+            }
+            BusMessage::DebugUpdated => {
+                self.sync_debug_faces(cx);
+            }
+            BusMessage::DebugStarted { name, result } => match result {
+                Ok(session) => {
+                    eprintln!("[debug] session started: {name}");
+                    if let Some(input) = self.pending_watch_input.take() {
+                        *session.shared.watch_input.lock().unwrap() = Some(input);
+                    }
+                    self.debug = Some(session);
+                    self.push_breakpoints(cx);
+                    self.open_window("debug", cx);
+                    self.sync_debug_faces(cx);
+                }
+                Err(e) => {
+                    self.toast(NotifyLevel::Warning, format!("Debug failed: {}", e.message));
+                }
+            },
+            BusMessage::BreakpointsChanged { path, lines, conditions } => {
+                let key = path.to_string_lossy().into_owned();
+                if lines.is_empty() {
+                    self.settings.breakpoints.remove(&key);
+                } else {
+                    self.settings.breakpoints.insert(key, settings::FileBreakpoints { lines, conditions });
+                }
+                settings::save(&self.settings);
+                self.push_breakpoints(cx);
+                if let Some(session) = &self.debug {
+                    let lines = self.settings.breakpoints.get(&path.to_string_lossy().into_owned());
+                    if let Some(bp) = lines {
+                        session.set_breakpoints(&path, &bp.lines, &bp.conditions);
+                    } else {
+                        session.set_breakpoints(&path, &[], &[]);
                     }
                 }
             }
@@ -3996,6 +4243,10 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_toggle_commit))
             .on_action(cx.listener(Self::on_toggle_terminal))
             .on_action(cx.listener(Self::on_new_terminal_tab))
+            .on_action(cx.listener(Self::on_debug))
+            .on_action(cx.listener(Self::on_debug_step_into))
+            .on_action(cx.listener(Self::on_debug_step_over))
+            .on_action(cx.listener(Self::on_debug_resume))
             .on_action(cx.listener(Self::on_trust_project))
             .on_action(cx.listener(Self::on_dont_open_project))
             .on_action(cx.listener(Self::on_reopen_closed_tab))
@@ -4422,6 +4673,8 @@ impl Workbench {
             "usages" => self.render_usages_body(cx),
             "run" => Some(self.render_run_body(cx)),
             "terminal" => self.render_terminal_body(cx),
+            "debug" => self.render_debug_body(cx),
+            "services" => self.render_services_body(cx),
             _ => None,
         }
     }
@@ -4980,7 +5233,7 @@ impl Workbench {
             .selected_index(match self.dock_page {
                 DockPage::Run(index) => index,
                 DockPage::Find => self.runs.len(),
-                DockPage::Problems | DockPage::Usages | DockPage::Terminal => 0,
+                DockPage::Problems | DockPage::Usages | DockPage::Terminal | DockPage::Debug => 0,
             })
             .on_click(cx.listener(|this, index: &usize, _, cx| {
                 let runs = this.runs.len();
@@ -5094,6 +5347,355 @@ impl Workbench {
                 .flex_col()
                 .child(header)
                 .child(div().flex_1().min_h_0().min_w_0().overflow_hidden().child(view))
+                .into_any_element(),
+        )
+    }
+
+    /// The Debug window's body (M11): the session header (phase, adapter,
+    /// Stop), the variables of the stopped frame, the call stack, the watch
+    /// expression, and the console. IDEA's four-section face, minimal.
+    fn render_debug_body(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let session = self.debug.clone()?;
+        let state = session.shared.state.lock().unwrap().clone();
+        let workbench = cx.entity().downgrade();
+        let phase = match state.phase {
+            debug::DebugPhase::Starting => "starting",
+            debug::DebugPhase::Running => "running",
+            debug::DebugPhase::Stopped => "stopped",
+            debug::DebugPhase::Exited => "exited",
+        };
+        let stopped = state.phase == debug::DebugPhase::Stopped;
+        let thread = state.thread_id;
+
+        // Variables: the first scope's rows (locals).
+        let mut sections: Vec<gpui::AnyElement> = Vec::new();
+        sections.push(self.debug_section_header("Variables"));
+        if stopped && !state.scopes.is_empty() {
+            let rows = session.shared.variables();
+            if rows.is_empty() {
+                sections.push(self.debug_muted_row("no locals reported"));
+            }
+            for var in rows {
+                sections.push(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .pl_4()
+                        .text_size(px(12.))
+                        .child(
+                            div()
+                                .text_color(theme::syntax_color(crate::highlight::Kind::Property))
+                                .child(SharedString::from(var.name.clone())),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_ellipsis()
+                                .text_color(theme::fg())
+                                .child(SharedString::from(var.value.clone())),
+                        )
+                        .into_any_element(),
+                );
+            }
+        } else {
+            sections.push(self.debug_muted_row(if stopped {
+                "no frame"
+            } else {
+                "running — the locals show at a stop"
+            }));
+        }
+
+        // Call stack: frame rows, click jumps to the file:line.
+        sections.push(self.debug_section_header("Call Stack"));
+        if state.frames.is_empty() {
+            sections.push(self.debug_muted_row(if stopped { "no frames" } else { "the stack shows at a stop" }));
+        }
+        for (index, frame) in state.frames.iter().enumerate() {
+            let path = frame.file.clone();
+            let line = frame.line;
+            sections.push(
+                div()
+                    .id(("debug-frame", index))
+                    .flex()
+                    .gap_2()
+                    .pl_4()
+                    .text_size(px(12.))
+                    .text_color(if index == 0 { theme::fg() } else { theme::fg_muted() })
+                    .hover(|h| h.bg(theme::raised_bg()))
+                    .when(path.is_some(), |row| {
+                        let path = path.clone();
+                        row.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            if let Some(path) = &path {
+                                this.open_path(path, cx);
+                                this.jump_active_to(line.saturating_sub(1), 0, cx);
+                            }
+                        }))
+                    })
+                    .child(SharedString::from(frame.name.clone()))
+                    .child(div().text_color(theme::fg_muted()).child(SharedString::from(
+                        match (&frame.file, frame.line) {
+                            (Some(file), l) => format!("{}:{}", file_name(file), l),
+                            (None, l) => l.to_string(),
+                        },
+                    )))
+                    .into_any_element(),
+            );
+        }
+
+        // Watches: the expression input + the evaluate answer lands in the console.
+        sections.push(self.debug_section_header("Watches"));
+        {
+            let input = session.shared.watch_input.lock().unwrap().clone();
+            let workbench2 = workbench.clone();
+            sections.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .pl_2()
+                    .pr_2()
+                    .children(input)
+                    .child(Button::new("watch-eval").icon(IconName::Play).xsmall().ghost().on_click(move |_, _, cx| {
+                        workbench2.update(cx, |this, cx| this.evaluate_watch(cx)).ok();
+                    }))
+                    .into_any_element(),
+            );
+        }
+
+        // Console: the session's collected lines (bounded render).
+        sections.push(self.debug_section_header("Console"));
+        {
+            let skipped = state.console.len().saturating_sub(200);
+            for line in state.console.iter().skip(skipped) {
+                sections.push(
+                    div()
+                        .pl_4()
+                        .text_size(px(11.))
+                        .text_color(theme::fg_muted())
+                        .child(SharedString::from(line.clone()))
+                        .into_any_element(),
+                );
+            }
+        }
+
+        Some(
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .id("debug-body")
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .h_7()
+                        .px_2()
+                        .text_size(px(12.))
+                        .border_b_1()
+                        .border_color(theme::border())
+                        .child(
+                            div().text_color(if stopped { theme::warning() } else { theme::fg_muted() }).child(phase),
+                        )
+                        .child(div().text_color(theme::fg()).child(SharedString::from(state.config_name.clone())))
+                        .child(div().text_color(theme::fg_muted()).child(SharedString::from(state.adapter.clone())))
+                        .child(div().flex_1())
+                        .when(stopped && thread.is_some(), |header| {
+                            let wb = workbench.clone();
+                            header
+                                .child(
+                                    Button::new("debug-step-into")
+                                        .icon(IconName::ArrowDownToLine)
+                                        .xsmall()
+                                        .ghost()
+                                        .tooltip("Step Into (F7)")
+                                        .on_click({
+                                            let wb = wb.clone();
+                                            move |_, _, cx| {
+                                                wb.update(cx, |this, _| this.debug_step(debug::StepKind::Into)).ok();
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    Button::new("debug-step-over")
+                                        .icon(IconName::ArrowDown)
+                                        .xsmall()
+                                        .ghost()
+                                        .tooltip("Step Over (F8)")
+                                        .on_click({
+                                            let wb = wb.clone();
+                                            move |_, _, cx| {
+                                                wb.update(cx, |this, _| this.debug_step(debug::StepKind::Over)).ok();
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    Button::new("debug-resume")
+                                        .icon(IconName::Play)
+                                        .xsmall()
+                                        .ghost()
+                                        .tooltip("Resume (F9)")
+                                        .on_click({
+                                            let wb = wb.clone();
+                                            move |_, _, cx| {
+                                                wb.update(cx, |this, _| this.debug_step(debug::StepKind::Resume)).ok();
+                                            }
+                                        }),
+                                )
+                        })
+                        .child(
+                            Button::new("debug-stop")
+                                .icon(IconName::Square)
+                                .xsmall()
+                                .ghost()
+                                .tooltip("Stop debugging")
+                                .on_click({
+                                    let wb = workbench.clone();
+                                    move |_, _, cx| {
+                                        wb.update(cx, |this, cx| this.stop_debug(cx)).ok();
+                                    }
+                                }),
+                        ),
+                )
+                .children(sections)
+                .into_any_element(),
+        )
+    }
+
+    fn debug_section_header(&self, text: &str) -> gpui::AnyElement {
+        div()
+            .pt_2()
+            .pl_2()
+            .text_size(px(11.))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme::fg_muted())
+            .child(SharedString::from(text.to_owned()))
+            .into_any_element()
+    }
+
+    fn debug_muted_row(&self, text: &str) -> gpui::AnyElement {
+        div()
+            .pl_4()
+            .text_size(px(11.))
+            .text_color(theme::fg_muted())
+            .child(SharedString::from(text.to_owned()))
+            .into_any_element()
+    }
+
+    /// The watch input's Enter / the section's play button: evaluate on the
+    /// stopped frame (the answer lands in the console as `[watch]`).
+    fn evaluate_watch(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &self.debug else { return };
+        let expression = session.shared.watch_text(cx);
+        if expression.is_empty() {
+            return;
+        }
+        let frame = session.shared.state.lock().unwrap().frames.first().map(|f| f.id);
+        session.evaluate(&expression, frame);
+    }
+
+    /// The Services window's minimal face (M11): every run and debug session
+    /// in start order, with a stop per row.
+    fn render_services_body(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        let workbench = cx.entity().downgrade();
+        for (index, panel) in self.runs.iter().enumerate() {
+            let panel_state = panel.read(cx);
+            let running = panel_state.running();
+            let label = panel_state.config_name.clone();
+            let stop = running.then(|| {
+                let wb = workbench.clone();
+                Button::new(("services-stop-run", index)).icon(IconName::Square).xsmall().ghost().on_click(
+                    move |_, _, cx| {
+                        wb.update(cx, |this, cx| this.close_run_tab(index, cx)).ok();
+                    },
+                )
+            });
+            rows.push(
+                div()
+                    .id(("services-run", index))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .pl_2()
+                    .h_6()
+                    .text_size(px(12.))
+                    .child(
+                        div()
+                            .text_color(if running { theme::diff_added() } else { theme::fg_muted() })
+                            .child(if running { "running" } else { "exited" }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_ellipsis()
+                            .text_color(theme::fg())
+                            .child(SharedString::from(label)),
+                    )
+                    .children(stop)
+                    .into_any_element(),
+            );
+        }
+        if let Some(session) = &self.debug {
+            let state = session.shared.state.lock().unwrap().clone();
+            let phase = match state.phase {
+                debug::DebugPhase::Starting => "starting",
+                debug::DebugPhase::Running => "running",
+                debug::DebugPhase::Stopped => "stopped",
+                debug::DebugPhase::Exited => "exited",
+            };
+            let wb = workbench.clone();
+            let debug_stop =
+                Button::new("services-stop-debug").icon(IconName::Square).xsmall().ghost().on_click(move |_, _, cx| {
+                    wb.update(cx, |this, cx| this.stop_debug(cx)).ok();
+                });
+            rows.push(
+                div()
+                    .id("services-debug")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .pl_2()
+                    .h_6()
+                    .text_size(px(12.))
+                    .child(
+                        div()
+                            .text_color(match state.phase {
+                                debug::DebugPhase::Exited => theme::fg_muted(),
+                                debug::DebugPhase::Stopped => theme::warning(),
+                                _ => theme::diff_added(),
+                            })
+                            .child(phase),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_ellipsis()
+                            .text_color(theme::fg())
+                            .child(SharedString::from(state.config_name.clone())),
+                    )
+                    .child(debug_stop)
+                    .into_any_element(),
+            );
+        }
+        if rows.is_empty() {
+            return Some(self.render_window_placeholder("No run or debug sessions"));
+        }
+        Some(
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .id("services-body")
+                .overflow_y_scroll()
+                .py_1()
+                .children(rows)
                 .into_any_element(),
         )
     }
@@ -5323,6 +5925,7 @@ impl Workbench {
             "find" => self.find_panel.is_some(),
             "usages" => self.usages.is_some(),
             "terminal" => !self.terminals.is_empty(),
+            "debug" => self.debug.is_some(),
             _ => self.win_state(desc).used,
         };
         if !has_content {
@@ -5513,6 +6116,7 @@ impl Workbench {
         let rows = self.picker_rows();
         let bounds: Vec<(&str, std::ops::Range<usize>)> = match picker.mode {
             PickerMode::Run => vec![("Run", 0..rows.len())],
+            PickerMode::Debug => vec![("Debug", 0..rows.len())],
             PickerMode::Files => vec![("Files", 0..rows.len())],
             PickerMode::Everywhere => vec![
                 ("Files", 0..picker.files.len()),
