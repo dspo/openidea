@@ -3395,6 +3395,7 @@ impl EditorPane {
     /// workbench (persist + push to the live session) through the bus.
     pub fn toggle_breakpoint(&mut self, cx: &mut gpui::Context<Self>) {
         let line = self.caret_line();
+        eprintln!("[debug] toggle breakpoint at line {}", line + 1);
         let created = if self.breakpoints.contains(&line) {
             self.breakpoints.remove(&line);
             self.breakpoint_conditions.retain(|(l, _)| *l != line);

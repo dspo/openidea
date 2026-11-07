@@ -123,6 +123,17 @@ pub fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").ok().and_then(|l| l.local_addr().ok()).map(|a| a.port()).unwrap_or(4711)
 }
 
+/// The adapter family for a bare target (a one-off shell line carries no
+/// adapter tag): the entry file's extension decides.  = unknown.
+pub fn adapter_for_target(program: &Path) -> Option<&'static str> {
+    match program.extension()?.to_str()? {
+        "js" | "mjs" | "cjs" => Some("js-debug"),
+        "py" => Some("debugpy"),
+        "go" => Some("delve"),
+        _ => Some("codelldb"),
+    }
+}
+
 /// The launch request body for an adapter family. The shapes are the
 /// adapters' own脾性 (documented per family in M11-REPORT); the run
 /// configuration supplies program/args/cwd.
@@ -290,6 +301,13 @@ pub(crate) struct SessionShared {
     /// The Watches section's expression input (the workbench creates it in
     /// a window-having context and slots it in).
     pub watch_input: std::sync::Mutex<Option<gpui::Entity<gpui_component::input::InputState>>>,
+    /// The adapter's process, kept alive for the session (a dropped tokio
+    /// Child with kill_on_drop would reap the adapter mid-handshake).
+    pub child: std::sync::Mutex<Option<tokio::process::Child>>,
+    /// The session task's abort handle — armed only by an explicit stop
+    /// (start()'s return must not drop it: that would kill the session the
+    /// moment start reports).
+    pub abort: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl SessionShared {
@@ -306,6 +324,8 @@ impl SessionShared {
 
 impl SessionShared {
     pub fn console_line(&self, line: String) {
+        // The transcript face: the drive asserts on these lines.
+        eprintln!("[debug-console] {line}");
         let mut state = self.state.lock().unwrap();
         state.console.push(line);
         // The console is bounded like every list the window renders.
@@ -590,6 +610,8 @@ impl DebugSession {
             events: events.clone(),
             variables: std::sync::Mutex::new(Vec::new()),
             watch_input: std::sync::Mutex::new(None),
+            child: std::sync::Mutex::new(None),
+            abort: std::sync::Mutex::new(None),
         });
         let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let child_pid = Arc::new(std::sync::Mutex::new(None));
@@ -601,6 +623,9 @@ impl DebugSession {
         // failure through IdeResult; everything later rides the bus.
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
         let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
+        // The abort handle arms only on an explicit stop; start()'s return
+        // must not drop it (that would kill the session as it reports).
+        *shared.abort.lock().unwrap() = Some(abort_tx);
         let task = {
             let shared = shared.clone();
             let seq = seq.clone();
@@ -639,9 +664,7 @@ impl DebugSession {
             .map_err(|_| "the handshake thread died".to_string())
             .and_then(|inner| inner.map_err(|e| e.to_string()));
         let outcome = settle;
-        if outcome.is_err() {
-            let _ = abort_tx.send(());
-        }
+        let _ = outcome;
 
         Ok(Self { shared, seq, req_tx, child_pid, _tasks: vec![task] })
     }
@@ -688,6 +711,9 @@ impl DebugSession {
         let _ = self.req_tx.send(("disconnect".into(), json!({ "terminateDebuggee": true }), None));
         if let Some(pid) = *self.child_pid.lock().unwrap() {
             unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        }
+        if let Some(abort) = self.shared.abort.lock().unwrap().take() {
+            let _ = abort.send(());
         }
         self.shared.set_phase(DebugPhase::Exited);
     }
@@ -780,10 +806,10 @@ async fn run_session_body(
             let child = tokio::process::Command::new(&spec.program)
                 .args(&spec.args)
                 .current_dir(&target.cwd)
-                .kill_on_drop(true)
                 .spawn()
                 .map_err(|e| format!("spawn `{}`: {e}", spec.program))?;
             *child_pid.lock().unwrap() = child.id();
+            *shared.child.lock().unwrap() = Some(child);
             // The adapter owns the socket once it is up; retry briefly.
             let mut stream = None;
             for _ in 0..40 {
@@ -803,12 +829,12 @@ async fn run_session_body(
                 .current_dir(&target.cwd)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .kill_on_drop(true)
                 .spawn()
                 .map_err(|e| format!("spawn `{}`: {e}", spec.program))?;
             *child_pid.lock().unwrap() = child.id();
             let stdin = child.stdin.take().ok_or("adapter stdin missing")?;
             let stdout = child.stdout.take().ok_or("adapter stdout missing")?;
+            *shared.child.lock().unwrap() = Some(child);
             Sides::Pipe(BufReader::new(stdout), stdin)
         }
     };
@@ -919,6 +945,10 @@ async fn run_session_body(
                             }
                             Some(FollowUp::Variables) => {
                                 let vars = parse_variables(message.get("body").unwrap_or(&Value::Null));
+                                shared.console_line(format!(
+                                    "[variables] {}",
+                                    vars.iter().map(|v| format!("{} = {}", v.name, v.value)).collect::<Vec<_>>().join("  ")
+                                ));
                                 *shared.variables.lock().unwrap() = vars;
                                 shared.events.updated();
                             }
@@ -955,16 +985,15 @@ async fn run_session_body(
                                 let thread = message["body"]["threadId"].as_u64().unwrap_or(1);
                                 current_thread = Some(thread);
                                 {
+                                    let reason = message["body"]["reason"].as_str().unwrap_or("?").to_owned();
                                     let mut state = shared.state.lock().unwrap();
                                     state.phase = DebugPhase::Stopped;
                                     state.thread_id = Some(thread);
-                                    state.console.push(format!(
-                                        "[stopped] {} (thread {thread})",
-                                        message["body"]["reason"].as_str().unwrap_or("?"),
-                                    ));
                                     state.stopped_at = None;
                                     state.frames.clear();
                                     state.scopes.clear();
+                                    drop(state);
+                                    shared.console_line(format!("[stopped] {reason} (thread {thread})"));
                                 }
                                 let s = next_seq();
                                 pending.lock().unwrap().insert(s, FollowUp::StackTrace);
@@ -985,8 +1014,9 @@ async fn run_session_body(
                             }
                             "output" => {
                                 let text = message["body"]["output"].as_str().unwrap_or("");
+                                let category = message["body"]["category"].as_str().unwrap_or("stdout");
                                 for line in text.lines() {
-                                    shared.console_line(line.to_owned());
+                                    shared.console_line(format!("[{category}] {line}"));
                                 }
                             }
                             "process" | "thread" => {}
@@ -1064,7 +1094,19 @@ pub fn debug_start(config: &RunConfig, root: &Path) -> Option<DebugStart> {
             module: None,
         }),
         // debugpy: `-m mod` launches the module; a script path launches it.
-        "python" | "pytest" => {
+        "pytest" => Some(DebugStart {
+            spec_adapter: "debugpy".into(),
+            target: DebugTarget {
+                program: PathBuf::new(),
+                args: target_args,
+                cwd,
+                env,
+                module: Some("pytest".into()),
+            },
+            build_command: None,
+            module: Some("pytest".into()),
+        }),
+        "python" => {
             let mut module = None;
             let mut program = PathBuf::new();
             let mut rest = Vec::new();
