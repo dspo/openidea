@@ -245,6 +245,7 @@ fn menu_item_for(name: &str, title: &'static str) -> Option<MenuItem> {
         "workbench::ToggleBookmarks" => Some(MenuItem::action(title, crate::actions::ToggleBookmarks)),
         "workbench::ToggleFind" => Some(MenuItem::action(title, crate::actions::ToggleFind)),
         "workbench::ToggleProblems" => Some(MenuItem::action(title, crate::actions::ToggleProblems)),
+        "workbench::AnalyzeDuplicates" => Some(MenuItem::action(title, crate::actions::AnalyzeDuplicates)),
         "workbench::ToggleStructure" => Some(MenuItem::action(title, crate::actions::ToggleStructure)),
         "workbench::HideActiveToolWindow" => Some(MenuItem::action(title, crate::actions::HideActiveToolWindow)),
         "workbench::MaximizeToolWindow" => Some(MenuItem::action(title, crate::actions::MaximizeToolWindow)),

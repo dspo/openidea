@@ -94,6 +94,9 @@ pub const WINDOWS: &[WindowDesc] = &[
     window!("services", "Services", Server, Bottom, 5, Some(8), Shown, Some("toolwindow.services"), true),
     window!("git", "Git", GitBranch, Bottom, 6, Some(9), Shown, Some("toolwindow.git"), false),
     window!("terminal", "Terminal", SquareTerminal, Bottom, 7, None, OnUse, Some("toolwindow.terminal"), true),
+    // M12: the duplicate-code inspection (the Code menu's Locate
+    // Duplicates… runs the analysis and lights the OnUse button).
+    window!("duplicates", "Duplicates", Copy, Right, 0, None, OnUse, None, true),
     window!("database", "Database", Database, Right, 0, None, Shown, None, false),
     window!("github", "Pull Requests", Github, Right, 1, None, Shown, None, false),
     window!("docker", "Docker", Container, Right, 2, None, Shown, None, false),

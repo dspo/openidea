@@ -46,6 +46,7 @@ use crate::actions::{
 use crate::bus::{Bus, BusMessage};
 use crate::debug::{self, DebugSession};
 use crate::diff_view::{self, DiffLine};
+use crate::duplicates;
 use crate::editor::EditorPane;
 use crate::file_tree::{FileTree, Row};
 use crate::find_panel::FindPanel;
@@ -73,6 +74,8 @@ enum DockPage {
     Terminal,
     // M11: the debug session's face (the ⌘5 window).
     Debug,
+    // M12: the duplicate-code inspection's face (the right stripe).
+    Duplicates,
 }
 
 /// An active dock/tree drag (M7): which handle, where the press started, and
@@ -370,6 +373,11 @@ pub struct Workbench {
     /// until the user closes its tab (kill = the sweep) or the project closes.
     terminals: Vec<TerminalTab>,
     active_terminal: usize,
+    /// The duplicate-code inspection's answer (M12), from the Code menu's
+    /// Locate Duplicates… (the run is background; the Duplicates window
+    /// renders the groups until the project closes).
+    duplicates: Option<duplicates::DuplicatesFace>,
+    duplicates_running: Cell<bool>,
     /// The live debug session (M11), if any: the DAP client handle whose
     /// shared state the Debug window renders. One session at a time (the
     /// MVP face; the Services window lists it beside the runs).
@@ -528,6 +536,8 @@ impl Workbench {
             runs: Vec::new(),
             terminals: Vec::new(),
             active_terminal: 0,
+            duplicates: None,
+            duplicates_running: Cell::new(false),
             debug: None,
             pending_watch_input: None,
             find_panel: None,
@@ -1098,7 +1108,12 @@ impl Workbench {
     fn on_stop_run(&mut self, _: &StopRun, _window: &mut Window, cx: &mut Context<Self>) {
         let selected = match self.dock_page {
             DockPage::Run(index) => self.runs.get(index).cloned(),
-            DockPage::Find | DockPage::Problems | DockPage::Usages | DockPage::Terminal | DockPage::Debug => None,
+            DockPage::Find
+            | DockPage::Problems
+            | DockPage::Usages
+            | DockPage::Terminal
+            | DockPage::Debug
+            | DockPage::Duplicates => None,
         };
         let target = selected
             .filter(|panel| panel.read(cx).running())
@@ -1148,6 +1163,7 @@ impl Workbench {
             DockPage::Find => self.find_panel.is_some(),
             DockPage::Usages => self.usages.is_some(),
             DockPage::Terminal => !self.terminals.is_empty(),
+            DockPage::Duplicates => self.duplicates.is_some(),
             DockPage::Debug => self.debug.is_some(),
             DockPage::Problems | DockPage::Run(_) => true,
         };
@@ -1196,6 +1212,7 @@ impl Workbench {
             "usages" => DockPage::Usages,
             "terminal" => DockPage::Terminal,
             "debug" => DockPage::Debug,
+            "duplicates" => DockPage::Duplicates,
             _ => DockPage::Run(self.runs.len().saturating_sub(1)),
         }
     }
@@ -1209,6 +1226,7 @@ impl Workbench {
             DockPage::Usages => Some("usages"),
             DockPage::Terminal => Some("terminal"),
             DockPage::Debug => Some("debug"),
+            DockPage::Duplicates => Some("duplicates"),
         }
     }
 
@@ -2794,6 +2812,56 @@ impl Workbench {
         self.launch_run(index, effective, cx);
     }
 
+    /// Code › Locate Duplicates…: the project's files walk on the
+    /// background executor, then `ide-analysis`'s clone detection. The
+    /// answer rides DuplicatesReady (the Duplicates window opens on the
+    /// first use).
+    fn on_analyze_duplicates(&mut self, _: &acts::AnalyzeDuplicates, _window: &mut Window, cx: &mut Context<Self>) {
+        eprintln!("[duplicates] action fired");
+        if self.duplicates_running.get() {
+            return;
+        }
+        let Some(host) = self.host.clone() else {
+            self.toast(NotifyLevel::Warning, strings::NO_PROJECT.to_owned());
+            return;
+        };
+        self.duplicates_running.set(true);
+        self.toast(NotifyLevel::Info, strings::DUPLICATES_RUNNING.to_owned());
+        let bus = self.bus.clone();
+        // The loader prefers an open tab's dirty buffer (find's face).
+        let tabs: Vec<(PathBuf, DocId)> = self.tabs.iter().map(|tab| (tab.path.clone(), tab.doc)).collect();
+        cx.background_executor()
+            .spawn(async move {
+                let paths = duplicates::collect_files(&host);
+                let sources = duplicates::source_files(&host.root, &paths);
+                eprintln!("[duplicates] analyzing {} files", sources.len());
+                let result = {
+                    let syntax = ide_language::Syntax::new();
+                    let loader = move |path: &Path| -> Option<(ide_core::LanguageId, String)> {
+                        for (open, doc) in &tabs {
+                            if open == path
+                                && let Ok(info) = host.snapshot(*doc)
+                            {
+                                return Some((host.languages.detect(path, None), info.text));
+                            }
+                        }
+                        let text = std::fs::read_to_string(path).ok()?;
+                        Some((host.languages.detect(path, None), text))
+                    };
+                    ide_analysis::find_duplicates(
+                        &syntax,
+                        &sources,
+                        &loader,
+                        &ide_analysis::DuplicateOptions::default(),
+                        &ide_core::CancellationToken::new(),
+                    )
+                };
+                bus.send(BusMessage::DuplicatesReady { result: Ok(duplicates::DuplicatesFace::from_report(result)) });
+            })
+            .detach();
+        cx.notify();
+    }
+
     /// The run gutter's ▶ click: the project's test configuration for the
     /// document's language runs the one test (⌥-click: the file's suite).
     fn run_test_at(
@@ -2924,7 +2992,12 @@ impl Workbench {
     fn run_status(&self, cx: &Context<Self>) -> Option<(String, gpui::Hsla)> {
         let selected = match self.dock_page {
             DockPage::Run(index) => self.runs.get(index),
-            DockPage::Find | DockPage::Problems | DockPage::Usages | DockPage::Terminal | DockPage::Debug => None,
+            DockPage::Find
+            | DockPage::Problems
+            | DockPage::Usages
+            | DockPage::Terminal
+            | DockPage::Debug
+            | DockPage::Duplicates => None,
         };
         let panel = selected
             .or_else(|| self.runs.iter().find(|panel| panel.read(cx).running()))
@@ -3377,6 +3450,31 @@ impl Workbench {
             }
             BusMessage::RunTestAt { doc, name, container, file_run } => {
                 self.run_test_at(doc, &name, container.as_deref(), file_run, cx);
+            }
+            BusMessage::DuplicatesReady { result } => {
+                self.duplicates_running.set(false);
+                match result {
+                    Ok(face) => {
+                        eprintln!(
+                            "[duplicates] {} groups over {} files (truncated={})",
+                            face.groups.len(),
+                            face.files,
+                            face.truncated
+                        );
+                        let analyzed = !face.groups.is_empty();
+                        self.duplicates = Some(face);
+                        // First use earns the Duplicates window its stripe.
+                        if analyzed {
+                            self.open_window("duplicates", cx);
+                        } else {
+                            self.toast(NotifyLevel::Info, strings::DUPLICATES_NONE.to_owned());
+                        }
+                    }
+                    Err(e) => {
+                        self.toast(NotifyLevel::Error, format!("{}: {}", strings::DUPLICATES_FAILED, e.message));
+                    }
+                }
+                cx.notify();
             }
             BusMessage::GitStatus { statuses, branch } => {
                 self.git_refreshing.set(false);
@@ -4525,6 +4623,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_toggle_commit))
             .on_action(cx.listener(Self::on_toggle_terminal))
             .on_action(cx.listener(Self::on_new_terminal_tab))
+            .on_action(cx.listener(Self::on_analyze_duplicates))
             .on_action(cx.listener(Self::on_debug))
             .on_action(cx.listener(Self::on_debug_step_into))
             .on_action(cx.listener(Self::on_debug_step_over))
@@ -4957,6 +5056,7 @@ impl Workbench {
             "terminal" => self.render_terminal_body(cx),
             "debug" => self.render_debug_body(cx),
             "services" => self.render_services_body(cx),
+            "duplicates" => self.render_duplicates_body(cx),
             _ => None,
         }
     }
@@ -5607,7 +5707,9 @@ impl Workbench {
             .selected_index(match self.dock_page {
                 DockPage::Run(index) => index,
                 DockPage::Find => self.runs.len(),
-                DockPage::Problems | DockPage::Usages | DockPage::Terminal | DockPage::Debug => 0,
+                DockPage::Problems | DockPage::Usages | DockPage::Terminal | DockPage::Debug | DockPage::Duplicates => {
+                    0
+                }
             })
             .on_click(cx.listener(|this, index: &usize, _, cx| {
                 let runs = this.runs.len();
@@ -6067,6 +6169,130 @@ impl Workbench {
                 .flex()
                 .flex_col()
                 .id("services-body")
+                .overflow_y_scroll()
+                .py_1()
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
+    /// The Duplicates window's body (M12): group headers (tokens · lines ·
+    /// language · N fragments) with member rows; a member click jumps, a
+    /// group's 对照 chip opens the first two fragments in the diff overlay.
+    fn render_duplicates_body(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let Some(face) = self.duplicates.clone() else {
+            return Some(self.render_window_placeholder(strings::DUPLICATES_HINT));
+        };
+        if face.groups.is_empty() {
+            return Some(self.render_window_placeholder(strings::DUPLICATES_NONE));
+        }
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        rows.push(
+            div()
+                .h(px(20.0))
+                .px_2()
+                .flex()
+                .items_center()
+                .text_size(px(10.0))
+                .text_color(theme::fg_muted())
+                .child(SharedString::from(format!(
+                    "{} groups · {} files scanned{}",
+                    face.groups.len(),
+                    face.files,
+                    if face.truncated { " · truncated" } else { "" }
+                )))
+                .into_any_element(),
+        );
+        let workbench = cx.entity().downgrade();
+        for (index, group) in face.groups.iter().enumerate() {
+            rows.push(
+                div()
+                    .h(px(22.0))
+                    .px_2()
+                    .mt_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child(div().flex_1().min_w_0().truncate().text_color(theme::fg()).child(SharedString::from(
+                        format!(
+                            "#{} · {} tokens · {} lines · {} · {} fragments",
+                            index + 1,
+                            group.tokens,
+                            group.lines,
+                            group.language,
+                            group.members.len()
+                        ),
+                    )))
+                    .when(group.members.len() >= 2, |header| {
+                        let wb = workbench.clone();
+                        let first = group.members[0].text.clone();
+                        let second = group.members[1].text.clone();
+                        let title = format!("#{} · {}", index + 1, group.language);
+                        header.child(
+                            Button::new(("duplicates-diff", index))
+                                .icon(IconName::Diff)
+                                .xsmall()
+                                .ghost()
+                                .tooltip("Compare the first two fragments")
+                                .on_click(move |_, _, cx| {
+                                    wb.update(cx, |this, cx| {
+                                        this.diff = Some(DiffState {
+                                            title: format!("{title} · {}", strings::TEST_DIFF_TITLE),
+                                            lines: crate::diff_view::from_texts(&first, &second),
+                                        });
+                                        this.diff_focus_pending.set(true);
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                }),
+                        )
+                    })
+                    .into_any_element(),
+            );
+            for (member_index, member) in group.members.iter().enumerate() {
+                let jump = member.path.clone();
+                let line = member.line;
+                let col = member.col;
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("duplicates-member-{index}-{member_index}")))
+                        .h(px(22.0))
+                        .pl(px(24.0))
+                        .pr_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_size(px(12.))
+                        .hover(|h| h.bg(theme::raised_bg()))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.push_nav(cx);
+                            this.open_path(&jump, cx);
+                            this.jump_active_to(line, col, cx);
+                            this.focus_active(window, cx);
+                        }))
+                        .child(
+                            div().truncate().text_color(theme::fg()).child(SharedString::from(member.rel_path.clone())),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.0))
+                                .text_color(theme::fg_muted())
+                                .child(SharedString::from(format!("{}:{}", member.line + 1, member.col + 1))),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+        Some(
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .id("duplicates-body")
                 .overflow_y_scroll()
                 .py_1()
                 .children(rows)

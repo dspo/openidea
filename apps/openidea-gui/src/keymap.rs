@@ -94,6 +94,10 @@ pub static BINDINGS: &[Binding] = &[
     // M11: the terminal window rides the preset's Alt+F12 row.
     binding!("alt-f12", "workbench::ToggleTerminal", None, Some("toolwindow.terminal")),
     binding!("ctrl-cmd-t", "workbench::NewTerminalTab", None, None),
+    // M12: Locate Duplicates (no IDEA preset row — the ⌃⌘T precedent for
+    // app-added keys; ⌘⇧D is free in the preset and unambiguous on macOS,
+    // where ⌥-modified letters arrive composed).
+    binding!("cmd-shift-d", "workbench::AnalyzeDuplicates", None, None),
     binding!("shift-escape", "workbench::HideActiveToolWindow", None, Some("toolwindow.hideActive")),
     // The preset's Meta+Shift+' converts to the shifted face (the macOS
     // physical-key rule: ⌘⇧' produces `"` and drops the shift).

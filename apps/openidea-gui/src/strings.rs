@@ -43,6 +43,11 @@ pub const TEST_TREE_WAITING: &str = "waiting for the runner's output…";
 pub const TEST_DIFF_TITLE: &str = "expected vs actual";
 pub const TEST_RERUN_FAILED: &str = "Cannot rerun this node";
 pub const TEST_NO_CONFIG: &str = "No test configuration for this language";
+// The duplicate-code inspection (M12).
+pub const DUPLICATES_HINT: &str = "Code › Locate Duplicates… scans the project";
+pub const DUPLICATES_NONE: &str = "No duplicate code found";
+pub const DUPLICATES_RUNNING: &str = "Scanning for duplicate code…";
+pub const DUPLICATES_FAILED: &str = "Duplicate scan failed";
 // The Run picker's synthetic row for a one-off shell command line.
 pub const RUN_SHELL_PREFIX: &str = "Run command: ";
 // Git (M4).

@@ -10,6 +10,7 @@ mod actions;
 mod bus;
 mod debug;
 mod diff_view;
+mod duplicates;
 mod editor;
 mod file_tree;
 mod find_panel;
