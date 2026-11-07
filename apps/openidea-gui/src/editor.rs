@@ -1120,6 +1120,10 @@ pub struct EditorPane {
     /// The caret position last reported to the status bar (M10's line:col
     /// widget): the render-time emission dedupes against it.
     reported_caret: Cell<(u32, u32)>,
+    // The IME echo deduper (M11 phase 0.5): a pass-through input method's
+    // echo insert (same text, same dispatch batch) is dropped — see
+    // `crate::ime` and docs/m11-design-notes.md Part 1.
+    ime_dedup: crate::ime::ImeEchoDeduper,
     rename: Option<RenameFlow>,
     // Code actions (M5 phase 3): the open quick-fix menu and its selection.
     code_actions: Option<(Vec<ide_lsp::types::CodeAction>, usize)>,
@@ -1231,6 +1235,7 @@ impl EditorPane {
             hints_by_line: RefCell::new(std::collections::HashMap::new()),
             bus,
             hud: Hud::default(),
+            ime_dedup: crate::ime::ImeEchoDeduper::default(),
             created_at: std::time::Instant::now(),
             first_paint_done: Cell::new(false),
         };
@@ -3383,6 +3388,10 @@ impl EditorPane {
         cx: &mut gpui::Context<Self>,
     ) {
         self.hud.note_input();
+        // A composition owns the input until its commit: its commit may
+        // legitimately reproduce the last raw character, so the echo deduper
+        // stands down (crate::ime).
+        self.ime_dedup.disarm();
         let caret = self.selections.first().map_or(0, |s| s.head);
         let base = range_utf16.clone().or_else(|| self.buf.marked.clone()).unwrap_or(caret..caret);
         let (marked, change) = self.buf.replace(base, new_text);
@@ -3410,6 +3419,14 @@ impl EditorPane {
     /// the marked range) or inserts at the primary cursor.
     fn ime_commit(&mut self, range_utf16: Option<Range<usize>>, text: &str, cx: &mut gpui::Context<Self>) {
         self.hud.note_input();
+        // A commit with no marked text is the IME's per-character delivery
+        // (macOS's plain insertText). The echo deduper guards it too — the
+        // defensive arm for a snapshot that routes echoes back through the
+        // IME channel instead of key events (crate::ime).
+        if self.buf.marked.is_none() && !self.ime_dedup.allows(text, crate::ime::now_ms()) {
+            eprintln!("[ime] commit echo deduped: {:?}", text);
+            return;
+        }
         // The commit replaces what the pane holds selected. An empty IME
         // range (plain `insertText`, macOS commits per character) with no
         // marked text means the primary selection is the composed range —
@@ -4136,7 +4153,15 @@ impl EditorPane {
             return;
         }
         if let Some(text) = ks.key_char.as_ref() {
-            self.insert_text(text, cx);
+            let now = crate::ime::now_ms();
+            // Held repeats bypass the echo window (they arrive faster than it
+            // and are the platform's own duplication, not an IME's).
+            if ev.is_held || self.ime_dedup.allows(text, now) {
+                self.insert_text(text, cx);
+                self.ime_dedup.note_raw(text, now);
+            } else {
+                eprintln!("[ime] key echo deduped: {:?}", text);
+            }
         }
     }
 

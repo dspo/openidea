@@ -15,6 +15,7 @@ mod find_panel;
 mod fuzzy;
 mod highlight;
 mod host;
+mod ime;
 mod keymap;
 // The preset tables: the active one binds; the other three stay as data for
 // the Settings keymap page (M14), re-synced by the generator.
