@@ -433,3 +433,44 @@ fn underline_and_inverse_style_flags() {
         sys::ghostty_terminal_free(term);
     }
 }
+
+/// The OSC 8 hyperlink lookup (M12's ⌘-click face): a terminal fed an OSC 8
+/// sequence exposes the URI at the labeled cell and nothing at the others.
+#[test]
+fn hyperlink_uri_at_reads_the_labeled_cell() {
+    unsafe {
+        let mut term: sys::GhosttyTerminal = std::ptr::null_mut();
+        check(sys::ghostty_terminal_new(std::ptr::null(), &mut term, 80, 5));
+        // The OSC 8 END face is the spec's empty-URI form (`]8;;` + ST); a
+        // bare ST leaks the link onto the following cells.
+        let content = b"\x1b]8;;https://example.com/m12\x1b\\CLICK-ME\x1b]8;;\x1b\\\r\nplain row\r\n";
+        sys::ghostty_terminal_vt_write(term, content.as_ptr(), content.len());
+
+        let point = |col: u16, row: u32| sys::GhosttyPoint {
+            tag: sys::GHOSTTY_POINT_TAG_VIEWPORT,
+            value: sys::GhosttyPointValue { coordinate: sys::GhosttyPointCoordinate { x: col, y: row } },
+        };
+        let uri_at = |col: u16, row: u32| -> Option<String> {
+            let mut grid_ref = sys::GhosttyGridRef::default();
+            check(sys::ghostty_terminal_grid_ref(term, point(col, row), &mut grid_ref));
+            let mut len: usize = 0;
+            let rc = sys::ghostty_grid_ref_hyperlink_uri(&grid_ref, std::ptr::null_mut(), 0, &mut len);
+            if rc == sys::GHOSTTY_SUCCESS && len == 0 {
+                return None;
+            }
+            assert_eq!(rc, sys::GHOSTTY_OUT_OF_SPACE, "the URI length probe");
+            let mut buf = vec![0u8; len];
+            let mut written: usize = 0;
+            check(sys::ghostty_grid_ref_hyperlink_uri(&grid_ref, buf.as_mut_ptr(), buf.len(), &mut written));
+            buf.truncate(written);
+            Some(String::from_utf8(buf).expect("utf8 uri"))
+        };
+
+        // The labeled cells (C-L-I-C-K-'-'-M-E at row 0, columns 0..7) carry
+        // the URI; the plain row below carries none.
+        assert_eq!(uri_at(0, 0).as_deref(), Some("https://example.com/m12"));
+        assert_eq!(uri_at(7, 0).as_deref(), Some("https://example.com/m12"));
+        assert_eq!(uri_at(0, 1), None, "the plain row has no hyperlink");
+        sys::ghostty_terminal_free(term);
+    }
+}

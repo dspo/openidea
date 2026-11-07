@@ -195,6 +195,52 @@ impl Terminal {
         flags
     }
 
+    /// Whether any mouse tracking mode is active (X10/normal/button/any) —
+    /// the programs that consume clicks themselves.
+    pub fn mouse_tracking(&self) -> bool {
+        let mut on: bool = false;
+        unsafe {
+            let _ = sys::ghostty_terminal_get(
+                self.term,
+                sys::GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING,
+                &mut on as *mut _ as *mut c_void,
+            );
+        }
+        on
+    }
+
+    /// The OSC 8 hyperlink URI under a viewport cell (0-based col/row),
+    /// `None` when the cell carries no hyperlink. The renderer's own
+    /// coordinates are the same viewport face, so clicks map directly.
+    pub fn hyperlink_uri_at(&self, col: u16, row: u32) -> Option<String> {
+        let point = sys::GhosttyPoint {
+            tag: sys::GHOSTTY_POINT_TAG_VIEWPORT,
+            value: sys::GhosttyPointValue { coordinate: sys::GhosttyPointCoordinate { x: col, y: row } },
+        };
+        let mut grid_ref = sys::GhosttyGridRef::default();
+        let rc = unsafe { sys::ghostty_terminal_grid_ref(self.term, point, &mut grid_ref) };
+        if rc != sys::GHOSTTY_SUCCESS {
+            return None;
+        }
+        // The URI's byte length first (the out-of-space retry), then the read.
+        let mut len: usize = 0;
+        let rc = unsafe { sys::ghostty_grid_ref_hyperlink_uri(&grid_ref, std::ptr::null_mut(), 0, &mut len) };
+        if rc == sys::GHOSTTY_SUCCESS && len == 0 {
+            return None;
+        }
+        if rc != sys::GHOSTTY_OUT_OF_SPACE || len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len];
+        let mut written: usize = 0;
+        let rc = unsafe { sys::ghostty_grid_ref_hyperlink_uri(&grid_ref, buf.as_mut_ptr(), buf.len(), &mut written) };
+        if rc != sys::GHOSTTY_SUCCESS {
+            return None;
+        }
+        buf.truncate(written);
+        String::from_utf8(buf).ok().filter(|uri| !uri.is_empty())
+    }
+
     /// Paste text: handles bracketed-paste mode and unsafe-paste rejection
     /// internally. Returns whether the bytes were written to the pty.
     pub fn paste(&self, text: &str) -> Result<bool, c_int> {

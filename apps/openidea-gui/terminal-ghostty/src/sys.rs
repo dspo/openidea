@@ -99,6 +99,8 @@ pub const GHOSTTY_TERMINAL_DATA_CURSOR_X: c_int = 3;
 pub const GHOSTTY_TERMINAL_DATA_CURSOR_Y: c_int = 4;
 pub const GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN: c_int = 6;
 pub const GHOSTTY_TERMINAL_DATA_KITTY_KEYBOARD_FLAGS: c_int = 8;
+/// Whether any mouse tracking mode is active (terminal.h).
+pub const GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING: c_int = 11;
 pub const GHOSTTY_TERMINAL_DATA_TITLE: c_int = 12;
 pub const GHOSTTY_TERMINAL_DATA_PWD: c_int = 13;
 pub const GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS: c_int = 15;
@@ -166,6 +168,68 @@ unsafe extern "C" {
     pub fn ghostty_terminal_get(terminal: GhosttyTerminal, data: c_int, out: *mut c_void) -> c_int;
     pub fn ghostty_terminal_vt_write(terminal: GhosttyTerminal, data: *const u8, len: usize);
     pub fn ghostty_terminal_scroll_viewport(terminal: GhosttyTerminal, behavior: GhosttyTerminalScrollViewport);
+    pub fn ghostty_terminal_grid_ref(
+        terminal: GhosttyTerminal,
+        point: GhosttyPoint,
+        out_ref: *mut GhosttyGridRef,
+    ) -> c_int;
+    pub fn ghostty_grid_ref_hyperlink_uri(
+        grid_ref: *const GhosttyGridRef,
+        buf: *mut u8,
+        buf_len: usize,
+        out_len: *mut usize,
+    ) -> c_int;
+}
+
+// --- point.h + grid_ref.h: the click-position face (OSC 8 hyperlinks) ---
+
+/// `GHOSTTY_POINT_TAG_*` (point.h): the visible viewport coordinates.
+pub const GHOSTTY_POINT_TAG_VIEWPORT: c_int = 1;
+
+/// A coordinate in the terminal grid (point.h).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyPointCoordinate {
+    /// Column (0-indexed).
+    pub x: u16,
+    /// Row (0-indexed).
+    pub y: u32,
+}
+
+/// Point reference tag (point.h).
+pub type GhosttyPointTag = c_int;
+
+/// Tagged union for a point in the terminal grid (point.h).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyPoint {
+    pub tag: GhosttyPointTag,
+    pub value: GhosttyPointValue,
+}
+
+/// The point's value union (point.h): the coordinate face.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union GhosttyPointValue {
+    pub coordinate: GhosttyPointCoordinate,
+    pub _padding: [u64; 2],
+}
+
+/// A resolved reference to a terminal cell position (grid_ref.h, sized).
+#[repr(C)]
+pub struct GhosttyGridRef {
+    pub size: usize,
+    pub node: *mut c_void,
+    pub x: u16,
+    pub y: u16,
+}
+
+impl Default for GhosttyGridRef {
+    fn default() -> Self {
+        let mut r: GhosttyGridRef = unsafe { std::mem::zeroed() };
+        r.size = std::mem::size_of::<GhosttyGridRef>();
+        r
+    }
 }
 
 // --- paste (paste.h) ---
