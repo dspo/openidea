@@ -24,6 +24,12 @@ pub const PICKER_RUN_PLACEHOLDER: &str = "Run configuration, or a shell command 
 pub const PICKER_NO_MATCHES: &str = "No matches";
 // The Run dock.
 pub const RUN_TITLE: &str = "Run";
+// M11 terminal window.
+pub const TERMINAL_LOCAL: &str = "Local";
+pub const TERMINAL_NEW_TAB: &str = "New Tab";
+pub const TERMINAL_CLOSE_ALL: &str = "Close All Sessions";
+pub const TERMINAL_SPAWN_FAILED: &str = "Cannot start the shell";
+pub const TERMINAL_EXITED: &str = "exited";
 pub const RUN_STARTING: &str = "starting…";
 pub const RUN_RUNNING: &str = "running · ";
 pub const RUN_EXIT_CODE: &str = "exit code";

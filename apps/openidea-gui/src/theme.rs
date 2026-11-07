@@ -188,3 +188,14 @@ pub fn git_status_color(kind: ide_vcs::ChangeKind) -> Option<gpui::Hsla> {
 pub fn diff_added() -> gpui::Hsla {
     rgba((GIT_ADDED << 8) | 0xff).into()
 }
+
+// The terminal surface's palette (M11): the app's dark greys bridge into the
+// ghostty core's RGB (programs' own palette/OSC colors still win per-index;
+// these are the defaults the render state resolves against).
+pub fn terminal_fg() -> terminal_ghostty::Rgb {
+    terminal_ghostty::Rgb::new(0xd1, 0xd3, 0xd9)
+}
+
+pub fn terminal_bg() -> terminal_ghostty::Rgb {
+    terminal_ghostty::Rgb::new(0x19, 0x1a, 0x1c)
+}
