@@ -33,6 +33,10 @@ mod semantic;
 mod settings;
 mod strings;
 mod templates;
+// The test-tree data plane (M12): lands before its UI face (the tree window
+// reads it next commit); the parse tests pin every field meanwhile.
+#[allow(dead_code)]
+mod test_tree;
 mod theme;
 mod toolwindow;
 mod workbench;
