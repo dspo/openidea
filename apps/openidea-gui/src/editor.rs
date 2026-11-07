@@ -1124,6 +1124,13 @@ pub struct EditorPane {
     // echo insert (same text, same dispatch batch) is dropped — see
     // `crate::ime` and docs/m11-design-notes.md Part 1.
     ime_dedup: crate::ime::ImeEchoDeduper,
+    // M11 debugger faces: this file's breakpoint rows (0-based), their
+    // conditions, the stopped frame's line (the execution band), and the
+    // condition input overlay (⌥⌘F8; Enter confirms, Esc cancels).
+    breakpoints: std::collections::BTreeSet<u32>,
+    breakpoint_conditions: Vec<(u32, String)>,
+    execution_line: Option<u32>,
+    condition_input: Option<(u32, gpui::Entity<InputState>)>,
     rename: Option<RenameFlow>,
     // Code actions (M5 phase 3): the open quick-fix menu and its selection.
     code_actions: Option<(Vec<ide_lsp::types::CodeAction>, usize)>,
@@ -1236,6 +1243,10 @@ impl EditorPane {
             bus,
             hud: Hud::default(),
             ime_dedup: crate::ime::ImeEchoDeduper::default(),
+            breakpoints: std::collections::BTreeSet::new(),
+            breakpoint_conditions: Vec::new(),
+            execution_line: None,
+            condition_input: None,
             created_at: std::time::Instant::now(),
             first_paint_done: Cell::new(false),
         };
@@ -3352,6 +3363,101 @@ impl EditorPane {
     }
 
     /// Replaces the pane's diagnostics (the workbench merges the producers).
+    /// The workbench's breakpoint snapshot for this file (the gutter dots).
+    pub fn set_breakpoints(&mut self, bp: Option<crate::settings::FileBreakpoints>, cx: &mut gpui::Context<Self>) {
+        match bp {
+            Some(bp) => {
+                self.breakpoints = bp.lines.into_iter().collect();
+                self.breakpoint_conditions = bp.conditions;
+            }
+            None => {
+                self.breakpoints.clear();
+                self.breakpoint_conditions.clear();
+            }
+        }
+        cx.notify();
+    }
+
+    /// The stopped frame's line (the full-width execution band); `None`
+    /// clears it (continue / session end).
+    pub fn set_execution_line(&mut self, line: Option<u32>, cx: &mut gpui::Context<Self>) {
+        self.execution_line = line;
+        cx.notify();
+    }
+
+    /// The primary caret's 0-based line (the breakpoint actions' target).
+    fn caret_line(&self) -> u32 {
+        let caret = self.selections.first().map_or(0, |s| s.head);
+        self.buf.line_of(caret)
+    }
+
+    /// ⌘F8: toggles the breakpoint on the caret line and tells the
+    /// workbench (persist + push to the live session) through the bus.
+    pub fn toggle_breakpoint(&mut self, cx: &mut gpui::Context<Self>) {
+        let line = self.caret_line();
+        let created = if self.breakpoints.contains(&line) {
+            self.breakpoints.remove(&line);
+            self.breakpoint_conditions.retain(|(l, _)| *l != line);
+            false
+        } else {
+            self.breakpoints.insert(line);
+            true
+        };
+        let _ = created;
+        self.emit_breakpoints(cx);
+    }
+
+    /// ⌥⌘F8: the condition editor for the caret line's breakpoint (created
+    /// when absent). Enter stores it (empty clears), Esc cancels.
+    pub fn start_breakpoint_condition(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        if self.condition_input.is_some() {
+            return;
+        }
+        let line = self.caret_line();
+        let current =
+            self.breakpoint_conditions.iter().find(|(l, _)| *l == line).map(|(_, c)| c.clone()).unwrap_or_default();
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("condition, empty clears"));
+        let len = current.len();
+        input.update(cx, |state, cx| {
+            state.set_value(current, window, cx);
+            state.set_selected_range(0..len, cx);
+        });
+        self.condition_input = Some((line, input));
+        cx.notify();
+    }
+
+    /// Enter on the condition input: stores the condition and closes.
+    fn condition_confirm(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some((line, input)) = self.condition_input.take() else { return };
+        let condition = input.read(cx).value().to_string();
+        if condition.is_empty() {
+            self.breakpoint_conditions.retain(|(l, _)| *l != line);
+        } else if let Some(entry) = self.breakpoint_conditions.iter_mut().find(|(l, _)| *l == line) {
+            entry.1 = condition;
+        } else {
+            self.breakpoint_conditions.push((line, condition));
+        }
+        self.emit_breakpoints(cx);
+    }
+
+    /// Esc on the condition input.
+    fn condition_cancel(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        if self.condition_input.take().is_some() {
+            window.focus(&self.focus, cx);
+            cx.notify();
+        }
+    }
+
+    /// The breakpoint set back to the workbench (persist + live session).
+    fn emit_breakpoints(&mut self, cx: &mut gpui::Context<Self>) {
+        self.bus.send(crate::bus::BusMessage::BreakpointsChanged {
+            path: self.path.clone(),
+            lines: self.breakpoints.iter().copied().collect(),
+            conditions: self.breakpoint_conditions.clone(),
+        });
+        cx.notify();
+    }
+
     pub fn set_diagnostics(&mut self, merged: Vec<Diagnostic>, cx: &mut gpui::Context<Self>) {
         self.diagnostics = merged;
         self.hover.set(None);
@@ -3542,6 +3648,21 @@ impl EditorPane {
         }
         if self.buf.marked.is_some() {
             return;
+        }
+        // The breakpoint condition input is modal the same way.
+        if self.condition_input.is_some() {
+            match cmd {
+                Command::Newline => {
+                    self.condition_confirm(cx);
+                    window.focus(&self.focus, cx);
+                    return;
+                }
+                Command::Cancel => {
+                    self.condition_cancel(window, cx);
+                    return;
+                }
+                _ => return,
+            }
         }
         // The rename input is modal: Enter confirms, Esc cancels; typing goes
         // through the input's own handler (it holds focus via render).
@@ -4914,6 +5035,10 @@ impl Render for EditorPane {
                 cx.listener(|this, _: &acts::TogglePerfHud, window, cx| this.command(Command::ToggleHud, window, cx)),
             )
             .on_action(cx.listener(|this, _: &acts::Cancel, window, cx| this.command(Command::Cancel, window, cx)))
+            .on_action(cx.listener(|this, _: &acts::ToggleBreakpoint, _, cx| this.toggle_breakpoint(cx)))
+            .on_action(cx.listener(|this, _: &acts::BreakpointCondition, window, cx| {
+                this.start_breakpoint_condition(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &acts::Newline, window, cx| this.command(Command::Newline, window, cx)))
             .on_action(cx.listener(|this, _: &acts::TabIndent, window, cx| this.command(Command::Tab, window, cx)))
             .on_action(
@@ -5079,6 +5204,7 @@ impl Render for EditorPane {
             .children(self.render_find_bar(window, cx))
             // Rename: input overlay, then the workspace-edit preview.
             .children(self.render_rename(window, cx))
+            .children(self.render_condition_input(window, cx))
             .on_action(cx.listener(|this, _: &acts::GotoDefinition, _, cx| this.goto_definition(cx)))
             .on_action(cx.listener(|this, _: &acts::GotoImplementation, _, cx| this.goto_implementation(cx)))
             .on_action(cx.listener(|this, _: &acts::GotoTypeDeclaration, _, cx| this.goto_type_declaration(cx)))
@@ -5250,6 +5376,39 @@ impl EditorPane {
                     cx.stop_propagation()
                 })
                 .child(body)
+                .into_any_element(),
+        )
+    }
+
+    fn render_condition_input(&self, window: &mut Window, cx: &mut gpui::Context<Self>) -> Option<gpui::AnyElement> {
+        let geometry = self.geometry.get()?;
+        let Some((line, input)) = &self.condition_input else { return None };
+        // The input keeps focus while the overlay is up (the rename shape).
+        let handle = input.read(cx).presentation().focus_handle().clone();
+        if window.focused(cx).is_none_or(|f| f != handle) {
+            window.focus(&handle, cx);
+        }
+        // A fixed anchor like the rename overlay: the line number in the
+        // label carries the context, so no row math is wanted.
+        let _ = line;
+        Some(
+            gpui::div()
+                .absolute()
+                .left(geometry.origin.x + px(80.0))
+                .top(geometry.origin.y + px(60.0))
+                .w(px(360.0))
+                .border_1()
+                .border_color(theme::warning())
+                .bg(theme::raised_bg())
+                .p_2()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(gpui::div().text_size(px(11.)).text_color(theme::fg_muted()).child(SharedString::from(format!(
+                    "Breakpoint condition on line {} — Enter stores, Esc cancels",
+                    line + 1
+                ))))
+                .child(Input::new(input))
                 .into_any_element(),
         )
     }
@@ -5661,6 +5820,10 @@ struct PrepaintState {
     chevrons: Vec<(u32, bool)>,
     /// Gutter diagnostic marks: (display row, strongest severity on the line).
     diag_marks: Vec<(u32, Severity)>,
+    /// Gutter breakpoint dots: the display rows with a breakpoint.
+    breakpoint_marks: Vec<u32>,
+    /// The stopped frame's full-width band (M11's current-line highlight).
+    execution_rect: Option<Bounds<Pixels>>,
     /// The primary cursor's buffer line, for the brighter gutter number.
     caret_line: u32,
     gutter_w: Pixels,
@@ -6027,6 +6190,8 @@ impl Element for EditorElement {
         let mut rows = Vec::with_capacity((last - first) as usize);
         let mut chevrons = Vec::new();
         let mut diag_marks = Vec::new();
+        let mut breakpoint_marks = Vec::new();
+        let mut execution_rect = None;
         let mut frame_max_w = px(0.0);
         let mut hinted_rows = 0u32;
         pane.hints_by_line.borrow_mut().clear();
@@ -6057,6 +6222,18 @@ impl Element for EditorElement {
                     }
                     if let Some(severity) = mark {
                         diag_marks.push((display, severity));
+                    }
+                    // The M11 breakpoint dot rides the same visible-row walk.
+                    if pane.breakpoints.contains(&line) {
+                        breakpoint_marks.push(display);
+                    }
+                    // The execution band's rect (full width; the paint pass
+                    // emits it under the text).
+                    if pane.execution_line == Some(line) {
+                        execution_rect = Some(Bounds::new(
+                            point(bounds.origin.x, bounds.origin.y + line_height * (display as f32 - first as f32)),
+                            size(bounds.size.width, line_height),
+                        ));
                     }
                     let runs = line_runs(&content, span, marked.clone(), line_start_byte, &pane.spans, &line_diags, fg);
                     // Inlay hints join the row text inline: split the runs at
@@ -6272,6 +6449,8 @@ impl Element for EditorElement {
             find_rects,
             chevrons,
             diag_marks,
+            breakpoint_marks,
+            execution_rect,
             caret_line: caret_buffer_line,
             gutter_w,
             numbers_w,
@@ -6300,6 +6479,11 @@ impl Element for EditorElement {
             // Selections under the text, then the rows (shifted left by the
             // horizontal scroll), then the gutter (repainted over any text
             // scrolled under it), then the carets and the scrollbars.
+            // The execution band under everything (M11): the accent row of
+            // the stopped frame.
+            if let Some(rect) = &prepaint.execution_rect {
+                window.paint_quad(fill(*rect, rgba_of(theme::SELECTION_BG)));
+            }
             for (rect, current) in &prepaint.find_rects {
                 let color = if *current { theme::find_current_bg() } else { theme::find_bg() };
                 window.paint_quad(fill(*rect, color));
@@ -6345,6 +6529,12 @@ impl Element for EditorElement {
                 let shaped = window.text_system().shape_line(glyph.into(), font_size, &[run], None);
                 let y = origin.y + line_height * (*display as f32 - geometry.scroll);
                 let _ = shaped.paint(point(gutter_x + px(2.0), y), line_height, TextAlign::Left, None, window, cx);
+            }
+            // Breakpoint dots (M11): a red circle at the gutter's left edge.
+            for display in &prepaint.breakpoint_marks {
+                let y = origin.y + line_height * (*display as f32 - geometry.scroll);
+                let dot = Bounds::new(point(gutter_x + px(5.0), y + px(5.0)), size(px(8.0), px(8.0)));
+                window.paint_quad(fill(dot, theme::error()));
             }
             // Diagnostic marks: a severity-colored bar at the gutter's right
             // edge, before the separator.

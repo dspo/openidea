@@ -51,6 +51,65 @@ pub struct Settings {
     /// Status bar widget visibility (M10's right-click menu), id -> shown.
     /// Missing ids follow the widget's default (shown).
     pub status_widgets: BTreeMap<String, bool>,
+    /// Gutter breakpoints (M11), path -> the lines (0-based rows) and the
+    /// per-line condition strings. IDE-global like bookmarks; written on
+    /// toggle only.
+    pub breakpoints: BTreeMap<String, FileBreakpoints>,
+}
+
+/// One file's breakpoints: the guarded lines plus the conditions some of
+/// them carry (an entry without a condition is an unconditional stop).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FileBreakpoints {
+    pub lines: Vec<u32>,
+    #[serde(default)]
+    pub conditions: Vec<(u32, String)>,
+}
+
+// The mutation face rides the editor's own set and the bus payload; these
+// helpers are the pure semantics the tests pin (M12's test tree reuses them).
+#[allow(dead_code)]
+impl FileBreakpoints {
+    /// Whether `line` is guarded (unconditionally or with a condition).
+    pub fn has(&self, line: u32) -> bool {
+        self.lines.contains(&line)
+    }
+
+    /// Toggles `line`; returns the new presence. A condition entry for the
+    /// line is cleared when the breakpoint goes away.
+    pub fn toggle(&mut self, line: u32) -> bool {
+        if let Some(pos) = self.lines.iter().position(|l| *l == line) {
+            self.lines.remove(pos);
+            self.conditions.retain(|(l, _)| *l != line);
+            false
+        } else {
+            self.lines.push(line);
+            self.lines.sort_unstable();
+            true
+        }
+    }
+
+    /// Sets (or clears, when `condition` is empty) the condition on `line`;
+    /// creates the breakpoint when it was not set.
+    pub fn set_condition(&mut self, line: u32, condition: &str) {
+        if condition.is_empty() {
+            self.conditions.retain(|(l, _)| *l != line);
+            return;
+        }
+        if !self.has(line) {
+            self.toggle(line);
+        }
+        if let Some(entry) = self.conditions.iter_mut().find(|(l, _)| *l == line) {
+            entry.1 = condition.to_owned();
+        } else {
+            self.conditions.push((line, condition.to_owned()));
+        }
+    }
+
+    /// The condition on `line`, if any.
+    pub fn condition_of(&self, line: u32) -> Option<&str> {
+        self.conditions.iter().find(|(l, _)| *l == line).map(|(_, c)| c.as_str())
+    }
 }
 
 /// One project's restored session (M8): the tabs in open order, the active
@@ -119,6 +178,7 @@ impl Default for Settings {
             commit_messages: Vec::new(),
             trusted_projects: Vec::new(),
             status_widgets: BTreeMap::new(),
+            breakpoints: BTreeMap::new(),
         }
     }
 }
@@ -144,6 +204,8 @@ struct Store {
     trusted_projects: Vec<String>,
     #[serde(default)]
     status_widgets: BTreeMap<String, bool>,
+    #[serde(default)]
+    breakpoints: BTreeMap<String, FileBreakpoints>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -346,6 +408,7 @@ fn from_store(store: Store) -> Settings {
         commit_messages: store.commit_messages,
         trusted_projects: store.trusted_projects,
         status_widgets: store.status_widgets,
+        breakpoints: store.breakpoints,
     }
 }
 
@@ -385,6 +448,7 @@ pub fn save(settings: &Settings) {
         commit_messages: settings.commit_messages.clone(),
         trusted_projects: settings.trusted_projects.clone(),
         status_widgets: settings.status_widgets.clone(),
+        breakpoints: settings.breakpoints.clone(),
     };
     let Ok(json) = serde_json::to_string_pretty(&store) else { return };
     if let Some(parent) = path.parent()
@@ -600,6 +664,7 @@ mod tests {
             commit_messages: vec!["initial".to_owned()],
             trusted_projects: vec!["/tmp/m10-trusted".to_owned()],
             status_widgets: BTreeMap::new(),
+            breakpoints: BTreeMap::new(),
         };
         let store = Store {
             recent_projects: settings.recent_projects.clone(),
@@ -620,6 +685,7 @@ mod tests {
             commit_messages: settings.commit_messages.clone(),
             trusted_projects: settings.trusted_projects.clone(),
             status_widgets: settings.status_widgets.clone(),
+            breakpoints: BTreeMap::new(),
         };
         let back: Store = serde_json::from_str(&serde_json::to_string(&store).unwrap()).unwrap();
         assert_eq!(back.recent_projects, settings.recent_projects);
