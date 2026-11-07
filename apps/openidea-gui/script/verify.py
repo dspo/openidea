@@ -269,6 +269,7 @@ class LinuxDriver:
         self.wayland_display = None
         self.sway_sock = None
         self.output = None
+        self.kbd_holder = None
 
     # -- session lifecycle --
 
@@ -316,12 +317,31 @@ class LinuxDriver:
         # `position 0,0` is a sway parse error. --custom because the
         # headless output advertises no mode list.
         self._swaymsg(f"output {self.output} mode --custom {self.OUTPUT_W}x{self.OUTPUT_H}")
+        # A persistent do-nothing virtual keyboard. The seat of a headless
+        # sway owns no devices, and per-invocation wtype clients add and
+        # destroy theirs within milliseconds — after which the seat loses
+        # its keyboard capability again and keystrokes stop reaching the
+        # focused window. Holding one open keeps the capability (and the
+        # keyboard focus it implies) alive for the whole session.
+        self.kbd_holder = subprocess.Popen(
+            ["wtype", "-s", "2147483647"],
+            env=self._env(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         time.sleep(0.5)
 
     def amend_env(self, env):
         env["WAYLAND_DISPLAY"] = self.wayland_display
 
     def shutdown(self, s):
+        if self.kbd_holder and self.kbd_holder.poll() is None:
+            self.kbd_holder.kill()
+            try:
+                self.kbd_holder.wait(timeout=5)
+            except Exception:
+                pass
+        self.kbd_holder = None
         if self.sway and self.sway.poll() is None:
             try:
                 self._swaymsg("exit")
@@ -467,15 +487,32 @@ class LinuxDriver:
         """Wheel events at the editor's center: swaymsg warps the cursor,
         wlrctl scrolls. Only the perf scenario needs this; the sign follows
         wlrctl's convention (positive dy scrolls content up)."""
-        if not shutil.which("wlrctl"):
-            raise RuntimeError("wlrctl is not installed (`sudo dnf install wlrctl`) — needed for the scroll leg")
         x, y, w, h = self.window_bounds(s)
         cx, cy = int(x + w / 2), int(y + h * 0.45)
-        subprocess.run(["swaymsg", "-s", self.sway_sock, "seat", "seat0", "cursor", "move", "warp", str(cx), str(cy)], env=self._env(), capture_output=True)
+        self.move_pointer(s, cx, cy)
         step = max(1, abs(dy) // 40)
         for _ in range(count):
             subprocess.run(["wlrctl", "pointer", "scroll", str(-step if dy < 0 else step)], env=self._env(), capture_output=True)
             time.sleep(interval)
+
+    def move_pointer(self, s, x, y):
+        """Warps the session cursor to global (x, y)."""
+        subprocess.run(
+            ["swaymsg", "-s", self.sway_sock, "seat", "seat0", "cursor", "move", "warp", str(x), str(y)],
+            env=self._env(),
+            capture_output=True,
+        )
+
+    def click(self, s, x, y):
+        """A left click at window-local coordinates (focus and selection
+        for the scripted legs)."""
+        wx, wy, _, _ = self.window_bounds(s)
+        self.move_pointer(s, wx + x, wy + y)
+        time.sleep(0.1)
+        r = subprocess.run(["wlrctl", "pointer", "click", "left"], env=self._env(), capture_output=True, text=True)
+        if r.returncode != 0 and not shutil.which("wlrctl"):
+            raise RuntimeError("wlrctl is not installed (`sudo dnf install wlrctl`) — needed for clicks")
+        time.sleep(0.15)
 
 
 def make_driver():
@@ -606,6 +643,10 @@ class Session:
         """Scroll-wheel events (pixel units) at the editor's center. The
         cursor moves there first — posted wheel events land at the cursor."""
         self.driver.scroll(self, dy, count, interval)
+
+    def click(self, x, y):
+        """A left click at window-local coordinates (Linux driver)."""
+        self.driver.click(self, x, y)
 
     # -- sampling ----------------------------------------------------------
 
