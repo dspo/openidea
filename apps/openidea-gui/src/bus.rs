@@ -160,6 +160,25 @@ pub enum BusMessage {
         lines: Vec<u32>,
         conditions: Vec<(u32, String)>,
     },
+    /// A test tree case row was activated (M12): open the file (root-relative
+    /// or absolute) at the failure's line when the parser found one.
+    TestJump {
+        file: Option<String>,
+        line: Option<u32>,
+    },
+    /// A failed case's diff chip: the expected/actual pair opens the same
+    /// overlay the ⌃D diff rides (the two texts already extracted).
+    TestDiff {
+        title: String,
+        expected: String,
+        actual: String,
+    },
+    /// A tree node's rerun button: the same configuration restarts with the
+    /// node's filter, replacing the run tab in place.
+    TestRerun {
+        index: usize,
+        filter: crate::test_tree::TestFilter,
+    },
 }
 
 /// The UI end of the event bus. Cheap to clone; `send` never blocks

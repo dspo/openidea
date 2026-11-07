@@ -54,7 +54,8 @@ use crate::host::Host;
 use crate::keymap;
 use crate::navigation;
 use crate::reconcile;
-use crate::run_panel::{RunPanel, stream_of};
+use crate::run_panel::{self, RunPanel, stream_of};
+use crate::test_tree;
 use crate::toolwindow::{self, Anchor, WindowDesc, WindowState};
 use crate::{ProjectHost, settings, strings, theme};
 
@@ -2697,12 +2698,34 @@ impl Workbench {
         };
         let name = config.name.clone();
         let index = self.runs.len();
-        self.runs.push(cx.new(|cx| RunPanel::new(host.clone(), name.clone(), cx)));
+        // A test-tagged configuration derives the structured command (the
+        // JSON/verbose face the tree's parsers read) and carries the session
+        // the Run window renders; the stored configuration stays untouched.
+        let runner = config.is_test.then(|| test_tree::resolve_runner(&config, &host.root)).flatten();
+        let (test, effective) = match runner {
+            Some(runner) => {
+                let report = test_report_path();
+                let test = Arc::new(test_tree::TestRunShared::new(runner, Some(report.clone())));
+                let effective = test_tree::test_run_config(&config, runner, &test_tree::TestFilter::All, Some(&report));
+                (Some(test), effective)
+            }
+            None => (None, config.clone()),
+        };
+        let seed = run_panel::RunPanelSeed { index, config_name: name.clone(), config: Some(config), runner, test };
+        self.runs.push(cx.new(|cx| RunPanel::new(host.clone(), self.bus.clone(), seed, cx)));
         self.dock_page = DockPage::Run(index);
         if !self.settings.layout.dock_visible {
             self.settings.layout.dock_visible = true;
             settings::save(&self.settings);
         }
+        self.launch_run(index, effective, cx);
+    }
+
+    /// The shared launch flow: output routing by dock index, the background
+    /// start, and the elapsed-time ticker (M4; test reruns reuse it).
+    fn launch_run(&mut self, index: usize, config: RunConfig, cx: &mut Context<Self>) {
+        let Some(host) = self.host.clone() else { return };
+        let name = config.name.clone();
         let bus = self.bus.clone();
         let on_output = {
             let bus = bus.clone();
@@ -2740,6 +2763,37 @@ impl Workbench {
         .detach();
         eprintln!("[run] starting {name}");
         cx.notify();
+    }
+
+    /// A tree node's rerun: the panel's stored configuration restarts with
+    /// the node's filter, replacing the tab in place (IDEA's rerun face).
+    fn rerun_test(&mut self, index: usize, filter: test_tree::TestFilter, cx: &mut Context<Self>) {
+        let Some(host) = self.host.clone() else { return };
+        let Some(panel) = self.runs.get(index) else { return };
+        let Some(config) = panel.read(cx).config.clone() else { return };
+        let Some(runner) = test_tree::resolve_runner(&config, &host.root) else {
+            self.toast(NotifyLevel::Warning, strings::TEST_RERUN_FAILED.to_owned());
+            return;
+        };
+        // A live run stops first (its panel is about to be replaced).
+        if let (Some(run_id), true) = (panel.read(cx).run_id, panel.read(cx).running())
+            && let Err(e) = host.stop_run(run_id)
+        {
+            eprintln!("[run] stop: {}", e.message);
+        }
+        let report = test_report_path();
+        let test = Arc::new(test_tree::TestRunShared::new(runner, Some(report.clone())));
+        let effective = test_tree::test_run_config(&config, runner, &filter, Some(&report));
+        let seed = run_panel::RunPanelSeed {
+            index,
+            config_name: effective.name.clone(),
+            config: Some(config),
+            runner: Some(runner),
+            test: Some(test),
+        };
+        self.runs[index] = cx.new(|cx| RunPanel::new(host.clone(), self.bus.clone(), seed, cx));
+        self.dock_page = DockPage::Run(index);
+        self.launch_run(index, effective, cx);
     }
 
     /// Closes a run tab (the tab's close button): a live run stops first.
@@ -3171,9 +3225,45 @@ impl Workbench {
                     let (stream, text) = stream_of(&chunk);
                     panel.update(cx, |panel, cx| {
                         panel.append(stream, text);
+                        // The test tree parses the same stream (stdout lines
+                        // stream-parse; every stream joins the finish tail).
+                        if let Some(test) = &panel.test {
+                            test.feed(stream, text);
+                        }
                         cx.notify();
                     });
                 }
+            }
+            BusMessage::TestJump { file, line } => {
+                // The parser's failure location (absolute for the JSON
+                // reporters, project-relative for pytest/cargo, package-
+                // relative for go). Same nav face as the editor's cross-file
+                // jumps.
+                let Some(path) = file.map(|f| self.resolve_test_file(&f)) else {
+                    cx.notify();
+                    return;
+                };
+                eprintln!("[tests] jump: {}:{:?}", path.display(), line);
+                self.push_nav(cx);
+                self.open_path(&path, cx);
+                if let Some(tab) = self.tabs.iter().find(|tab| tab.path == path) {
+                    tab.pane.update(cx, |pane, cx| pane.jump_to_offset(ide_core::Pos::new(line.unwrap_or(0), 0), cx));
+                }
+                cx.notify();
+            }
+            BusMessage::TestDiff { title, expected, actual } => {
+                let lines = crate::diff_view::from_texts(&expected, &actual);
+                if lines.is_empty() {
+                    cx.notify();
+                    return;
+                }
+                eprintln!("[tests] diff overlay: {title} ({} lines)", lines.len());
+                self.diff = Some(DiffState { title, lines });
+                self.diff_focus_pending.set(true);
+                cx.notify();
+            }
+            BusMessage::TestRerun { index, filter } => {
+                self.rerun_test(index, filter, cx);
             }
             BusMessage::GitStatus { statuses, branch } => {
                 self.git_refreshing.set(false);
@@ -3373,6 +3463,16 @@ impl Workbench {
                 if let Some(panel) = mine {
                     panel.update(cx, |panel, cx| {
                         panel.exited(code);
+                        // The whole-document parsers settle here (JSON
+                        // reports, pytest's FAILURES section).
+                        if let Some(test) = &panel.test {
+                            test.finish();
+                            let state = test.state.lock().unwrap();
+                            eprintln!(
+                                "[tests] finished: {} passed / {} failed / {} skipped",
+                                state.summary.passed, state.summary.failed, state.summary.skipped
+                            );
+                        }
                         cx.notify();
                     });
                     self.toast(NotifyLevel::Info, format!("{} {code:?}", strings::RUN_EXITED));
@@ -4002,6 +4102,46 @@ fn quoted(name: &str) -> String {
 
 fn file_name(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
+}
+
+/// The JSON report file one test run writes (`--outputFile`): unique per
+/// start, under the platform temp dir, read once at the run's exit.
+fn test_report_path() -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    std::env::temp_dir().join(format!("openidea-gui-test-report-{nonce}.json"))
+}
+
+impl Workbench {
+    /// The failure location's project face: absolute paths pass through; a
+    /// direct root join wins; otherwise the runner-relative face (go reports
+    /// per package directory) resolves over the project index — suffix
+    /// match first, then a bare file-name match.
+    fn resolve_test_file(&self, raw: &str) -> PathBuf {
+        let p = PathBuf::from(raw);
+        if p.is_absolute() {
+            return p;
+        }
+        if let Some(host) = &self.host {
+            let joined = host.root.join(&p);
+            if joined.exists() {
+                return joined;
+            }
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let candidates = host.index.find_files(&name, 8);
+            for candidate in &candidates {
+                if candidate.path.0.to_string_lossy().ends_with(raw) {
+                    return candidate.path.0.clone();
+                }
+            }
+            for candidate in &candidates {
+                if candidate.path.0.file_name() == p.file_name() {
+                    return candidate.path.0.clone();
+                }
+            }
+            return joined;
+        }
+        p
+    }
 }
 
 /// One font-size step, clamped to the settings' range.
