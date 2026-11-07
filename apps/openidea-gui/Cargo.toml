@@ -93,6 +93,10 @@ rfd = "0.15"
 # M7 settings (recents, layout, font size): one JSON file, serde-shaped.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# M11: the integrated terminal's emulation core — libghostty-vt (statically
+# linked via its build.rs) behind a self-drawn GPUI element, as a sub-crate
+# of this app tree (the root exclude already covers the whole directory).
+terminal-ghostty = { path = "terminal-ghostty" }
 
 [dev-dependencies]
 # The headless gpui harness (TestAppContext / VisualTestContext): the M7

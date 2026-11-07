@@ -66,6 +66,8 @@ enum DockPage {
     // references answer.
     Problems,
     Usages,
+    // M11: the integrated terminal (its window carries the session tabs).
+    Terminal,
 }
 
 /// An active dock/tree drag (M7): which handle, where the press started, and
@@ -98,6 +100,14 @@ struct ServerRow {
     name: String,
     status: ServerStatus,
     message: Option<String>,
+}
+
+/// One open terminal session (M11): the view entity with the OSC title the
+/// program claimed (None = the "Local" fallback label) and its exit flag.
+struct TerminalTab {
+    view: Entity<terminal_ghostty::GhosttyView>,
+    title: Option<String>,
+    exited: bool,
 }
 
 /// An action row of the palette: the registry entry plus its local fuzzy hit.
@@ -341,6 +351,11 @@ pub struct Workbench {
     /// output streams through the bus. A panel lives until the project closes
     /// or the user closes its tab (which stops a live run).
     runs: Vec<Entity<RunPanel>>,
+    /// The integrated terminal's sessions (M11), in tab order; the active
+    /// one renders under the window's "Local × + ▾" header. A session lives
+    /// until the user closes its tab (kill = the sweep) or the project closes.
+    terminals: Vec<TerminalTab>,
+    active_terminal: usize,
     /// The Find-in-Files dock page (M5), from the first ⇧⌘F until the
     /// project closes; searches run through the bus (the workbench owns the
     /// dirty-buffer snapshot).
@@ -488,6 +503,8 @@ impl Workbench {
             picker_sub: None,
             picker_gen: 0,
             runs: Vec::new(),
+            terminals: Vec::new(),
+            active_terminal: 0,
             find_panel: None,
             dock_page: DockPage::Run(0),
             drag: Cell::new(None),
@@ -868,7 +885,7 @@ impl Workbench {
     fn on_stop_run(&mut self, _: &StopRun, _window: &mut Window, cx: &mut Context<Self>) {
         let selected = match self.dock_page {
             DockPage::Run(index) => self.runs.get(index).cloned(),
-            DockPage::Find | DockPage::Problems | DockPage::Usages => None,
+            DockPage::Find | DockPage::Problems | DockPage::Usages | DockPage::Terminal => None,
         };
         let target = selected
             .filter(|panel| panel.read(cx).running())
@@ -917,11 +934,14 @@ impl Workbench {
         let page_live = match self.dock_page {
             DockPage::Find => self.find_panel.is_some(),
             DockPage::Usages => self.usages.is_some(),
+            DockPage::Terminal => !self.terminals.is_empty(),
             DockPage::Problems | DockPage::Run(_) => true,
         };
         if !page_live {
             self.dock_page = if self.find_panel.is_some() {
                 DockPage::Find
+            } else if !self.terminals.is_empty() {
+                DockPage::Terminal
             } else {
                 DockPage::Run(self.runs.len().saturating_sub(1))
             };
@@ -938,7 +958,7 @@ impl Workbench {
             self.settings.layout.windows.get(desc.id).cloned().unwrap_or_else(|| WindowState::defaults(desc));
         if desc.id == "project" {
             state.visible = self.settings.layout.tree_visible;
-        } else if matches!(desc.id, "find" | "problems" | "usages" | "run") {
+        } else if matches!(desc.id, "find" | "problems" | "usages" | "run" | "terminal") {
             state.visible = self.settings.layout.dock_visible && self.dock_page == self.page_for(desc.id);
         }
         state
@@ -960,6 +980,7 @@ impl Workbench {
             "problems" => DockPage::Problems,
             "find" => DockPage::Find,
             "usages" => DockPage::Usages,
+            "terminal" => DockPage::Terminal,
             _ => DockPage::Run(self.runs.len().saturating_sub(1)),
         }
     }
@@ -971,6 +992,7 @@ impl Workbench {
             DockPage::Find => Some("find"),
             DockPage::Problems => Some("problems"),
             DockPage::Usages => Some("usages"),
+            DockPage::Terminal => Some("terminal"),
         }
     }
 
@@ -978,7 +1000,7 @@ impl Workbench {
     /// fields, not the map) and persists.
     fn set_win_state(&mut self, desc: &WindowDesc, state: WindowState, cx: &mut Context<Self>) {
         let stored = match desc.id {
-            "project" | "find" | "problems" | "usages" | "run" => WindowState { visible: false, ..state },
+            "project" | "find" | "problems" | "usages" | "run" | "terminal" => WindowState { visible: false, ..state },
             _ => state,
         };
         self.settings.layout.windows.insert(desc.id.to_owned(), stored);
@@ -1220,6 +1242,83 @@ impl Workbench {
 
     fn on_toggle_problems(&mut self, _: &acts::ToggleProblems, _window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_window("problems", cx);
+    }
+
+    fn on_toggle_terminal(&mut self, _: &acts::ToggleTerminal, _window: &mut Window, cx: &mut Context<Self>) {
+        // The first open spawns the first session (the OnUse stripe face).
+        if self.terminals.is_empty() {
+            self.spawn_terminal(cx);
+        }
+        self.toggle_window("terminal", cx);
+    }
+
+    /// Spawns one shell session: the front session's reported cwd (OSC 7)
+    /// when it has one, the project root otherwise. The view's events (OSC
+    /// title/pwd, exit) ride the entity subscription into the tab row.
+    fn spawn_terminal(&mut self, cx: &mut Context<Self>) {
+        let Some(host) = self.host.as_ref() else {
+            self.toast(NotifyLevel::Warning, strings::TERMINAL_SPAWN_FAILED);
+            return;
+        };
+        let cwd = self
+            .terminals
+            .get(self.active_terminal.min(self.terminals.len().saturating_sub(1)))
+            .and_then(|tab| tab.view.read(cx).live_cwd())
+            .and_then(|uri| terminal_cwd_of(&uri))
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| host.root.clone());
+        let view = terminal_ghostty::spawn_ghostty_view(
+            &cwd,
+            terminal_ghostty::Theme { fg: theme::terminal_fg(), bg: theme::terminal_bg() },
+            cx,
+        );
+        let Ok(view) = view else {
+            self.toast(NotifyLevel::Warning, strings::TERMINAL_SPAWN_FAILED);
+            return;
+        };
+        let tab = TerminalTab { view: view.clone(), title: None, exited: false };
+        self.terminals.push(tab);
+        self.active_terminal = self.terminals.len() - 1;
+        cx.subscribe(&view, |this, view, event: &terminal_ghostty::GhosttyEvent, cx| {
+            this.on_terminal_event(view, event, cx);
+        })
+        .detach();
+        eprintln!("[terminal] spawned session {} at {}", self.terminals.len(), cwd.display());
+        cx.notify();
+    }
+
+    /// The terminal view's events into the tab row: the OSC title becomes
+    /// the session label, the exit flag dims it.
+    fn on_terminal_event(
+        &mut self,
+        view: Entity<terminal_ghostty::GhosttyView>,
+        event: &terminal_ghostty::GhosttyEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.terminals.iter().position(|tab| tab.view == view) else {
+            return;
+        };
+        match event {
+            terminal_ghostty::GhosttyEvent::TitleChanged(title) => {
+                self.terminals[index].title = title.clone();
+            }
+            terminal_ghostty::GhosttyEvent::Exited => {
+                self.terminals[index].exited = true;
+                eprintln!("[terminal] session {} exited", index + 1);
+            }
+            terminal_ghostty::GhosttyEvent::PwdChanged(_) => {}
+        }
+        cx.notify();
+    }
+
+    /// Closes one session (the tab's ×): the kill is the detached sweep.
+    fn close_terminal(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.terminals.get(index) else { return };
+        tab.view.update(cx, |view, _| view.kill());
+        self.terminals.remove(index);
+        self.active_terminal = self.active_terminal.min(self.terminals.len().saturating_sub(1));
+        self.clamp_dock_page();
+        cx.notify();
     }
 
     fn on_toggle_structure(&mut self, _: &acts::ToggleStructure, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2427,7 +2526,7 @@ impl Workbench {
     fn run_status(&self, cx: &Context<Self>) -> Option<(String, gpui::Hsla)> {
         let selected = match self.dock_page {
             DockPage::Run(index) => self.runs.get(index),
-            DockPage::Find | DockPage::Problems | DockPage::Usages => None,
+            DockPage::Find | DockPage::Problems | DockPage::Usages | DockPage::Terminal => None,
         };
         let panel = selected
             .or_else(|| self.runs.iter().find(|panel| panel.read(cx).running()))
@@ -3886,6 +3985,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_hide_active_tool_window))
             .on_action(cx.listener(Self::on_maximize_tool_window))
             .on_action(cx.listener(Self::on_toggle_commit))
+            .on_action(cx.listener(Self::on_toggle_terminal))
             .on_action(cx.listener(Self::on_trust_project))
             .on_action(cx.listener(Self::on_dont_open_project))
             .on_action(cx.listener(Self::on_reopen_closed_tab))
@@ -4311,6 +4411,7 @@ impl Workbench {
             "find" => Some(self.find_panel.clone()?.into_any_element()),
             "usages" => self.render_usages_body(cx),
             "run" => Some(self.render_run_body(cx)),
+            "terminal" => self.render_terminal_body(cx),
             _ => None,
         }
     }
@@ -4869,7 +4970,7 @@ impl Workbench {
             .selected_index(match self.dock_page {
                 DockPage::Run(index) => index,
                 DockPage::Find => self.runs.len(),
-                DockPage::Problems | DockPage::Usages => 0,
+                DockPage::Problems | DockPage::Usages | DockPage::Terminal => 0,
             })
             .on_click(cx.listener(|this, index: &usize, _, cx| {
                 let runs = this.runs.len();
@@ -4878,6 +4979,113 @@ impl Workbench {
             }))
             .children(children);
         div().flex_1().min_h_0().flex().flex_col().child(tabs).child(body).into_any_element()
+    }
+
+    /// The Terminal window's body: the "Local × + ▾" session header (IDEA's
+    /// terminal tab strip) over the active view. The view renders the grid
+    /// itself (the ghostty element); focus follows the click, the first
+    /// render takes it.
+    fn render_terminal_body(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if self.terminals.is_empty() {
+            return None;
+        }
+        self.active_terminal = self.active_terminal.min(self.terminals.len() - 1);
+        let active = self.active_terminal;
+        let workbench = cx.entity().downgrade();
+        let mut tabs = Vec::new();
+        for (index, tab) in self.terminals.iter().enumerate() {
+            let label = tab.title.clone().unwrap_or_else(|| strings::TERMINAL_LOCAL.to_owned());
+            tabs.push(
+                div()
+                    .id(("terminal-tab", index))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .h_6()
+                    .px_2()
+                    .rounded(px(4.0))
+                    .text_size(px(12.))
+                    .when(index == active, |chip| chip.bg(theme::selected_bg()))
+                    .when(index != active, |chip| chip.hover(|h| h.bg(theme::raised_bg())))
+                    .text_color(if tab.exited { theme::fg_muted() } else { theme::fg() })
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.active_terminal = index;
+                        cx.notify();
+                    }))
+                    .child(SharedString::from(label))
+                    .when(tab.exited, |chip| {
+                        chip.child(
+                            div().text_size(px(10.)).text_color(theme::fg_muted()).child(strings::TERMINAL_EXITED),
+                        )
+                    })
+                    .child(Button::new(("terminal-tab-close", index)).icon(IconName::Close).xsmall().ghost().on_click(
+                        {
+                            let workbench = workbench.clone();
+                            move |_, _, cx| {
+                                workbench.update(cx, |this, cx| this.close_terminal(index, cx)).ok();
+                            }
+                        },
+                    ))
+                    .into_any_element(),
+            );
+        }
+        let view = self.terminals[active].view.clone();
+        let header = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .h_7()
+            .border_b_1()
+            .border_color(theme::border())
+            .children(tabs)
+            .child(
+                Button::new("terminal-new")
+                    .icon(IconName::Plus)
+                    .xsmall()
+                    .ghost()
+                    .tooltip("New session (follows the front session's directory)")
+                    .on_click({
+                        let workbench = workbench.clone();
+                        move |_, _, cx| {
+                            workbench.update(cx, |this, cx| this.spawn_terminal(cx)).ok();
+                        }
+                    }),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("terminal-menu")
+                    .icon(IconName::EllipsisVertical)
+                    .xsmall()
+                    .ghost()
+                    .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |mut menu, _window, _cx| {
+                        let wb = workbench.clone();
+                        menu = menu.item(PopupMenuItem::new(strings::TERMINAL_NEW_TAB).on_click(move |_, _, cx| {
+                            wb.update(cx, |this, cx| this.spawn_terminal(cx)).ok();
+                        }));
+                        let wb = workbench.clone();
+                        menu = menu.item(PopupMenuItem::new(strings::TERMINAL_CLOSE_ALL).on_click(move |_, _, cx| {
+                            wb.update(cx, |this, cx| {
+                                for index in (0..this.terminals.len()).rev() {
+                                    this.close_terminal(index, cx);
+                                }
+                            })
+                            .ok();
+                        }));
+                        menu
+                    }),
+            );
+        Some(
+            div()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(header)
+                .child(div().flex_1().min_h_0().min_w_0().overflow_hidden().child(view))
+                .into_any_element(),
+        )
     }
 
     /// The muted "nothing here" face of an empty window body.
@@ -5104,6 +5312,7 @@ impl Workbench {
             "run" => !self.runs.is_empty() || self.find_panel.is_some(),
             "find" => self.find_panel.is_some(),
             "usages" => self.usages.is_some(),
+            "terminal" => !self.terminals.is_empty(),
             _ => self.win_state(desc).used,
         };
         if !has_content {
@@ -6237,4 +6446,68 @@ fn flatten_outline(items: &[OutlineItem], depth: usize) -> Vec<(OutlineItem, usi
         .iter()
         .flat_map(|item| std::iter::once((item.clone(), depth)).chain(flatten_outline(&item.children, depth + 1)))
         .collect()
+}
+
+/// The shell's OSC 7 report is a `file://host/path` URI — the path is the
+/// session's working directory (the new-tab cwd). Percent escapes decode;
+/// a non-file URI (or garbage) yields nothing.
+fn terminal_cwd_of(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    // The host component ends at the first slash (localhost or empty); the
+    // slash itself opens the path (file:///tmp → host "", path "/tmp"). A
+    // host-only URI carries no path at all.
+    let raw = rest.split_once('/').map(|(_, p)| p)?;
+    let path = PathBuf::from(format!("/{}", percent_decode(raw)));
+    path.is_absolute().then_some(path)
+}
+
+/// Minimal percent-decoding for the URI path (%XX upper- or lowercase hex).
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len() + 1
+            && let (Some(hi), Some(lo)) = (
+                bytes.get(i + 1).and_then(|b| (*b as char).to_digit(16)),
+                bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16)),
+            )
+        {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+
+    /// The OSC 7 URI the shell integration emits resolves to the session's
+    /// cwd — this is the "new tab follows the front session" data path.
+    #[test]
+    fn osc7_uri_resolves_to_the_working_directory() {
+        assert_eq!(terminal_cwd_of("file://mbp.local/Users/me/dev"), Some(PathBuf::from("/Users/me/dev")));
+        assert_eq!(terminal_cwd_of("file:///tmp/scratch"), Some(PathBuf::from("/tmp/scratch")));
+    }
+
+    /// Percent escapes decode (spaces are the common one in user paths).
+    #[test]
+    fn osc7_uri_decodes_percent_escapes() {
+        assert_eq!(terminal_cwd_of("file://host/Users/me/My%20Files"), Some(PathBuf::from("/Users/me/My Files")));
+    }
+
+    /// Non-file URIs and relative paths yield nothing (the caller falls
+    /// back to the project root).
+    #[test]
+    fn garbage_yields_none() {
+        assert_eq!(terminal_cwd_of("https://example.com/x"), None);
+
+        assert_eq!(terminal_cwd_of("file://localhost"), None);
+    }
 }

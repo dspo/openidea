@@ -1,0 +1,33 @@
+# terminal-ghostty — the M11 integrated terminal's emulation core.
+#
+# A sub-crate of the app (path dependency from src), inside the root
+# `Cargo.toml`'s `exclude` tree by construction: the gpui stack and the zig
+# build must never enter the main workspace's graph. The crate is
+# self-contained — the app supplies its palette (Theme) and consumes events;
+# nothing here reads the app's settings or its other modules.
+[package]
+name = "terminal-ghostty"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "Ghostty-backed terminal surface: libghostty-vt emulation core behind a self-drawn GPUI element"
+links = "ghostty-vt"
+
+[features]
+# The deterministic TestProcess/TestProbe pair for hosts' own tests.
+test-support = []
+
+[dependencies]
+# Same exact pin as the app crate, so the gpui types unify across the path
+# dependency boundary (one tested snapshot, shared with manox-app).
+gpui = { package = "gpui-pre", version = "=0.3.9" }
+libc = "0.2"
+# The same PTY substrate the main workspace's ide-terminal pins (portable-pty
+# 0.9) — the "same seam" the roadmap names; the manager shape differs because
+# this host renders in-process from libghostty-vt instead of xterm.js over IPC.
+portable-pty = "0.9"
+async-channel = "2"
+# Descendant sweep on terminal teardown.
+sysinfo = "0.39"
+unicode-width = "0.2"

@@ -93,7 +93,7 @@ pub const WINDOWS: &[WindowDesc] = &[
     window!("debug", "Debug", Bug, Bottom, 4, Some(5), Shown, Some("toolwindow.debug"), false),
     window!("services", "Services", Server, Bottom, 5, Some(8), Shown, Some("toolwindow.services"), false),
     window!("git", "Git", GitBranch, Bottom, 6, Some(9), Shown, Some("toolwindow.git"), false),
-    window!("terminal", "Terminal", SquareTerminal, Bottom, 7, None, OnUse, None, false),
+    window!("terminal", "Terminal", SquareTerminal, Bottom, 7, None, OnUse, Some("toolwindow.terminal"), true),
     window!("database", "Database", Database, Right, 0, None, Shown, None, false),
     window!("github", "Pull Requests", Github, Right, 1, None, Shown, None, false),
     window!("docker", "Docker", Container, Right, 2, None, Shown, None, false),
