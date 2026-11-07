@@ -179,6 +179,11 @@ pub enum BusMessage {
         index: usize,
         filter: crate::test_tree::TestFilter,
     },
+    /// The duplicate-code analysis finished (M12; it ran on the background
+    /// executor) — the Duplicates window's rows.
+    DuplicatesReady {
+        result: ide_core::IdeResult<crate::duplicates::DuplicatesFace>,
+    },
     /// The run gutter's ▶ click (M12): the editor asks for one test (or,
     /// with ⌥, the file's suite). The workbench matches the project's test
     /// configuration by the document's language and derives the command.

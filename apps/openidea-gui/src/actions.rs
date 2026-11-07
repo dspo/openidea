@@ -47,6 +47,9 @@ actions!(
         // M11: the debugger — the preset's run.debug row (⌃D, the M4 note's
         // deferred retarget) and the stepping trio the preset pins to F7/F8/F9.
         Debug,
+        // M12: the duplicate-code inspection (Code menu; the Duplicates
+        // window earns its OnUse stripe at the first run).
+        AnalyzeDuplicates,
         DebugStepInto,
         DebugStepOver,
         DebugResume,
@@ -232,6 +235,7 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("editor::FindUsages", "Find Usages", "Navigate", "⌥F7"),
     action_info!("editor::Rename", "Rename…", "Refactor", "⇧F6"),
     action_info!("editor::CodeActions", "Quick Fix…", "Refactor", "⌥⏎"),
+    action_info!("workbench::AnalyzeDuplicates", "Locate Duplicates…", "Code", "⌘⇧D"),
     action_info!("editor::FormatDocument", "Format Document", "Code", "⌘⌥L"),
     action_info!("editor::OrganizeImports", "Organize Imports", "Code", "⌃⌥O"),
     action_info!("editor::ToggleInlayHints", "Toggle Inlay Hints", "View", "⌥⌘I"),

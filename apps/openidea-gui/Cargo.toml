@@ -55,6 +55,9 @@ ide-index = { path = "../../crates/ide-index" }
 # M4: run configurations and process management (the same engine the Tauri
 # host's Run tool window drives).
 ide-run = { path = "../../crates/ide-run" }
+# M12: the duplicate-code inspection (ide-analysis's token-based clone
+# detection, the same crate the Tauri host's analysis commands drive).
+ide-analysis = { path = "../../crates/ide-analysis" }
 # M4: the minimal git surface — status / diff / stage / commit through the
 # same Repo the Tauri host's VCS feature drives.
 ide-vcs = { path = "../../crates/ide-vcs" }
