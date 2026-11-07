@@ -40,6 +40,10 @@ actions!(
         ToggleCommit,
         // M11: the integrated terminal window (the preset's Alt+F12 row).
         ToggleTerminal,
+        // A second terminal session (⌃⌘T): no preset row — IDEA reaches the
+        // + button with the mouse; the keymap face exists for scripted
+        // verification and discoverability (the ⌃⌘R precedent).
+        NewTerminalTab,
         TrustProject,
         DontOpenProject,
         // M9 navigation habits.
@@ -206,6 +210,7 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("workbench::MaximizeToolWindow", "Maximize Tool Window", "View", "⌘⇧'"),
     action_info!("workbench::ToggleCommit", "Commit", "VCS", "⌘0"),
     action_info!("workbench::ToggleTerminal", "Terminal", "View", "⌥F12"),
+    action_info!("workbench::NewTerminalTab", "New Terminal Tab", "View", "⌃⌘T"),
     action_info!("editor::Paste", "Paste", "Edit", "⌘V"),
     action_info!("editor::TabIndent", "Indent / Expand Template", "Edit", "⇥"),
     action_info!("editor::OutdentLine", "Outdent Line", "Edit", "⇧⇥"),
