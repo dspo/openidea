@@ -325,8 +325,8 @@ pub fn startup_bindings(
     let mut out = Vec::new();
     for row in BINDINGS {
         let keys = match row.idea_id.and_then(|id| overrides.get(id)) {
-            Some(user) => user.iter().filter_map(|k| keystroke(k)).collect::<Vec<_>>(),
-            None => vec![row.keys.to_owned()],
+            Some(user) => user.iter().filter_map(|k| keystroke(k)).map(|k| registration_keys(&k)).collect::<Vec<_>>(),
+            None => vec![registration_keys(row.keys)],
         };
         for keys in keys {
             out.push((keys, row.action, row.context));
@@ -345,6 +345,28 @@ pub fn keystroke(idea: &str) -> Option<String> {
         steps.push(one_step(step)?);
     }
     Some(steps.join(" "))
+}
+
+/// The face a registered binding carries on this platform. The table (and
+/// the preset data) speak the macOS convention — "cmd" — but gpui's Linux
+/// platforms map the `platform` modifier to Super, and IDEA's Linux habit
+/// is Ctrl, so the primary flips to Ctrl at registration. Steps that
+/// already carry Ctrl keep it (⌃⌘R stays a distinct chord on Linux instead
+/// of collapsing into ⌃R and stealing Run's key).
+fn registration_keys(keys: &str) -> String {
+    if cfg!(target_os = "macos") {
+        return keys.to_owned();
+    }
+    keys.split_whitespace()
+        .map(|step| {
+            let has_ctrl = step.split('-').any(|part| part == "ctrl");
+            step.split('-')
+                .map(|part| if part == "cmd" && !has_ctrl { "ctrl" } else { part })
+                .collect::<Vec<_>>()
+                .join("-")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// One chord step, "Meta+Shift+O" → "shift-cmd-o", macOS conventions.
@@ -647,8 +669,11 @@ mod tests {
         let save = resolved.iter().filter(|(_, action, _)| *action == "workbench::Save").collect::<Vec<_>>();
         assert_eq!(save.len(), 1);
         assert_eq!(save[0].0, "ctrl-s");
-        // Untouched rows keep their defaults.
-        assert!(resolved.iter().any(|(keys, action, _)| *action == "workbench::GoToFile" && keys == "shift-cmd-o"));
+        // Untouched rows keep their defaults — in the registered face, so
+        // the primary modifier reads Ctrl on non-macOS (see
+        // [`registration_keys`]).
+        let goto_file = if cfg!(target_os = "macos") { "shift-cmd-o" } else { "shift-ctrl-o" };
+        assert!(resolved.iter().any(|(keys, action, _)| *action == "workbench::GoToFile" && keys == goto_file));
     }
 
     /// An override that cannot convert (a typo) is dropped, not silently
