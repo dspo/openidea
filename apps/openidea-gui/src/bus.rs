@@ -179,6 +179,15 @@ pub enum BusMessage {
         index: usize,
         filter: crate::test_tree::TestFilter,
     },
+    /// The run gutter's ▶ click (M12): the editor asks for one test (or,
+    /// with ⌥, the file's suite). The workbench matches the project's test
+    /// configuration by the document's language and derives the command.
+    RunTestAt {
+        doc: ide_core::DocId,
+        name: String,
+        container: Option<String>,
+        file_run: bool,
+    },
 }
 
 /// The UI end of the event bus. Cheap to clone; `send` never blocks

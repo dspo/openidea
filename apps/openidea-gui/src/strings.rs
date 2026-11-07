@@ -42,6 +42,7 @@ pub const RUN_LAUNCH_FAILED: &str = "Run failed";
 pub const TEST_TREE_WAITING: &str = "waiting for the runner's output…";
 pub const TEST_DIFF_TITLE: &str = "expected vs actual";
 pub const TEST_RERUN_FAILED: &str = "Cannot rerun this node";
+pub const TEST_NO_CONFIG: &str = "No test configuration for this language";
 // The Run picker's synthetic row for a one-off shell command line.
 pub const RUN_SHELL_PREFIX: &str = "Run command: ";
 // Git (M4).
