@@ -1129,6 +1129,9 @@ pub struct EditorPane {
     // condition input overlay (⌥⌘F8; Enter confirms, Esc cancels).
     breakpoints: std::collections::BTreeSet<u32>,
     breakpoint_conditions: Vec<(u32, String)>,
+    /// M12 run gutter: this file's test declarations (the workbench scans
+    /// on open/save; the gutter marks them and the strip click runs one).
+    test_marks: Vec<crate::test_tree::TestItem>,
     execution_line: Option<u32>,
     condition_input: Option<(u32, gpui::Entity<InputState>)>,
     rename: Option<RenameFlow>,
@@ -1245,6 +1248,7 @@ impl EditorPane {
             ime_dedup: crate::ime::ImeEchoDeduper::default(),
             breakpoints: std::collections::BTreeSet::new(),
             breakpoint_conditions: Vec::new(),
+            test_marks: Vec::new(),
             execution_line: None,
             condition_input: None,
             created_at: std::time::Instant::now(),
@@ -3385,6 +3389,13 @@ impl EditorPane {
         cx.notify();
     }
 
+    /// The workbench's test-item scan for this file (the run gutter's
+    /// marks and the single-test click face).
+    pub fn set_test_marks(&mut self, marks: Vec<crate::test_tree::TestItem>, cx: &mut gpui::Context<Self>) {
+        self.test_marks = marks;
+        cx.notify();
+    }
+
     /// The primary caret's 0-based line (the breakpoint actions' target).
     fn caret_line(&self) -> u32 {
         let caret = self.selections.first().map_or(0, |s| s.head);
@@ -4391,9 +4402,23 @@ impl EditorPane {
         }
         self.template = None;
         let display_row = self.row_at(&geometry, ev.position.y);
-        // The gutter folds: a chevron row toggles its fold.
+        // The gutter folds: a chevron row toggles its fold. The right-edge
+        // strip is the run gutter (M12): a click on a test row runs that
+        // one test (⌥-click runs the file's suite).
         if ev.position.x < geometry.gutter_x + geometry.gutter_w {
             let (line, placeholder) = self.resolve_display(display_row);
+            let strip_x = geometry.gutter_x + geometry.gutter_w - px(theme::GUTTER_PAD_R) - px(14.0);
+            if ev.position.x >= strip_x
+                && let Some(item) = self.test_marks.iter().find(|mark| mark.line == line)
+            {
+                self.bus.send(crate::bus::BusMessage::RunTestAt {
+                    doc: self.doc_id,
+                    name: item.name.clone(),
+                    container: item.container.clone(),
+                    file_run: ev.modifiers.alt,
+                });
+                return;
+            }
             if let Some(fold) = placeholder {
                 self.unfold_placeholder(fold.start_line, cx);
             } else if self.fold_candidates.iter().any(|(start, _)| *start == line) {
@@ -5823,6 +5848,8 @@ struct PrepaintState {
     diag_marks: Vec<(u32, Severity)>,
     /// Gutter breakpoint dots: the display rows with a breakpoint.
     breakpoint_marks: Vec<u32>,
+    /// The run gutter's ▶ rows (M12): the visible test declarations.
+    run_marks: Vec<u32>,
     /// The stopped frame's full-width band (M11's current-line highlight).
     execution_rect: Option<Bounds<Pixels>>,
     /// The primary cursor's buffer line, for the brighter gutter number.
@@ -6192,6 +6219,7 @@ impl Element for EditorElement {
         let mut chevrons = Vec::new();
         let mut diag_marks = Vec::new();
         let mut breakpoint_marks = Vec::new();
+        let mut run_marks = Vec::new();
         let mut execution_rect = None;
         let mut frame_max_w = px(0.0);
         let mut hinted_rows = 0u32;
@@ -6227,6 +6255,10 @@ impl Element for EditorElement {
                     // The M11 breakpoint dot rides the same visible-row walk.
                     if pane.breakpoints.contains(&line) {
                         breakpoint_marks.push(display);
+                    }
+                    // The run gutter's ▶ (M12): a test declaration row.
+                    if pane.test_marks.iter().any(|mark| mark.line == line) {
+                        run_marks.push(display);
                     }
                     // The execution band's rect (full width; the paint pass
                     // emits it under the text).
@@ -6451,6 +6483,7 @@ impl Element for EditorElement {
             chevrons,
             diag_marks,
             breakpoint_marks,
+            run_marks,
             execution_rect,
             caret_line: caret_buffer_line,
             gutter_w,
@@ -6536,6 +6569,21 @@ impl Element for EditorElement {
                 let y = origin.y + line_height * (*display as f32 - geometry.scroll);
                 let dot = Bounds::new(point(gutter_x + px(5.0), y + px(5.0)), size(px(8.0), px(8.0)));
                 window.paint_quad(fill(dot, theme::error()));
+            }
+            // The run gutter (M12): a green ▶ at the gutter's right edge,
+            // before the diagnostic bar (IDEA's run-gutter face).
+            for display in &prepaint.run_marks {
+                let y = origin.y + line_height * (*display as f32 - geometry.scroll);
+                let run = plain_run("▶".len(), theme::diff_added());
+                let shaped = window.text_system().shape_line("▶".into(), font_size, &[run], None);
+                let _ = shaped.paint(
+                    point(gutter_x + prepaint.gutter_w - px(theme::GUTTER_PAD_R) - px(11.0), y),
+                    line_height,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
             }
             // Diagnostic marks: a severity-colored bar at the gutter's right
             // edge, before the separator.

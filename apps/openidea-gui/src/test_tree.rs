@@ -296,6 +296,36 @@ pub enum TestFilter {
     Case { id: String, name: String, file: Option<String> },
 }
 
+/// The single-test filter for a gutter item (the run-gutter ▶ click).
+/// go/rust filter by name (the `-run` regex / libtest substring); python
+/// builds the full `file::class::name` id; the JSON reporters take the
+/// file plus a `-t` title.
+pub fn test_filter_for_item(language: &str, rel_path: &str, item: &TestItem) -> TestFilter {
+    match language {
+        "go" | "rust" => TestFilter::Case { id: item.name.clone(), name: item.name.clone(), file: None },
+        "python" => {
+            let mut id = String::from(rel_path);
+            if let Some(container) = &item.container {
+                id.push_str("::");
+                id.push_str(container);
+            }
+            id.push_str("::");
+            id.push_str(&item.name);
+            TestFilter::Case { id, name: item.name.clone(), file: Some(rel_path.to_owned()) }
+        }
+        _ => TestFilter::Case { id: item.name.clone(), name: item.name.clone(), file: Some(rel_path.to_owned()) },
+    }
+}
+
+/// The file-level filter (the ⌥-click face): a file path where the runner
+/// takes one; go/rust have no file filter (the whole config runs).
+pub fn file_filter(language: &str, rel_path: &str) -> TestFilter {
+    match language {
+        "go" | "rust" => TestFilter::All,
+        _ => TestFilter::Suite { name: rel_path.to_owned() },
+    }
+}
+
 /// The effective command a test run (or rerun) executes: the config's own
 /// command with the runner's structured-output face and the filter applied.
 /// Never mutates the stored configuration — a derived clone every time.
@@ -1627,6 +1657,35 @@ isTest = false
         std::fs::remove_dir_all(&dir).ok();
         // A go config resolves from its shape without touching the disk.
         assert_eq!(resolve_runner(&go, &dir), Some(Runner::Go));
+    }
+
+    #[test]
+    fn gutter_items_map_to_the_runner_filters() {
+        let item = TestItem { line: 4, name: "test_inside".into(), container: Some("TestSuite".into()) };
+        let filter = test_filter_for_item("python", "tests/test_calc.py", &item);
+        assert_eq!(
+            filter,
+            TestFilter::Case {
+                id: "tests/test_calc.py::TestSuite::test_inside".into(),
+                name: "test_inside".into(),
+                file: Some("tests/test_calc.py".into())
+            }
+        );
+        let go_item = TestItem { line: 2, name: "TestAdd".into(), container: None };
+        assert_eq!(
+            test_filter_for_item("go", "calc/calc_test.go", &go_item),
+            TestFilter::Case { id: "TestAdd".into(), name: "TestAdd".into(), file: None }
+        );
+        let js_item = TestItem { line: 1, name: "works".into(), container: Some("math".into()) };
+        assert_eq!(
+            test_filter_for_item("typescript", "src/math.test.ts", &js_item),
+            TestFilter::Case { id: "works".into(), name: "works".into(), file: Some("src/math.test.ts".into()) }
+        );
+        assert_eq!(file_filter("go", "calc/calc_test.go"), TestFilter::All);
+        assert_eq!(
+            file_filter("python", "tests/test_calc.py"),
+            TestFilter::Suite { name: "tests/test_calc.py".into() }
+        );
     }
 
     // -- the gutter scanner ---------------------------------------------------

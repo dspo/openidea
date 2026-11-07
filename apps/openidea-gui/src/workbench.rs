@@ -55,7 +55,7 @@ use crate::keymap;
 use crate::navigation;
 use crate::reconcile;
 use crate::run_panel::{self, RunPanel, stream_of};
-use crate::test_tree;
+use crate::test_tree::{self, TestFilter};
 use crate::toolwindow::{self, Anchor, WindowDesc, WindowState};
 use crate::{ProjectHost, settings, strings, theme};
 
@@ -1025,6 +1025,27 @@ impl Workbench {
         for tab in &mut self.tabs {
             let bp = self.settings.breakpoints.get(&tab.path.to_string_lossy().into_owned()).cloned();
             tab.pane.update(cx, |pane, cx| pane.set_breakpoints(bp, cx));
+        }
+        cx.notify();
+    }
+
+    /// Scans the file for test declarations (dirty buffer wins) and pushes
+    /// the run gutter's marks into its pane (open/save refresh points).
+    fn refresh_test_marks(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(host) = &self.host else { return };
+        let language = host.languages.detect(path, None);
+        let text = self
+            .tabs
+            .iter()
+            .find(|tab| tab.path == path)
+            .and_then(|tab| host.snapshot(tab.doc).ok())
+            .map(|info| info.text)
+            .unwrap_or_else(|| std::fs::read_to_string(path).unwrap_or_default());
+        let marks = test_tree::test_items(language.as_str(), &text);
+        for tab in &self.tabs {
+            if tab.path == path {
+                tab.pane.update(cx, |pane, cx| pane.set_test_marks(marks.clone(), cx));
+            }
         }
         cx.notify();
     }
@@ -2721,6 +2742,75 @@ impl Workbench {
         self.launch_run(index, effective, cx);
     }
 
+    /// A test configuration starting with a filter (the run gutter's ▶
+    /// click, the tree reruns): the derived command + tree session ride a
+    /// fresh dock tab.
+    fn start_test_run(&mut self, config: RunConfig, filter: TestFilter, cx: &mut Context<Self>) {
+        let Some(host) = self.host.clone() else {
+            self.toast(NotifyLevel::Warning, strings::NO_PROJECT.to_owned());
+            cx.notify();
+            return;
+        };
+        let index = self.runs.len();
+        let runner = test_tree::resolve_runner(&config, &host.root)
+            .or_else(|| test_tree::runner_for(&config))
+            .expect("a test config's runner resolved");
+        let report = test_report_path();
+        let test = Arc::new(test_tree::TestRunShared::new(runner, Some(report.clone())));
+        let effective = test_tree::test_run_config(&config, runner, &filter, Some(&report));
+        eprintln!("[tests] start {} -> {} {:?}", config.name, effective.command, effective.args);
+        let seed = run_panel::RunPanelSeed {
+            index,
+            config_name: effective.name.clone(),
+            config: Some(config),
+            runner: Some(runner),
+            test: Some(test),
+        };
+        self.runs.push(cx.new(|cx| RunPanel::new(host.clone(), self.bus.clone(), seed, cx)));
+        self.dock_page = DockPage::Run(index);
+        if !self.settings.layout.dock_visible {
+            self.settings.layout.dock_visible = true;
+            settings::save(&self.settings);
+        }
+        self.launch_run(index, effective, cx);
+    }
+
+    /// The run gutter's ▶ click: the project's test configuration for the
+    /// document's language runs the one test (⌥-click: the file's suite).
+    fn run_test_at(
+        &mut self,
+        doc: ide_core::DocId,
+        name: &str,
+        container: Option<&str>,
+        file_run: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(host) = self.host.clone() else { return };
+        let Some(tab) = self.tabs.iter().find(|tab| tab.doc == doc) else { return };
+        let path = tab.path.clone();
+        let language = host.languages.detect(&path, None);
+        let rel = path
+            .strip_prefix(&host.root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+        let configs = host.run_configs().unwrap_or_default();
+        let Some(config) = pick_test_config(&configs, language.as_str()) else {
+            self.toast(NotifyLevel::Warning, strings::TEST_NO_CONFIG.to_owned());
+            return;
+        };
+        let filter = if file_run {
+            test_tree::file_filter(language.as_str(), &rel)
+        } else {
+            test_tree::test_filter_for_item(
+                language.as_str(),
+                &rel,
+                &test_tree::TestItem { line: 0, name: name.to_owned(), container: container.map(str::to_owned) },
+            )
+        };
+        eprintln!("[tests] run at {}:{} {} (file_run={})", rel, name, container.unwrap_or("-"), file_run);
+        self.start_test_run(config, filter, cx);
+    }
+
     /// The shared launch flow: output routing by dock index, the background
     /// start, and the elapsed-time ticker (M4; test reruns reuse it).
     fn launch_run(&mut self, index: usize, config: RunConfig, cx: &mut Context<Self>) {
@@ -2767,7 +2857,7 @@ impl Workbench {
 
     /// A tree node's rerun: the panel's stored configuration restarts with
     /// the node's filter, replacing the tab in place (IDEA's rerun face).
-    fn rerun_test(&mut self, index: usize, filter: test_tree::TestFilter, cx: &mut Context<Self>) {
+    fn rerun_test(&mut self, index: usize, filter: TestFilter, cx: &mut Context<Self>) {
         let Some(host) = self.host.clone() else { return };
         let Some(panel) = self.runs.get(index) else { return };
         let Some(config) = panel.read(cx).config.clone() else { return };
@@ -2947,6 +3037,7 @@ impl Workbench {
             pinned: false,
         });
         self.push_breakpoints(cx);
+        self.refresh_test_marks(&path, cx);
         self.active = Some(self.tabs.len() - 1);
         // Every open feeds the index's recency (the empty palette query lists
         // recent files) and the workbench's own ⌘E list.
@@ -3264,6 +3355,9 @@ impl Workbench {
             }
             BusMessage::TestRerun { index, filter } => {
                 self.rerun_test(index, filter, cx);
+            }
+            BusMessage::RunTestAt { doc, name, container, file_run } => {
+                self.run_test_at(doc, &name, container.as_deref(), file_run, cx);
             }
             BusMessage::GitStatus { statuses, branch } => {
                 self.git_refreshing.set(false);
@@ -4106,6 +4200,19 @@ fn file_name(path: &Path) -> String {
 
 /// The JSON report file one test run writes (`--outputFile`): unique per
 /// start, under the platform temp dir, read once at the run's exit.
+/// The project's test configuration for a language (the run gutter's
+/// target): the first `is_test` row of the language's runner kind.
+fn pick_test_config(configs: &[RunConfig], language: &str) -> Option<RunConfig> {
+    let kind = match language {
+        "go" => "go",
+        "rust" => "cargo",
+        "python" => "pytest",
+        "typescript" | "tsx" | "javascript" | "jsx" => "npm",
+        _ => return None,
+    };
+    configs.iter().find(|c| c.is_test && c.kind == kind).cloned()
+}
+
 fn test_report_path() -> std::path::PathBuf {
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     std::env::temp_dir().join(format!("openidea-gui-test-report-{nonce}.json"))
