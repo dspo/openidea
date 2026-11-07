@@ -1096,13 +1096,7 @@ pub fn debug_start(config: &RunConfig, root: &Path) -> Option<DebugStart> {
         // debugpy: `-m mod` launches the module; a script path launches it.
         "pytest" => Some(DebugStart {
             spec_adapter: "debugpy".into(),
-            target: DebugTarget {
-                program: PathBuf::new(),
-                args: target_args,
-                cwd,
-                env,
-                module: Some("pytest".into()),
-            },
+            target: DebugTarget { program: PathBuf::new(), args: target_args, cwd, env, module: Some("pytest".into()) },
             build_command: None,
             module: Some("pytest".into()),
         }),

@@ -928,11 +928,8 @@ impl Workbench {
         } else {
             adapter_name.clone()
         };
-        let Some(dbg_cfg) = host
-            .languages
-            .all()
-            .into_iter()
-            .find_map(|lang| lang.debugger.clone().filter(|d| d.adapter == wanted))
+        let Some(dbg_cfg) =
+            host.languages.all().into_iter().find_map(|lang| lang.debugger.clone().filter(|d| d.adapter == wanted))
         else {
             self.toast(NotifyLevel::Warning, "No debug adapter for this configuration");
             return;
