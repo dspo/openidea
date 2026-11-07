@@ -96,6 +96,7 @@ if IS_MACOS:
         "backspace": 51,
         "i": 34,
         "l": 37,
+        "q": 12,
     }
 
     FLAG_CMD = Quartz.kCGEventFlagMaskCommand
@@ -147,6 +148,7 @@ else:
         "comma": "comma",
         "backspace": "BackSpace",
         "i": "i",
+        "q": "q",
         "l": "l",
     }
 
