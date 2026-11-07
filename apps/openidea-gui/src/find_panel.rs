@@ -163,17 +163,17 @@ impl Focusable for FindPanel {
 }
 
 /// One match's ranges drawn as accent runs inside the line text (UTF-16
-/// columns into `text`).
+/// columns into `text`, the repo's IPC convention).
 fn render_line_text(text: &str, ranges: &[(u32, u32)]) -> gpui::AnyElement {
     let mut row = div().flex().min_w_0();
     let mut cursor = 0usize;
     for (start, end) in ranges {
-        let (start, end) = (*start as usize, (*end as usize).max(*start as usize));
-        if start > cursor && start <= text.len() {
+        let (start, end) = (utf16_byte(text, *start as usize), utf16_byte(text, (*end as usize).max(*start as usize)));
+        if start > cursor {
             row = row.child(div().text_color(theme::fg()).child(SharedString::from(text[cursor..start].to_owned())));
             cursor = start;
         }
-        if end > cursor && end <= text.len() {
+        if end > cursor {
             row = row.child(
                 div()
                     .text_color(theme::accent())
@@ -187,6 +187,25 @@ fn render_line_text(text: &str, ranges: &[(u32, u32)]) -> gpui::AnyElement {
         row = row.child(div().text_color(theme::fg()).truncate().child(SharedString::from(text[cursor..].to_owned())));
     }
     row.into_any_element()
+}
+
+/// The byte offset of the `col`-th UTF-16 unit of `text`, snapped to a char
+/// boundary: a column landing inside a multibyte char (or past the end)
+/// resolves to that char's start (or the length). Slicing with raw UTF-16
+/// columns panics on any line with multibyte content before the match —
+/// the Fedora smoke hit exactly that on a CJK comment line.
+fn utf16_byte(text: &str, col: usize) -> usize {
+    let mut units = 0usize;
+    for (i, ch) in text.char_indices() {
+        if units >= col {
+            return i;
+        }
+        units += ch.len_utf16();
+        if units > col {
+            return i;
+        }
+    }
+    text.len()
 }
 
 impl Render for FindPanel {
@@ -365,5 +384,30 @@ mod tests {
             );
             assert!(panel.files.is_empty(), "a stale answer repopulated the cleared page");
         });
+    }
+
+    /// The Fedora smoke crashed here: highlighting a match on a CJK comment
+    /// line sliced the text with raw UTF-16 columns ("end byte index 19 is
+    /// not a char boundary; it is inside '真'"). Columns must resolve to
+    /// byte offsets on char boundaries — before, inside, and after
+    /// multibyte content alike.
+    #[test]
+    fn utf16_columns_never_slice_mid_char() {
+        let line = "x = Render; // 真的是匹配";
+        assert_eq!(utf16_byte(line, 0), 0);
+        assert_eq!(utf16_byte(line, 12), 12, "columns agree with bytes while ASCII");
+        // BMP chars are one UTF-16 unit each: the column after 真 resolves
+        // to the next char's start.
+        let cjk = line.find('真').unwrap();
+        assert_eq!(utf16_byte(line, cjk), cjk);
+        assert_eq!(utf16_byte(line, cjk + 1), cjk + 3);
+        // An astral char is two units; a column inside the pair snaps to
+        // the char's start.
+        let astral = "x = Render; // 😀匹配";
+        let emoji = astral.find('😀').unwrap();
+        assert_eq!(utf16_byte(astral, emoji), emoji);
+        assert_eq!(utf16_byte(astral, emoji + 1), emoji);
+        assert_eq!(utf16_byte(astral, emoji + 2), emoji + 4);
+        assert_eq!(utf16_byte(astral, 9999), astral.len(), "past the end clamps to the length");
     }
 }
