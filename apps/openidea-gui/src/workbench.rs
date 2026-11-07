@@ -907,6 +907,7 @@ impl Workbench {
     /// all resolved on the background thread (the DAP handshake blocks
     /// there); the answer rides DebugStarted.
     fn start_debug(&mut self, config: RunConfig, window: &mut Window, cx: &mut Context<Self>) {
+        eprintln!("[debug] starting {} (adapter {:?})", config.name, config.debug_adapter);
         let Some(host) = self.host.clone() else { return };
         // A live session restarts (IDEA's re-debug face).
         if let Some(session) = self.debug.take() {
@@ -918,12 +919,20 @@ impl Workbench {
             // target program's extension decides).
             String::new()
         });
+        // The adapter row: the config's tag when it has one, else the
+        // target's extension decides (the one-off line face).
+        let wanted = if adapter_name.is_empty() {
+            debug::debug_start(&config, &host.root)
+                .and_then(|start| debug::adapter_for_target(&start.target.program).map(str::to_owned))
+                .unwrap_or_default()
+        } else {
+            adapter_name.clone()
+        };
         let Some(dbg_cfg) = host
             .languages
             .all()
             .into_iter()
-            .find_map(|lang| lang.debugger.clone().filter(|d| adapter_name.is_empty() || d.adapter == adapter_name))
-            .or_else(|| host.languages.all().into_iter().find_map(|lang| lang.debugger.clone()))
+            .find_map(|lang| lang.debugger.clone().filter(|d| d.adapter == wanted))
         else {
             self.toast(NotifyLevel::Warning, "No debug adapter for this configuration");
             return;
@@ -932,11 +941,13 @@ impl Workbench {
             self.toast(NotifyLevel::Warning, "This configuration cannot start a debug session");
             return;
         };
+        // Breakpoints are IDE-global (like bookmarks): every persisted file's
+        // set rides the start (DAP simply leaves the foreign ones unbound).
         let breakpoints: debug::FileBreakpointSet = self
             .settings
             .breakpoints
             .iter()
-            .filter(|(path, bp)| !bp.lines.is_empty() && Path::new(path.as_str()).starts_with(&host.root))
+            .filter(|(_, bp)| !bp.lines.is_empty())
             .map(|(path, bp)| (PathBuf::from(path.as_str()), bp.lines.clone(), bp.conditions.clone()))
             .collect();
         let spec = debug::adapter_spec(&dbg_cfg, debug::free_port());
@@ -2218,25 +2229,33 @@ impl Workbench {
         let matches_query = |text: &str| query.is_empty() || fuzzy::match_text(text, query).is_some();
         match picker.mode {
             PickerMode::Run => self.run_rows().0,
-            // The Debug palette lists only the configs a debug adapter tags.
-            PickerMode::Debug => self
-                .picker
-                .as_ref()
-                .map(|picker| {
-                    picker
-                        .configs
-                        .iter()
-                        .filter(|config| config.debug_adapter.is_some())
-                        .filter(|config| {
-                            query.is_empty()
-                                || fuzzy::match_text(&config.name, query).is_some()
-                                || fuzzy::match_text(&config.command, query).is_some()
-                        })
-                        .cloned()
-                        .map(|config| PickerRow::Run(Box::new(config)))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
+            // The Debug palette lists only the configs a debug adapter tags;
+            // a typed line stays runnable-as-debuggable (the shell face
+            // derives the adapter from the entry file).
+            PickerMode::Debug => {
+                let mut rows = self
+                    .picker
+                    .as_ref()
+                    .map(|picker| {
+                        picker
+                            .configs
+                            .iter()
+                            .filter(|config| config.debug_adapter.is_some())
+                            .filter(|config| {
+                                query.is_empty()
+                                    || fuzzy::match_text(&config.name, query).is_some()
+                                    || fuzzy::match_text(&config.command, query).is_some()
+                            })
+                            .cloned()
+                            .map(|config| PickerRow::Run(Box::new(config)))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if !query.is_empty() {
+                    rows.push(PickerRow::Shell(query.to_owned()));
+                }
+                rows
+            }
             PickerMode::RecentFiles => self
                 .recent_files
                 .iter()
