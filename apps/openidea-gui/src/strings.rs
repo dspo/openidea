@@ -177,3 +177,17 @@ pub const GIT_LOG_FAILED: &str = "Git log failed";
 pub const GIT_DETAIL_HINT: &str = "Select a commit to see its message and files";
 pub const GIT_REFRESH: &str = "Refresh";
 pub const TW_NOTHING_GIT: &str = "No repository";
+
+// The branches popup (M13).
+pub const BRANCHES_TITLE: &str = "Git Branches";
+pub const BRANCHES_NEW_PLACEHOLDER: &str = "New branch name (⏎ creates + switches)";
+pub const BRANCHES_LOCAL: &str = "Local";
+pub const BRANCHES_REMOTE: &str = "Remote";
+pub const BRANCHES_CHECKOUT: &str = "Checkout";
+pub const BRANCHES_MERGE: &str = "Merge";
+pub const BRANCHES_REBASE: &str = "Rebase";
+pub const BRANCHES_DELETE: &str = "Delete";
+pub const BRANCHES_CONFIRM_DELETE: &str = "Delete for real?";
+pub const BRANCHES_CHECKED_OUT: &str = "checked out";
+pub const BRANCHES_OP_FAILED: &str = "Git operation failed";
+pub const BRANCHES_PROTECTED: &str = "the checked-out branch cannot be deleted";

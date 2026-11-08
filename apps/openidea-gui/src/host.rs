@@ -395,6 +395,47 @@ impl Host {
         let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
         repo.branches()
     }
+
+    /// Merge / rebase / cherry-pick in progress, if any.
+    pub fn git_operation(&self) -> IdeResult<Option<String>> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        repo.operation()
+    }
+
+    /// Creates branch `name` at HEAD, optionally switching to it.
+    pub fn git_create_branch(&self, name: &str, checkout: bool) -> IdeResult<()> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        repo.create_branch(name, None, checkout)
+    }
+
+    /// Switches to `branch` as IDEA does: local changes in the way are
+    /// reported (the outcome names them), remote branches get a tracking
+    /// branch. `None`'s semantics live upstream ([`Repo::checkout_with`]).
+    pub fn git_checkout(&self, branch: &str) -> IdeResult<ide_vcs::CheckoutOutcome> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        repo.checkout_with(branch, false, &ide_vcs::CheckoutOptions::default())
+    }
+
+    /// Deletes a local branch without asking; the answer reports one that
+    /// was not fully merged (IDEA's restore notification data).
+    pub fn git_delete_branch(&self, branch: &str) -> IdeResult<ide_vcs::DeletedBranch> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        repo.delete_branch_restorable(branch)
+    }
+
+    /// Merges `branch` into HEAD; conflicts leave the repository mid-merge
+    /// (the error says so) for the conflict surface.
+    pub fn git_merge(&self, branch: &str) -> IdeResult<()> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        repo.merge(branch)
+    }
+
+    /// Rebases the current branch onto `onto`; conflicts leave the
+    /// repository mid-rebase for the conflict surface.
+    pub fn git_rebase(&self, onto: &str) -> IdeResult<()> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        repo.rebase(onto)
+    }
 }
 
 /// Stable per-project cache-directory name (FNV-1a of the root), the same

@@ -51,8 +51,11 @@ actions!(
         // window earns its OnUse stripe at the first run).
         AnalyzeDuplicates,
         // M13: the Git window (⌘9, the preset's toolwindow.git slot) — the
-        // log graph's home.
+        // log graph's home; the branches popup (the preset's vcs.newBranch
+        // ⌘⌥N row arms its name input).
         ToggleGit,
+        Branches,
+        NewBranch,
         DebugStepInto,
         DebugStepOver,
         DebugResume,
@@ -240,6 +243,8 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("editor::CodeActions", "Quick Fix…", "Refactor", "⌥⏎"),
     action_info!("workbench::AnalyzeDuplicates", "Locate Duplicates…", "Code", "⌘⇧D"),
     action_info!("workbench::ToggleGit", "Git", "View", "⌘9"),
+    action_info!("workbench::Branches", "Git Branches…", "VCS", "⌃⌘G"),
+    action_info!("workbench::NewBranch", "New Branch…", "VCS", "⌘⌥N"),
     action_info!("editor::FormatDocument", "Format Document", "Code", "⌘⌥L"),
     action_info!("editor::OrganizeImports", "Organize Imports", "Code", "⌃⌥O"),
     action_info!("editor::ToggleInlayHints", "Toggle Inlay Hints", "View", "⌥⌘I"),

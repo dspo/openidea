@@ -49,10 +49,12 @@ pub enum BusMessage {
         chunk: OutputChunk,
     },
     /// A git status + branch refresh finished (M4; the reads ran on the
-    /// background executor).
+    /// background executor). `operation` is the merge/rebase in progress,
+    /// if any (M13's status-bar face).
     GitStatus {
         statuses: Vec<ide_vcs::FileStatus>,
         branch: Option<String>,
+        operation: Option<String>,
     },
     /// A file's diff against HEAD finished building (M4; hunks render as a
     /// unified read-only view).
@@ -211,6 +213,15 @@ pub enum BusMessage {
     /// filter menu.
     GitBranches {
         result: IdeResult<Vec<ide_vcs::Branch>>,
+    },
+    /// A branch operation (checkout / create / delete / merge / rebase)
+    /// finished (M13; ide-vcs ran it on the background executor). The
+    /// output lines land in a finished Run panel tab (the brief's "run
+    /// output panel" face).
+    GitOpDone {
+        op: String,
+        result: IdeResult<()>,
+        output: Vec<String>,
     },
 }
 

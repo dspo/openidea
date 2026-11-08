@@ -285,6 +285,21 @@ struct GitWindowState {
     exhausted: bool,
 }
 
+/// The branches popup (M13): the repository's branches with IDEA's minimal
+/// action set — checkout (the row click), create (the name input, ⏎),
+/// delete (two-step; the checked-out branch is protected), and the merge /
+/// rebase entries against the current branch.
+struct BranchesPopup {
+    focus: FocusHandle,
+    new_input: Entity<InputState>,
+    branches: Vec<ide_vcs::Branch>,
+    current: Option<String>,
+    /// The merge / rebase in progress (the popup's warning chip).
+    operation: Option<String>,
+    /// The branch a first Delete click armed (the second confirms).
+    confirm_delete: Option<String>,
+}
+
 /// The commit overlay (M4): the changed files (checked = staged for this
 /// commit) and a multi-line message.
 struct CommitFlow {
@@ -466,6 +481,11 @@ pub struct Workbench {
     git_window: Option<GitWindowState>,
     /// The filter inputs' Enter subscriptions, alive while the state is.
     git_filter_subs: Vec<gpui::Subscription>,
+    /// The branches popup (M13) and its name input's ⏎ subscription.
+    branches_popup: Option<BranchesPopup>,
+    branches_new_sub: Option<gpui::Subscription>,
+    /// The merge/rebase operation in progress (M13: the status bar chip).
+    git_operation: Option<String>,
     /// The message input's PressEnter subscription, alive while the overlay is.
     commit_sub: Option<gpui::Subscription>,
     /// The tree prompt overlay (M7 context menu: new file / folder, rename)
@@ -619,6 +639,9 @@ impl Workbench {
             commit_window_sub: None,
             git_window: None,
             git_filter_subs: Vec::new(),
+            branches_popup: None,
+            branches_new_sub: None,
+            git_operation: None,
             trust_prompt: pending_trust
                 .as_ref()
                 .map(|path| TrustPrompt { path: path.clone(), focus: cx.focus_handle() }),
@@ -685,14 +708,15 @@ impl Workbench {
         cx.background_executor()
             .spawn(async move {
                 let result = host.git_status();
+                let operation = host.git_operation().ok().flatten();
                 eprintln!(
-                    "[vcs] status refresh: {} files, branch {:?} ({})",
+                    "[vcs] status refresh: {} files, branch {:?} op {operation:?} ({})",
                     result.as_ref().map_or(0, |(s, _)| s.len()),
                     result.as_ref().map(|(_, b)| b.as_deref()),
                     result.as_ref().err().map_or("ok", |e| e.message.as_str())
                 );
                 let (statuses, branch) = result.unwrap_or((Vec::new(), None));
-                bus.send(BusMessage::GitStatus { statuses, branch });
+                bus.send(BusMessage::GitStatus { statuses, branch, operation });
             })
             .detach();
     }
@@ -835,6 +859,9 @@ impl Workbench {
         // The log window belongs to the outgoing project's repository.
         self.git_window = None;
         self.git_filter_subs.clear();
+        self.branches_popup = None;
+        self.branches_new_sub = None;
+        self.git_operation = None;
         self.closed_tabs.clear();
         // The usages answer belongs to the outgoing project; the Structure
         // window refetches for the (initially) empty active tab.
@@ -1741,7 +1768,9 @@ impl Workbench {
     /// inputs (input entities need the window) and loads the first page of
     /// the log through upstream's log API.
     fn on_toggle_git(&mut self, _: &acts::ToggleGit, window: &mut Window, cx: &mut Context<Self>) {
-        self.toggle_window("git", cx);
+        // The state lands before the toggle: raising a dock page clamps
+        // against the page's liveness, and the Git page is live only while
+        // the log state exists.
         if self.git_window.is_none() {
             let author = cx.new(|cx| InputState::new(window, cx).placeholder(strings::GIT_FILTER_AUTHOR));
             let text = cx.new(|cx| InputState::new(window, cx).placeholder(strings::GIT_FILTER_MESSAGE));
@@ -1778,6 +1807,17 @@ impl Workbench {
             self.git_log_load(cx);
             self.git_load_branches(cx);
         }
+        self.toggle_window("git", cx);
+    }
+
+    /// ⌃⌘G / the status-bar branch click / the VCS menu: the branches popup.
+    fn on_branches(&mut self, _: &acts::Branches, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_branches_popup(false, window, cx);
+    }
+
+    /// ⌘⌥N (the preset's vcs.newBranch): the popup with the name input armed.
+    fn on_new_branch(&mut self, _: &acts::NewBranch, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_branches_popup(true, window, cx);
     }
 
     /// Loads page zero (a fresh query): the answer replaces the rows.
@@ -2073,7 +2113,7 @@ impl Workbench {
             rows = rows.child(
                 div()
                     .id(("git-row", index))
-                    .h(px(24.0))
+                    .h(px(28.0))
                     .pr_2()
                     .flex()
                     .items_center()
@@ -2308,6 +2348,425 @@ impl Workbench {
             .into_any_element()
     }
 
+    // -- the branches popup (M13) ----------------------------------------------
+
+    /// ⌃⌘G (and the status-bar branch click, the VCS menu): the branches
+    /// popup over the repository's local and remote branches. `arm_new`
+    /// hands the name input the focus (the ⌘⌥N face).
+    fn open_branches_popup(&mut self, arm_new: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.host.as_ref().and_then(|host| host.repo.as_ref()).is_none() {
+            self.toast(NotifyLevel::Warning, strings::GIT_NOT_A_REPO.to_owned());
+            cx.notify();
+            return;
+        }
+        if self.branches_popup.is_none() {
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder(strings::BRANCHES_NEW_PLACEHOLDER));
+            let focus = input.read(cx).focus_handle(cx);
+            self.branches_popup = Some(BranchesPopup {
+                focus,
+                new_input: input.clone(),
+                branches: self.git_window.as_ref().map(|state| state.branches.clone()).unwrap_or_default(),
+                current: self.git_branch.clone(),
+                operation: self.git_operation.clone(),
+                confirm_delete: None,
+            });
+            // ⏎ in the name input creates the branch.
+            self.branches_new_sub = Some(cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.branches_create(cx);
+                }
+            }));
+            self.git_load_branches(cx);
+        }
+        if arm_new && let Some(popup) = &self.branches_popup {
+            window.focus(&popup.new_input.read(cx).focus_handle(cx), cx);
+        } else if let Some(popup) = &self.branches_popup {
+            window.focus(&popup.focus.clone(), cx);
+        }
+        cx.notify();
+    }
+
+    fn close_branches_popup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.branches_popup.take().is_none() {
+            return;
+        }
+        self.branches_new_sub = None;
+        self.restore_focus(window, cx);
+        cx.notify();
+    }
+
+    /// ⏎ in the name input (or the Create button): create at HEAD, check it
+    /// out (IDEA's new-branch dialog semantics), report in the run panel.
+    fn branches_create(&mut self, cx: &mut Context<Self>) {
+        let Some(popup) = &self.branches_popup else { return };
+        let name = popup.new_input.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let op = format!("branch {name}");
+        self.git_run_op(
+            op,
+            move |host| {
+                host.git_create_branch(&name, true)?;
+                Ok(vec![format!("created branch {name}")])
+            },
+            cx,
+        );
+    }
+
+    /// The popup's checkout (row click / button), merge, rebase, delete.
+    fn branches_checkout(&mut self, branch: String, cx: &mut Context<Self>) {
+        let op = format!("checkout {branch}");
+        self.git_run_op(
+            op,
+            move |host| {
+                let outcome = host.git_checkout(&branch)?;
+                match outcome {
+                    ide_vcs::CheckoutOutcome::Done => Ok(vec![format!("switched to {branch}")]),
+                    ide_vcs::CheckoutOutcome::LocalChanges { files } => {
+                        Ok(vec![format!("local changes in the way: {}", files.join(", "))])
+                    }
+                    ide_vcs::CheckoutOutcome::UntrackedFiles { files } => {
+                        Ok(vec![format!("untracked files in the way: {}", files.join(", "))])
+                    }
+                    ide_vcs::CheckoutOutcome::LocalBranchAhead { local, remote } => {
+                        Ok(vec![format!("{local} has commits {remote} lacks — resolve from the log")])
+                    }
+                    ide_vcs::CheckoutOutcome::Conflicts { files } => {
+                        Ok(vec![format!("checked out with conflicts in: {}", files.join(", "))])
+                    }
+                }
+            },
+            cx,
+        );
+    }
+
+    fn branches_merge(&mut self, branch: String, cx: &mut Context<Self>) {
+        let current = self.git_branch.clone().unwrap_or_else(|| "HEAD".to_owned());
+        let op = format!("merge {branch} into {current}");
+        self.git_run_op(
+            op,
+            move |host| {
+                host.git_merge(&branch)?;
+                Ok(vec![format!("merged {branch} into {current}")])
+            },
+            cx,
+        );
+    }
+
+    fn branches_rebase(&mut self, onto: String, cx: &mut Context<Self>) {
+        let current = self.git_branch.clone().unwrap_or_else(|| "HEAD".to_owned());
+        let op = format!("rebase {current} onto {onto}");
+        self.git_run_op(
+            op,
+            move |host| {
+                host.git_rebase(&onto)?;
+                Ok(vec![format!("rebased {current} onto {onto}")])
+            },
+            cx,
+        );
+    }
+
+    fn branches_delete(&mut self, branch: String, cx: &mut Context<Self>) {
+        let op = format!("branch -d {branch}");
+        self.git_run_op(
+            op,
+            move |host| {
+                let deleted = host.git_delete_branch(&branch)?;
+                let mut lines =
+                    vec![format!("deleted branch {branch} (was {})", &deleted.tip[..deleted.tip.len().min(7)])];
+                if deleted.unmerged {
+                    lines.push("it was not fully merged".to_owned());
+                }
+                Ok(lines)
+            },
+            cx,
+        );
+    }
+
+    /// Runs one branch operation on the background executor; the answer
+    /// lands as [`BusMessage::GitOpDone`].
+    fn git_run_op(
+        &mut self,
+        op: String,
+        run: impl FnOnce(&Host) -> IdeResult<Vec<String>> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(host) = self.host.clone() else { return };
+        let bus = self.bus.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let result = run(&host);
+                let (outcome, output) = match result {
+                    Ok(lines) => (Ok(()), lines),
+                    Err(e) => (Err(e), Vec::new()),
+                };
+                bus.send(BusMessage::GitOpDone { op, result: outcome, output });
+            })
+            .detach();
+        cx.notify();
+    }
+
+    /// A branch operation finished: its output becomes a finished Run panel
+    /// tab (the brief's run-output face), the toast carries the failure,
+    /// and the whole git face refreshes (status, log, popup list).
+    fn git_op_done(&mut self, op: String, result: IdeResult<()>, output: Vec<String>, cx: &mut Context<Self>) {
+        let code = if result.is_ok() { 0 } else { 1 };
+        let mut lines: Vec<(run_panel::Stream, String)> = vec![(run_panel::Stream::System, format!("$ git {op}\n"))];
+        lines.extend(output.into_iter().map(|line| (run_panel::Stream::Stdout, format!("{line}\n"))));
+        if let Err(e) = &result {
+            lines.push((run_panel::Stream::Stderr, format!("{}\n", e.message)));
+            // A merge/rebase conflict leaves the operation in progress; the
+            // conflict surface (Commit window, the editor strip) takes over.
+            self.toast(NotifyLevel::Warning, format!("{}: {}", strings::BRANCHES_OP_FAILED, e.message));
+        }
+        let index = self.runs.len();
+        let Some(host) = self.host.clone() else { return };
+        let name = format!("git {op}");
+        let seed = run_panel::RunPanelSeed {
+            index,
+            config_name: name,
+            config: None,
+            runner: None,
+            test: None,
+            finished: Some((code, lines)),
+        };
+        self.runs.push(cx.new(|cx| RunPanel::new(host, self.bus.clone(), seed, cx)));
+        self.dock_page = DockPage::Run(index);
+        self.settings.layout.dock_visible = true;
+        settings::save(&self.settings);
+        // The repository moved: refresh everything that reads it.
+        self.refresh_git(cx);
+        if self.git_window.is_some() {
+            self.git_log_load(cx);
+        }
+        self.git_load_branches(cx);
+        if let Some(popup) = &mut self.branches_popup {
+            popup.confirm_delete = None;
+            popup.current = self.git_branch.clone();
+        }
+        cx.notify();
+    }
+
+    /// The branches popup's body: the name input, the local branches (the
+    /// current one checked and protected), the remotes, and each row's
+    /// action buttons.
+    fn render_branches(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let popup = self.branches_popup.as_ref()?;
+        let workbench = cx.entity().downgrade();
+        let operation = popup.operation.clone();
+        let confirm_delete = popup.confirm_delete.clone();
+        let mut list = div().id("branches-list").flex_1().min_h_0().overflow_y_scroll().py_1();
+        let mut in_remote = false;
+        for branch in &popup.branches {
+            if branch.remote != in_remote {
+                in_remote = branch.remote;
+                list = list.child(div().px_3().pt_2().pb_1().text_size(px(10.)).text_color(theme::fg_muted()).child(
+                    SharedString::from(if branch.remote {
+                        strings::BRANCHES_REMOTE.to_owned()
+                    } else {
+                        strings::BRANCHES_LOCAL.to_owned()
+                    }),
+                ));
+            }
+            let is_current = branch.current;
+            let name = branch.name.clone();
+            let tracking = branch.upstream.clone().map(|up| {
+                let mut text = up;
+                if branch.ahead > 0 {
+                    text += &format!(" ↑{}", branch.ahead);
+                }
+                if branch.behind > 0 {
+                    text += &format!(" ↓{}", branch.behind);
+                }
+                text
+            });
+            let row = div()
+                .id(SharedString::from(format!("branch-row-{name}")))
+                .h(px(28.0))
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(px(12.))
+                .hover(|row| row.bg(theme::app_bg()))
+                .when(is_current, |row| {
+                    row.child(div().text_color(theme::accent()).child(SharedString::from("●")))
+                        .child(div().text_color(theme::fg()).child(SharedString::from(name.clone())))
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(theme::fg_muted())
+                                .child(SharedString::from(strings::BRANCHES_CHECKED_OUT.to_owned())),
+                        )
+                })
+                .when(!is_current, |row| {
+                    row.on_click(cx.listener({
+                        let name = name.clone();
+                        move |this, _: &ClickEvent, _, cx| this.branches_checkout(name.clone(), cx)
+                    }))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_color(theme::fg())
+                            .child(SharedString::from(name.clone())),
+                    )
+                })
+                .when_some(tracking.filter(|_| !is_current), |row, tracking| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .max_w(px(140.0))
+                            .truncate()
+                            .text_size(px(10.))
+                            .text_color(theme::fg_muted())
+                            .child(SharedString::from(tracking)),
+                    )
+                });
+            let mut row = row;
+            if in_remote || !is_current {
+                for (label, action) in [
+                    (strings::BRANCHES_CHECKOUT, "checkout"),
+                    (strings::BRANCHES_MERGE, "merge"),
+                    (strings::BRANCHES_REBASE, "rebase"),
+                ] {
+                    let name = name.clone();
+                    let workbench = workbench.clone();
+                    row = row.child(
+                        Button::new(SharedString::from(format!("branch-{action}-{name}")))
+                            .label(label)
+                            .xsmall()
+                            .ghost()
+                            .on_click(move |_, _, cx| {
+                                let name = name.clone();
+                                workbench
+                                    .update(cx, |this, cx| match action {
+                                        "checkout" => this.branches_checkout(name, cx),
+                                        "merge" => this.branches_merge(name, cx),
+                                        _ => this.branches_rebase(name, cx),
+                                    })
+                                    .ok();
+                            }),
+                    );
+                }
+            }
+            if !in_remote && !is_current {
+                let armed = confirm_delete.as_deref() == Some(name.as_str());
+                let workbench = workbench.clone();
+                let name = name.clone();
+                row = row.child(
+                    Button::new(SharedString::from(format!("branch-delete-{name}")))
+                        .label(if armed { strings::BRANCHES_CONFIRM_DELETE } else { strings::BRANCHES_DELETE })
+                        .xsmall()
+                        .ghost()
+                        .when(armed, |button| button.text_color(theme::error()))
+                        .on_click(move |_, _, cx| {
+                            let name = name.clone();
+                            let armed_now = armed;
+                            workbench
+                                .update(cx, |this, cx| {
+                                    if armed_now {
+                                        this.branches_delete(name.clone(), cx);
+                                    } else if let Some(popup) = &mut this.branches_popup {
+                                        popup.confirm_delete = Some(name);
+                                        cx.notify();
+                                    }
+                                })
+                                .ok();
+                        })
+                        .tooltip(strings::BRANCHES_PROTECTED),
+                );
+            }
+            list = list.child(row);
+        }
+        let input = popup.new_input.clone();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.close_branches_popup(window, cx)),
+                )
+                .child(
+                    div()
+                        .mt(px(96.0))
+                        .w(px(640.0))
+                        .h(px(480.0))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(theme::border())
+                        .bg(theme::raised_bg())
+                        .key_context("Branches")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            |_: &gpui::MouseDownEvent, _: &mut Window, cx: &mut gpui::App| cx.stop_propagation(),
+                        )
+                        .on_action(cx.listener(|this, _: &Cancel, window, cx| this.close_branches_popup(window, cx)))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .h_8()
+                                .border_b_1()
+                                .border_color(theme::border())
+                                .text_size(px(12.))
+                                .child(
+                                    div()
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme::fg())
+                                        .child(SharedString::from(strings::BRANCHES_TITLE)),
+                                )
+                                .when_some(operation, |header, operation| {
+                                    header.child(
+                                        div()
+                                            .px_1()
+                                            .rounded(px(3.0))
+                                            .text_size(px(10.))
+                                            .text_color(theme::warning())
+                                            .child(SharedString::from(format!("{operation} in progress"))),
+                                    )
+                                })
+                                .child(div().flex_1())
+                                .child(Button::new("branches-close").icon(IconName::Close).xsmall().ghost().on_click(
+                                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.close_branches_popup(window, cx)
+                                    }),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .py_2()
+                                .border_b_1()
+                                .border_color(theme::border())
+                                .child(div().flex_1().child(Input::new(&input).small().bordered(false).h(px(24.0))))
+                                .child(
+                                    Button::new("branches-create")
+                                        .label("Create")
+                                        .xsmall()
+                                        .secondary()
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.branches_create(cx))),
+                                ),
+                        )
+                        .child(list),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// Hands the focus to the topmost live surface: the still-open overlays
     /// first (topmost in the render order), then the active editor pane,
     /// then the (visible) tree, then the workbench root. Every hide/close
@@ -2322,6 +2781,8 @@ impl Workbench {
             window.focus(&confirm, cx);
         } else if let Some(commit) = &self.commit {
             window.focus(&commit.input.read(cx).focus_handle(cx), cx);
+        } else if let Some(popup) = &self.branches_popup {
+            window.focus(&popup.focus.clone(), cx);
         } else if self.diff.is_some() {
             window.focus(&self.diff_focus, cx);
         } else if self.settings_overlay.is_some() {
@@ -3402,7 +3863,14 @@ impl Workbench {
             }
             None => (None, config.clone()),
         };
-        let seed = run_panel::RunPanelSeed { index, config_name: name.clone(), config: Some(config), runner, test };
+        let seed = run_panel::RunPanelSeed {
+            index,
+            config_name: name.clone(),
+            config: Some(config),
+            runner,
+            test,
+            finished: None,
+        };
         self.runs.push(cx.new(|cx| RunPanel::new(host.clone(), self.bus.clone(), seed, cx)));
         self.dock_page = DockPage::Run(index);
         if !self.settings.layout.dock_visible {
@@ -3435,6 +3903,7 @@ impl Workbench {
             config: Some(config),
             runner: Some(runner),
             test: Some(test),
+            finished: None,
         };
         self.runs.push(cx.new(|cx| RunPanel::new(host.clone(), self.bus.clone(), seed, cx)));
         self.dock_page = DockPage::Run(index);
@@ -3600,6 +4069,7 @@ impl Workbench {
             config: Some(config),
             runner: Some(runner),
             test: Some(test),
+            finished: None,
         };
         self.runs[index] = cx.new(|cx| RunPanel::new(host.clone(), self.bus.clone(), seed, cx));
         self.dock_page = DockPage::Run(index);
@@ -4088,11 +4558,17 @@ impl Workbench {
             BusMessage::GitLogPage { reset, result } => {
                 self.git_log_page(reset, result, cx);
             }
+            BusMessage::GitOpDone { op, result, output } => {
+                self.git_op_done(op, result, output, cx);
+            }
             BusMessage::GitBranches { result } => {
-                if let Some(state) = &mut self.git_window
-                    && let Ok(branches) = result
-                {
-                    state.branches = branches;
+                if let Ok(branches) = result {
+                    if let Some(state) = &mut self.git_window {
+                        state.branches = branches.clone();
+                    }
+                    if let Some(popup) = &mut self.branches_popup {
+                        popup.branches = branches;
+                    }
                     cx.notify();
                 }
             }
@@ -4138,9 +4614,10 @@ impl Workbench {
                 }
                 cx.notify();
             }
-            BusMessage::GitStatus { statuses, branch } => {
+            BusMessage::GitStatus { statuses, branch, operation } => {
                 self.git_refreshing.set(false);
                 self.git_branch = branch;
+                self.git_operation = operation;
                 self.git_status = statuses
                     .into_iter()
                     .map(|file| {
@@ -5374,6 +5851,8 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_new_terminal_tab))
             .on_action(cx.listener(Self::on_analyze_duplicates))
             .on_action(cx.listener(Self::on_toggle_git))
+            .on_action(cx.listener(Self::on_branches))
+            .on_action(cx.listener(Self::on_new_branch))
             .on_action(cx.listener(Self::on_debug))
             .on_action(cx.listener(Self::on_debug_step_into))
             .on_action(cx.listener(Self::on_debug_step_over))
@@ -5460,6 +5939,7 @@ impl Render for Workbench {
             .children(self.render_picker(cx))
             .children(self.render_diff(cx))
             .children(self.render_commit(cx))
+            .children(self.render_branches(cx))
             .children(self.render_tree_prompt(cx))
             .children(self.render_tree_confirm(cx))
             .children(self.render_trust_prompt(cx))
@@ -7344,11 +7824,30 @@ impl Workbench {
         if shown("branch")
             && let Some(branch) = &self.git_branch
         {
+            // The branches popup's IDEA entry: the widget itself is the
+            // click target (the branch label rides along).
             left = left
                 .child(
                     div().text_color(theme::fg_muted()).child(SharedString::from(strings::GIT_BRANCH_LABEL.to_owned())),
                 )
-                .child(div().text_color(theme::fg()).child(SharedString::from(branch.clone())));
+                .child(
+                    div()
+                        .id("status-branch")
+                        .cursor_pointer()
+                        .hover(|widget| widget.text_color(theme::accent()))
+                        .on_click(
+                            cx.listener(|this, _: &ClickEvent, window, cx| this.open_branches_popup(false, window, cx)),
+                        )
+                        .child(div().text_color(theme::fg()).child(SharedString::from(branch.clone()))),
+                );
+        }
+        if let Some(operation) = &self.git_operation {
+            left = left.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme::warning())
+                    .child(SharedString::from(format!("{operation} in progress"))),
+            );
         }
         if shown("position") {
             let (line, col) = self.caret.get();

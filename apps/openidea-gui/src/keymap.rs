@@ -96,6 +96,11 @@ pub static BINDINGS: &[Binding] = &[
     binding!("ctrl-cmd-t", "workbench::NewTerminalTab", None, None),
     // M13: the Git window (the preset's toolwindow.git slot).
     binding!("cmd-9", "workbench::ToggleGit", None, Some("toolwindow.git")),
+    // The branches popup's app-added key (the preset's vcs.branches row
+    // carries no keys; ⌃⌘G is free and unambiguous — the ⌃⌘T precedent).
+    binding!("ctrl-cmd-g", "workbench::Branches", None, None),
+    // The preset's vcs.newBranch row: opens the popup, name input armed.
+    binding!("alt-cmd-n", "workbench::NewBranch", None, Some("vcs.newBranch")),
     // M12: Locate Duplicates (no IDEA preset row — the ⌃⌘T precedent for
     // app-added keys; ⌘⇧D is free in the preset and unambiguous on macOS,
     // where ⌥-modified letters arrive composed).

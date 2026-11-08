@@ -173,6 +173,8 @@ const TOOLS_MENU: &[ItemSpec] = &[
 const VCS_MENU: &[ItemSpec] = &[
     Row("workbench::Commit"),
     Row("workbench::ShowDiff"),
+    Row("workbench::Branches"),
+    Row("workbench::NewBranch"),
     Separator,
     Deferred("Update Project"),
     Deferred("Push…"),
@@ -252,6 +254,8 @@ fn menu_item_for(name: &str, title: &'static str) -> Option<MenuItem> {
         "workbench::MaximizeToolWindow" => Some(MenuItem::action(title, crate::actions::MaximizeToolWindow)),
         "workbench::ToggleCommit" => Some(MenuItem::action(title, crate::actions::ToggleCommit)),
         "workbench::ToggleGit" => Some(MenuItem::action(title, crate::actions::ToggleGit)),
+        "workbench::Branches" => Some(MenuItem::action(title, crate::actions::Branches)),
+        "workbench::NewBranch" => Some(MenuItem::action(title, crate::actions::NewBranch)),
         "workbench::TrustProject" => Some(MenuItem::action(title, crate::actions::TrustProject)),
         "workbench::DontOpenProject" => Some(MenuItem::action(title, crate::actions::DontOpenProject)),
         "workbench::RecentFiles" => Some(MenuItem::action(title, crate::actions::RecentFiles)),

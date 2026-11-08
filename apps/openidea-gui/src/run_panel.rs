@@ -52,6 +52,9 @@ pub struct RunPanelSeed {
     pub config: Option<ide_run::RunConfig>,
     pub runner: Option<test_tree::Runner>,
     pub test: Option<Arc<test_tree::TestRunShared>>,
+    /// A git operation's pre-captured output (M13): the panel opens already
+    /// finished — `(exit code, lines)` — with no process behind it.
+    pub finished: Option<(i32, Vec<(Stream, String)>)>,
 }
 
 pub struct RunPanel {
@@ -88,7 +91,7 @@ pub struct RunPanel {
 
 impl RunPanel {
     pub fn new(host: Arc<Host>, bus: Bus, seed: RunPanelSeed, cx: &mut gpui::Context<Self>) -> Self {
-        Self {
+        let mut panel = Self {
             host,
             bus,
             index: seed.index,
@@ -106,7 +109,13 @@ impl RunPanel {
             show_output: false,
             scroll: gpui::UniformListScrollHandle::new(),
             focus: cx.focus_handle(),
+        };
+        if let Some((code, lines)) = seed.finished {
+            panel.lines = lines;
+            panel.starting = false;
+            panel.exited = Some((Some(code), Instant::now()));
         }
+        panel
     }
 
     /// The start call returned: `info` is the live run (its id routes output
