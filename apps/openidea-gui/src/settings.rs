@@ -55,6 +55,9 @@ pub struct Settings {
     /// per-line condition strings. IDE-global like bookmarks; written on
     /// toggle only.
     pub breakpoints: BTreeMap<String, FileBreakpoints>,
+    /// The editor's inline blame tail (M13): the caret line's
+    /// `author (date rev)` label. On by default (the IDEA face).
+    pub inline_blame: bool,
 }
 
 /// One file's breakpoints: the guarded lines plus the conditions some of
@@ -179,6 +182,7 @@ impl Default for Settings {
             trusted_projects: Vec::new(),
             status_widgets: BTreeMap::new(),
             breakpoints: BTreeMap::new(),
+            inline_blame: true,
         }
     }
 }
@@ -206,6 +210,8 @@ struct Store {
     status_widgets: BTreeMap<String, bool>,
     #[serde(default)]
     breakpoints: BTreeMap<String, FileBreakpoints>,
+    #[serde(default)]
+    inline_blame: Option<bool>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -409,6 +415,7 @@ fn from_store(store: Store) -> Settings {
         trusted_projects: store.trusted_projects,
         status_widgets: store.status_widgets,
         breakpoints: store.breakpoints,
+        inline_blame: store.inline_blame.unwrap_or(defaults.inline_blame),
     }
 }
 
@@ -449,6 +456,7 @@ pub fn save(settings: &Settings) {
         trusted_projects: settings.trusted_projects.clone(),
         status_widgets: settings.status_widgets.clone(),
         breakpoints: settings.breakpoints.clone(),
+        inline_blame: Some(settings.inline_blame),
     };
     let Ok(json) = serde_json::to_string_pretty(&store) else { return };
     if let Some(parent) = path.parent()
@@ -665,6 +673,7 @@ mod tests {
             trusted_projects: vec!["/tmp/m10-trusted".to_owned()],
             status_widgets: BTreeMap::new(),
             breakpoints: BTreeMap::new(),
+            inline_blame: true,
         };
         let store = Store {
             recent_projects: settings.recent_projects.clone(),
@@ -686,6 +695,7 @@ mod tests {
             trusted_projects: settings.trusted_projects.clone(),
             status_widgets: settings.status_widgets.clone(),
             breakpoints: BTreeMap::new(),
+            inline_blame: Some(settings.inline_blame),
         };
         let back: Store = serde_json::from_str(&serde_json::to_string(&store).unwrap()).unwrap();
         assert_eq!(back.recent_projects, settings.recent_projects);

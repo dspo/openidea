@@ -423,6 +423,13 @@ impl Host {
         repo.delete_branch_restorable(branch)
     }
 
+    /// One blame entry per line of `current_text` (or the file on disk);
+    /// uncommitted lines carry the all-zero commit id.
+    pub fn git_blame(&self, path: &Path, current_text: Option<&str>) -> IdeResult<Vec<ide_vcs::BlameLine>> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        repo.blame(path, current_text, None, encoding_rs::UTF_8)
+    }
+
     /// Merges `branch` into HEAD; conflicts leave the repository mid-merge
     /// (the error says so) for the conflict surface.
     pub fn git_merge(&self, branch: &str) -> IdeResult<()> {

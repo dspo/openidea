@@ -51,6 +51,11 @@ fn rgba_of(c: u32) -> gpui::Rgba {
     rgba((c << 8) | 0xff)
 }
 
+/// The blame swimlane's label budget in characters (the 210 px lane at the
+/// scaled-down label font; the paint cannot clip text, so the label itself
+/// truncates).
+const BLAME_LANE_CHARS: usize = 28;
+
 /// The find match cap (the count shows `10000+` past it).
 const MAX_FIND_MATCHES: usize = 10_000;
 
@@ -1129,6 +1134,13 @@ pub struct EditorPane {
     // condition input overlay (⌥⌘F8; Enter confirms, Esc cancels).
     breakpoints: std::collections::BTreeSet<u32>,
     breakpoint_conditions: Vec<(u32, String)>,
+    /// M13 blame: the file's per-line entries plus the two faces' switches
+    /// (the annotation swimlane, the caret line's inline tail). The entries
+    /// are a snapshot of the text at blame time — an edit after it leaves
+    /// the lane short (the workbench re-blames on save).
+    blame: Option<std::sync::Arc<Vec<ide_vcs::BlameLine>>>,
+    annotate: bool,
+    inline_blame: bool,
     /// M12 run gutter: this file's test declarations (the workbench scans
     /// on open/save; the gutter marks them and the strip click runs one).
     test_marks: Vec<crate::test_tree::TestItem>,
@@ -1248,6 +1260,9 @@ impl EditorPane {
             ime_dedup: crate::ime::ImeEchoDeduper::default(),
             breakpoints: std::collections::BTreeSet::new(),
             breakpoint_conditions: Vec::new(),
+            blame: None,
+            annotate: false,
+            inline_blame: false,
             test_marks: Vec::new(),
             execution_line: None,
             condition_input: None,
@@ -3391,6 +3406,31 @@ impl EditorPane {
 
     /// The workbench's test-item scan for this file (the run gutter's
     /// marks and the single-test click face).
+    /// The workbench's blame answer for this file: the entries plus the two
+    /// faces' switches (the swimlane, the inline tail).
+    pub fn set_blame(
+        &mut self,
+        entries: Option<std::sync::Arc<Vec<ide_vcs::BlameLine>>>,
+        annotate: bool,
+        inline: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.blame = entries;
+        self.annotate = annotate && self.blame.is_some();
+        self.inline_blame = inline;
+        cx.notify();
+    }
+
+    /// Whether the annotation swimlane is on (the workbench re-blames on save).
+    pub fn annotated(&self) -> bool {
+        self.annotate
+    }
+
+    /// The current entries (the workbench re-pushes them on a face flip).
+    pub fn blame_entries(&self) -> Option<std::sync::Arc<Vec<ide_vcs::BlameLine>>> {
+        self.blame.clone()
+    }
+
     pub fn set_test_marks(&mut self, marks: Vec<crate::test_tree::TestItem>, cx: &mut gpui::Context<Self>) {
         self.test_marks = marks;
         cx.notify();
@@ -4405,6 +4445,7 @@ impl EditorPane {
         // The gutter folds: a chevron row toggles its fold. The right-edge
         // strip is the run gutter (M12): a click on a test row runs that
         // one test (⌥-click runs the file's suite).
+        let lane_w = if self.annotate { px(crate::blame::LANE_W) } else { px(0.0) };
         if ev.position.x < geometry.gutter_x + geometry.gutter_w {
             let (line, placeholder) = self.resolve_display(display_row);
             let strip_x = geometry.gutter_x + geometry.gutter_w - px(theme::GUTTER_PAD_R) - px(14.0);
@@ -4417,6 +4458,10 @@ impl EditorPane {
                     container: item.container.clone(),
                     file_run: ev.modifiers.alt,
                 });
+                return;
+            }
+            if ev.position.x < geometry.gutter_x + lane_w {
+                // The blame lane is inert (the swimlane is read-only).
                 return;
             }
             if let Some(fold) = placeholder {
@@ -5852,10 +5897,17 @@ struct PrepaintState {
     run_marks: Vec<u32>,
     /// The stopped frame's full-width band (M11's current-line highlight).
     execution_rect: Option<Bounds<Pixels>>,
+    /// The blame swimlane's visible labels (M13): (display row, label,
+    /// age color). Empty without the annotation face.
+    blame_rows: Vec<(u32, String, gpui::Hsla)>,
+    /// The caret line's inline tail label (M13), with the buffer line.
+    inline_tail: Option<(u32, String)>,
     /// The primary cursor's buffer line, for the brighter gutter number.
     caret_line: u32,
     gutter_w: Pixels,
     numbers_w: Pixels,
+    /// The annotation lane's width (zero without the face).
+    lane_w: Pixels,
 }
 
 struct DisplayedRow {
@@ -5864,6 +5916,11 @@ struct DisplayedRow {
     /// The buffer line, `None` for a fold placeholder row.
     line: Option<u32>,
     shaped: ShapedLine,
+}
+
+/// The wall clock as epoch milliseconds (the blame faces' "now").
+fn unix_ms_now() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as f64).unwrap_or(0.0)
 }
 
 fn text_run(range: Range<usize>, color: gpui::Hsla) -> TextRun {
@@ -6197,10 +6254,13 @@ impl Element for EditorElement {
         let scroll = pane.scroll.get();
 
         // Gutter geometry: the widest line number sets the width (at least
-        // three digits, so small files do not look cramped).
+        // three digits, so small files do not look cramped). The blame
+        // annotation (M13) adds a swimlane left of the numbers.
+        let now_ms = unix_ms_now();
+        let lane_w = if pane.annotate { px(crate::blame::LANE_W) } else { px(0.0) };
         let digits = pane.buf.line_count().to_string().len().max(3);
         let numbers_w = shaped_width(window, &"8".repeat(digits), font_size);
-        let gutter_w = px(theme::GUTTER_PAD_L) + numbers_w + px(theme::GUTTER_PAD_R);
+        let gutter_w = px(theme::GUTTER_PAD_L) + numbers_w + px(theme::GUTTER_PAD_R) + lane_w;
         let gutter_x = bounds.origin.x;
         let origin = point(gutter_x + gutter_w, bounds.origin.y + px(theme::TEXT_INSET));
         let text_area_w = bounds.size.width - gutter_w;
@@ -6220,6 +6280,8 @@ impl Element for EditorElement {
         let mut diag_marks = Vec::new();
         let mut breakpoint_marks = Vec::new();
         let mut run_marks = Vec::new();
+        let mut blame_rows = Vec::new();
+        let mut inline_tail = None;
         let mut execution_rect = None;
         let mut frame_max_w = px(0.0);
         let mut hinted_rows = 0u32;
@@ -6255,6 +6317,13 @@ impl Element for EditorElement {
                     // The M11 breakpoint dot rides the same visible-row walk.
                     if pane.breakpoints.contains(&line) {
                         breakpoint_marks.push(display);
+                    }
+                    // The blame swimlane's label (M13), age-colored.
+                    if let Some(entries) = &pane.blame
+                        && let Some(entry) = crate::blame::entry_for(entries, line)
+                    {
+                        let color = crate::blame::age_color(crate::blame::age_of(entry.time_ms, now_ms));
+                        blame_rows.push((display, crate::blame::lane_label(entry, BLAME_LANE_CHARS), color));
                     }
                     // The run gutter's ▶ (M12): a test declaration row.
                     if pane.test_marks.iter().any(|mark| mark.line == line) {
@@ -6475,6 +6544,14 @@ impl Element for EditorElement {
         }));
 
         self.view.read(cx).hud.prepaint_ms.set(Some(prepaint_started.elapsed().as_secs_f32() * 1000.0));
+        // The caret line's inline tail (M13): only with the face on and the
+        // blame covering the line.
+        if pane.inline_blame
+            && let Some(entries) = &pane.blame
+            && let Some(entry) = crate::blame::entry_for(entries, caret_buffer_line)
+        {
+            inline_tail = Some((caret_buffer_line, crate::blame::inline_label(entry)));
+        }
         PrepaintState {
             rows,
             carets,
@@ -6485,9 +6562,12 @@ impl Element for EditorElement {
             breakpoint_marks,
             run_marks,
             execution_rect,
+            blame_rows,
+            inline_tail,
             caret_line: caret_buffer_line,
             gutter_w,
             numbers_w,
+            lane_w,
         }
     }
 
@@ -6525,6 +6605,13 @@ impl Element for EditorElement {
             for rect in &prepaint.selection_rects {
                 window.paint_quad(fill(*rect, rgba_of(theme::SELECTION_BG)));
             }
+            // The gutter faces read the rows — the drain below consumes them
+            // (the numbers' silent absence in the M12 evidence set was this).
+            let number_rows: Vec<(u32, Option<u32>)> =
+                prepaint.rows.iter().map(|row| (row.display, row.line)).collect();
+            let tail_anchor: Option<(u32, Pixels)> = prepaint.inline_tail.as_ref().and_then(|(line, _)| {
+                prepaint.rows.iter().find(|row| row.line == Some(*line)).map(|row| (row.display, row.shaped.width))
+            });
             for row in prepaint.rows.drain(..) {
                 let y = origin.y + line_height * (row.display as f32 - geometry.scroll);
                 let _ = row.shaped.paint(
@@ -6545,13 +6632,33 @@ impl Element for EditorElement {
                 size(gutter_x + geometry.gutter_w - bounds.origin.x, bounds.size.height),
             );
             window.paint_quad(fill(gutter_bg, theme::surface_bg()));
-            for row in &prepaint.rows {
-                let y = origin.y + line_height * (row.display as f32 - geometry.scroll);
-                if let Some(line) = row.line {
+            // The blame swimlane paints first (M13) — the numbers and the
+            // decorative marks sit to its right.
+            if prepaint.lane_w > px(0.0) {
+                let lane_w = prepaint.lane_w;
+                let lane = Bounds::new(point(bounds.origin.x, bounds.origin.y), size(lane_w, bounds.size.height));
+                window.paint_quad(fill(lane, rgba((theme::BG_SURFACE << 8) | 0xb4)));
+                for (display, label, color) in &prepaint.blame_rows {
+                    let y = origin.y + line_height * (*display as f32 - geometry.scroll);
+                    let run = plain_run(label.len(), *color);
+                    let shaped = window.text_system().shape_line(label.as_str().into(), font_size * 0.82, &[run], None);
+                    let _ = shaped.paint(
+                        point(bounds.origin.x + px(6.0), y + px(2.0)),
+                        line_height,
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+            }
+            for (display, line) in &number_rows {
+                let y = origin.y + line_height * (*display as f32 - geometry.scroll);
+                if let Some(line) = line {
                     let number = (line + 1).to_string();
                     let width = shaped_width(window, &number, font_size);
-                    let color = if Some(line) == Some(prepaint.caret_line) { theme::fg() } else { theme::fg_muted() };
-                    let x = gutter_x + px(theme::GUTTER_PAD_L) + prepaint.numbers_w - width;
+                    let color = if Some(*line) == Some(prepaint.caret_line) { theme::fg() } else { theme::fg_muted() };
+                    let x = gutter_x + prepaint.lane_w + px(theme::GUTTER_PAD_L) + prepaint.numbers_w - width;
                     let run = plain_run(number.len(), color);
                     let shaped = window.text_system().shape_line(number.into(), font_size, &[run], None);
                     let _ = shaped.paint(point(x, y), line_height, TextAlign::Left, None, window, cx);
@@ -6562,12 +6669,19 @@ impl Element for EditorElement {
                 let run = plain_run(glyph.len(), theme::fg_muted());
                 let shaped = window.text_system().shape_line(glyph.into(), font_size, &[run], None);
                 let y = origin.y + line_height * (*display as f32 - geometry.scroll);
-                let _ = shaped.paint(point(gutter_x + px(2.0), y), line_height, TextAlign::Left, None, window, cx);
+                let _ = shaped.paint(
+                    point(gutter_x + prepaint.lane_w + px(2.0), y),
+                    line_height,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
             }
             // Breakpoint dots (M11): a red circle at the gutter's left edge.
             for display in &prepaint.breakpoint_marks {
                 let y = origin.y + line_height * (*display as f32 - geometry.scroll);
-                let dot = Bounds::new(point(gutter_x + px(5.0), y + px(5.0)), size(px(8.0), px(8.0)));
+                let dot = Bounds::new(point(gutter_x + prepaint.lane_w + px(5.0), y + px(5.0)), size(px(8.0), px(8.0)));
                 window.paint_quad(fill(dot, theme::error()));
             }
             // The run gutter (M12): a green ▶ at the gutter's right edge,
@@ -6600,6 +6714,52 @@ impl Element for EditorElement {
                 size(px(1.0), bounds.size.height),
             );
             window.paint_quad(fill(separator, theme::border()));
+
+            // The inline blame tail (M13): the caret line's `author (date
+            // rev)` a step right of the line's text; hovering it spreads the
+            // summary under it.
+            if let Some((line, label)) = &prepaint.inline_tail
+                && let Some((display, width)) = tail_anchor
+            {
+                let y = origin.y + line_height * (display as f32 - geometry.scroll);
+                let x = origin.x + width + px(18.0);
+                let probe = window.text_system().shape_line(
+                    label.as_str().into(),
+                    font_size * 0.82,
+                    &[plain_run(label.len(), theme::fg_muted())],
+                    None,
+                );
+                let mouse = window.mouse_position();
+                let hovered = mouse.x >= x && mouse.x <= x + probe.width && mouse.y >= y && mouse.y <= y + line_height;
+                let color = if hovered { theme::fg() } else { theme::fg_muted() };
+                let run = plain_run(label.len(), color);
+                let shaped = window.text_system().shape_line(label.as_str().into(), font_size * 0.82, &[run], None);
+                let _ = shaped.paint(point(x, y + px(3.0)), line_height, TextAlign::Left, None, window, cx);
+                if hovered
+                    && let Some(entries) = &self.view.read(cx).blame
+                    && let Some(entry) = crate::blame::entry_for(entries, *line)
+                {
+                    let detail = crate::blame::hover_detail(entry);
+                    let run = plain_run(detail.len(), theme::fg());
+                    let shaped =
+                        window.text_system().shape_line(detail.as_str().into(), font_size * 0.82, &[run], None);
+                    let box_w = shaped.width + px(12.0);
+                    let box_x = x.min(bounds.origin.x + bounds.size.width - box_w - px(8.0));
+                    let backdrop = Bounds::new(
+                        point(box_x - px(6.0), y + line_height + px(2.0)),
+                        size(box_w + px(6.0), line_height),
+                    );
+                    window.paint_quad(fill(backdrop, rgba((theme::BG_APP << 8) | 0xf0)));
+                    let _ = shaped.paint(
+                        point(box_x, y + line_height + px(4.0)),
+                        line_height,
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+            }
 
             for caret in &prepaint.carets {
                 window.paint_quad(fill(*caret, rgba_of(theme::ACCENT)));

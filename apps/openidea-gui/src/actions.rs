@@ -56,6 +56,11 @@ actions!(
         ToggleGit,
         Branches,
         NewBranch,
+        // M13 blame: the annotation swimlane (the preset's vcs.annotate,
+        // whose row carries no keys — the app-added ⌃⌘A rides) and the
+        // inline tail's toggle (no preset row; ⌃⌘B app-added).
+        Annotate,
+        ToggleInlineBlame,
         DebugStepInto,
         DebugStepOver,
         DebugResume,
@@ -245,6 +250,8 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("workbench::ToggleGit", "Git", "View", "⌘9"),
     action_info!("workbench::Branches", "Git Branches…", "VCS", "⌃⌘G"),
     action_info!("workbench::NewBranch", "New Branch…", "VCS", "⌘⌥N"),
+    action_info!("workbench::Annotate", "Annotate", "VCS", "⌃⌘A"),
+    action_info!("workbench::ToggleInlineBlame", "Toggle Inline Blame", "VCS", "⌃⌘B"),
     action_info!("editor::FormatDocument", "Format Document", "Code", "⌘⌥L"),
     action_info!("editor::OrganizeImports", "Organize Imports", "Code", "⌃⌥O"),
     action_info!("editor::ToggleInlayHints", "Toggle Inlay Hints", "View", "⌥⌘I"),

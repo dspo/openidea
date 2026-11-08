@@ -7,6 +7,7 @@
 //! dependencies into `../../crates/*`.
 
 mod actions;
+mod blame;
 mod bus;
 mod debug;
 mod diff_view;

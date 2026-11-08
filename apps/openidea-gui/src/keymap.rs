@@ -101,6 +101,11 @@ pub static BINDINGS: &[Binding] = &[
     binding!("ctrl-cmd-g", "workbench::Branches", None, None),
     // The preset's vcs.newBranch row: opens the popup, name input armed.
     binding!("alt-cmd-n", "workbench::NewBranch", None, Some("vcs.newBranch")),
+    // M13 blame: the swimlane's toggle (the preset's vcs.annotate row
+    // carries no keys; ⌃⌘A is the app-added face) and the inline tail's
+    // (no preset row; ⌃⌘B app-added).
+    binding!("ctrl-cmd-a", "workbench::Annotate", None, None),
+    binding!("ctrl-cmd-b", "workbench::ToggleInlineBlame", None, None),
     // M12: Locate Duplicates (no IDEA preset row — the ⌃⌘T precedent for
     // app-added keys; ⌘⇧D is free in the preset and unambiguous on macOS,
     // where ⌥-modified letters arrive composed).

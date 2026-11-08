@@ -223,6 +223,15 @@ pub enum BusMessage {
         result: IdeResult<()>,
         output: Vec<String>,
     },
+    /// A file's blame finished (M13): the editor pane's swimlane/inline
+    /// faces take the entries (routed by the document). `annotate` is the
+    /// request's swimlane switch (the tab-open seed passes false — only the
+    /// inline tail consumes the entries).
+    BlameReady {
+        doc: ide_core::DocId,
+        annotate: bool,
+        result: IdeResult<Vec<ide_vcs::BlameLine>>,
+    },
 }
 
 /// The UI end of the event bus. Cheap to clone; `send` never blocks

@@ -178,7 +178,8 @@ const VCS_MENU: &[ItemSpec] = &[
     Separator,
     Deferred("Update Project"),
     Deferred("Push…"),
-    Deferred("Annotate"),
+    Row("workbench::Annotate"),
+    Row("workbench::ToggleInlineBlame"),
     Deferred("Show Git Log"),
     Deferred("Manage Remotes…"),
 ];
@@ -256,6 +257,8 @@ fn menu_item_for(name: &str, title: &'static str) -> Option<MenuItem> {
         "workbench::ToggleGit" => Some(MenuItem::action(title, crate::actions::ToggleGit)),
         "workbench::Branches" => Some(MenuItem::action(title, crate::actions::Branches)),
         "workbench::NewBranch" => Some(MenuItem::action(title, crate::actions::NewBranch)),
+        "workbench::Annotate" => Some(MenuItem::action(title, crate::actions::Annotate)),
+        "workbench::ToggleInlineBlame" => Some(MenuItem::action(title, crate::actions::ToggleInlineBlame)),
         "workbench::TrustProject" => Some(MenuItem::action(title, crate::actions::TrustProject)),
         "workbench::DontOpenProject" => Some(MenuItem::action(title, crate::actions::DontOpenProject)),
         "workbench::RecentFiles" => Some(MenuItem::action(title, crate::actions::RecentFiles)),

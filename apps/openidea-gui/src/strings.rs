@@ -191,3 +191,7 @@ pub const BRANCHES_CONFIRM_DELETE: &str = "Delete for real?";
 pub const BRANCHES_CHECKED_OUT: &str = "checked out";
 pub const BRANCHES_OP_FAILED: &str = "Git operation failed";
 pub const BRANCHES_PROTECTED: &str = "the checked-out branch cannot be deleted";
+
+// Blame (M13).
+pub const BLAME_FAILED: &str = "Blame failed";
+pub const BLAME_NOT_A_REPO: &str = "Annotate needs a git repository";

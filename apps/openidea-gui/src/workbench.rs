@@ -1820,6 +1820,77 @@ impl Workbench {
         self.open_branches_popup(true, window, cx);
     }
 
+    /// VCS › Annotate (⌃⌘A): the active tab's blame annotation swimlane
+    /// toggles; enabling loads the blame through upstream's face.
+    fn on_annotate(&mut self, _: &acts::Annotate, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.active else {
+            self.toast(NotifyLevel::Info, strings::NO_FILE.to_owned());
+            cx.notify();
+            return;
+        };
+        let (path, doc) = {
+            let tab = &self.tabs[index];
+            (tab.path.clone(), tab.doc)
+        };
+        let annotate = !self.tabs[index].pane.read(cx).annotated();
+        if annotate {
+            self.load_blame(path, doc, true, cx);
+        } else {
+            let inline = self.settings.inline_blame;
+            self.tabs[index].pane.update(cx, |pane, cx| pane.set_blame(None, false, inline, cx));
+            cx.notify();
+        }
+    }
+
+    /// VCS › Toggle Inline Blame (⌃⌘B): the persisted setting flips; the
+    /// active tab re-renders (and blames, when first needed).
+    fn on_toggle_inline_blame(&mut self, _: &acts::ToggleInlineBlame, _: &mut Window, cx: &mut Context<Self>) {
+        self.settings.inline_blame = !self.settings.inline_blame;
+        settings::save(&self.settings);
+        if let Some(index) = self.active {
+            let tab = &self.tabs[index];
+            let (path, doc) = (tab.path.clone(), tab.doc);
+            let has_blame = tab.pane.read(cx).annotated();
+            if !has_blame {
+                self.load_blame(path, doc, false, cx);
+            } else {
+                let inline = self.settings.inline_blame;
+                let entries = tab.pane.read(cx).blame_entries();
+                tab.pane.update(cx, |pane, cx| pane.set_blame(entries, true, inline, cx));
+            }
+        }
+        self.toast(
+            NotifyLevel::Info,
+            format!("inline blame {}", if self.settings.inline_blame { "on" } else { "off" }),
+        );
+        cx.notify();
+    }
+
+    /// Loads one file's blame on the background executor; the answer rides
+    /// the bus to the pane (`annotate` switches the swimlane on with it).
+    fn load_blame(&mut self, path: PathBuf, doc: DocId, annotate: bool, cx: &mut Context<Self>) {
+        let Some(host) = self.host.clone() else { return };
+        if host.repo.is_none() {
+            self.toast(NotifyLevel::Warning, strings::BLAME_NOT_A_REPO.to_owned());
+            cx.notify();
+            return;
+        }
+        // The dirty buffer wins over the disk (its lines are what shows).
+        let current = match self.tabs.iter().find(|tab| tab.doc == doc) {
+            Some(tab) if tab.dirty => Some(tab.pane.read(cx).buffer_text()),
+            _ => None,
+        };
+        let bus = self.bus.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let result = host.git_blame(&path, current.as_deref());
+                eprintln!("[blame] {}: {}", path.display(), result.as_ref().map_or(0, |entries| entries.len()));
+                bus.send(BusMessage::BlameReady { doc, annotate, result });
+            })
+            .detach();
+        cx.notify();
+    }
+
     /// Loads page zero (a fresh query): the answer replaces the rows.
     fn git_log_load(&mut self, cx: &mut Context<Self>) {
         let Some(host) = self.host.clone() else { return };
@@ -4223,6 +4294,29 @@ impl Workbench {
         if let Some(merged) = existing.map(Self::merge_diagnostics) {
             pane.update(cx, |pane, cx| pane.set_diagnostics(merged, cx));
         }
+        // The inline blame tail (M13): seeded with the entries when the
+        // setting is on (the face is IDEA's default; the load is background).
+        eprintln!("[blame] seed {} inline={}", path.display(), self.settings.inline_blame);
+        if self.settings.inline_blame {
+            let blame_path = path.to_path_buf();
+            let blame_doc = doc_id;
+            let has_repo = self.host.as_ref().and_then(|host| host.repo.as_ref()).is_some();
+            if has_repo {
+                let host = self.host.clone().unwrap();
+                let bus = self.bus.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        let result = host.git_blame(&blame_path, None);
+                        eprintln!(
+                            "[blame] {}: {}",
+                            blame_path.display(),
+                            result.as_ref().map_or(0, |entries| entries.len())
+                        );
+                        bus.send(BusMessage::BlameReady { doc: blame_doc, annotate: false, result });
+                    })
+                    .detach();
+            }
+        }
         let path = path.to_path_buf();
         self.tabs.push(Tab {
             path: path.clone(),
@@ -4561,6 +4655,21 @@ impl Workbench {
             BusMessage::GitOpDone { op, result, output } => {
                 self.git_op_done(op, result, output, cx);
             }
+            BusMessage::BlameReady { doc, annotate, result } => {
+                if let Some(tab) = self.tabs.iter().find(|tab| tab.doc == doc) {
+                    let inline = self.settings.inline_blame;
+                    match result {
+                        Ok(entries) => {
+                            let entries = std::sync::Arc::new(entries);
+                            tab.pane.update(cx, |pane, cx| pane.set_blame(Some(entries), annotate, inline, cx));
+                        }
+                        Err(e) => {
+                            self.toast(NotifyLevel::Warning, format!("{}: {}", strings::BLAME_FAILED, e.message));
+                        }
+                    }
+                    cx.notify();
+                }
+            }
             BusMessage::GitBranches { result } => {
                 if let Ok(branches) = result {
                     if let Some(state) = &mut self.git_window {
@@ -4842,6 +4951,16 @@ impl Workbench {
                 {
                     tab.dirty = false;
                     tab.stale = false;
+                    // The blame faces follow the saved text (M13): a live
+                    // swimlane (or inline entries) re-blames on save.
+                    let (annotated, has_entries) =
+                        tab.pane.read_with(cx, |pane, _| (pane.annotated(), pane.blame_entries().is_some()));
+                    if annotated || has_entries {
+                        let path = tab.path.clone();
+                        let pane_doc = doc;
+                        let annotate = annotated;
+                        self.load_blame(path, pane_doc, annotate, cx);
+                    }
                 }
                 match &error {
                     None => {
@@ -5853,6 +5972,8 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_toggle_git))
             .on_action(cx.listener(Self::on_branches))
             .on_action(cx.listener(Self::on_new_branch))
+            .on_action(cx.listener(Self::on_annotate))
+            .on_action(cx.listener(Self::on_toggle_inline_blame))
             .on_action(cx.listener(Self::on_debug))
             .on_action(cx.listener(Self::on_debug_step_into))
             .on_action(cx.listener(Self::on_debug_step_over))
