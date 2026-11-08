@@ -58,14 +58,81 @@ fn excludes() -> Vec<String> {
 /// hook now, so `languages/` stays at zero diff with upstream.
 const GOPLS_INITIALIZATION_OPTIONS: &str = "semanticTokens = true\n[hints]\nassignVariableTypes = true\nparameterNames = true\nfunctionTypeParameters = true\n";
 
+/// The vtsls / tsserver inlay-hint opt-in (M14a): the provider advertises but
+/// answers null until the wanted kinds turn on — the gopls story repeating —
+/// and upstream's `typescript.toml`/`javascript.toml` carry none. The shape
+/// is VSCode's `typescript.inlayHints.*` settings tree (M14a stdio probes:
+/// the preferences-form `includeInlay*` keys are ignored by vtsls; this form
+/// answers). The kinds mirror the Go baseline's default-on faces: types,
+/// parameter names, return types, enum values.
+const TS_INLAY_HINTS: &str = r#"
+[typescript.inlayHints.parameterTypes]
+enabled = true
+[typescript.inlayHints.parameterNames]
+enabled = "all"
+suppressWhenArgumentMatchesName = false
+[typescript.inlayHints.functionLikeReturnTypes]
+enabled = true
+[typescript.inlayHints.variableTypes]
+enabled = true
+suppressWhenTypeMatchesName = false
+[typescript.inlayHints.propertyDeclarationTypes]
+enabled = true
+[typescript.inlayHints.enumMemberValues]
+enabled = true
+[javascript.inlayHints.parameterTypes]
+enabled = true
+[javascript.inlayHints.parameterNames]
+enabled = "all"
+suppressWhenArgumentMatchesName = false
+[javascript.inlayHints.functionLikeReturnTypes]
+enabled = true
+[javascript.inlayHints.variableTypes]
+enabled = true
+suppressWhenTypeMatchesName = false
+[javascript.inlayHints.propertyDeclarationTypes]
+enabled = true
+[javascript.inlayHints.enumMemberValues]
+enabled = true
+"#;
+
+/// Merges `layer` under `base` (deep, tables union; leaves from `layer`).
+/// Mirrors ide-lsp's own settings merge, app-side (the fork's options live
+/// here, never in the tomls).
+fn merge_toml(base: &mut toml::Value, layer: toml::Value) {
+    match (base, layer) {
+        (toml::Value::Table(base), toml::Value::Table(layer)) => {
+            for (key, value) in layer {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_toml(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, layer) => *base = layer,
+    }
+}
+
 /// Fills server-config gaps before each launch. Deliberately conservative:
-/// only gopls, and only when nobody (a user override, a future registry
-/// change) already set options.
+/// the gopls opt-ins only when nobody set options, and the vtsls hints as a
+/// merge under whatever exists (a user's own inlayHints kind wins).
 fn apply_server_overrides(cfg: &mut LanguageServerConfig) {
     if cfg.name == "gopls" && cfg.initialization_options.is_none() {
         // Static text, unit-tested to parse; `.ok()` keeps the launch path
         // panic-free even if it ever drifts.
         cfg.initialization_options = toml::from_str(GOPLS_INITIALIZATION_OPTIONS).ok();
+    }
+    if cfg.name == "vtsls"
+        && let Ok(hints) = toml::from_str::<toml::Value>(TS_INLAY_HINTS)
+    {
+        // The existing options merge OVER the hints tree: the toml's (or a
+        // user's) own kinds win, the defaults fill the gaps.
+        let existing = cfg.initialization_options.take().unwrap_or_else(|| toml::Value::Table(Default::default()));
+        let mut merged = hints;
+        merge_toml(&mut merged, existing);
+        cfg.initialization_options = Some(merged);
     }
 }
 
@@ -571,6 +638,65 @@ root-markers = ["go.work", "go.mod"]
             preset.initialization_options.expect("kept")["semanticTokens"].as_bool(),
             Some(false),
             "an existing option is never clobbered"
+        );
+    }
+
+    /// The upstream vtsls rows carry rename/import preferences; the overlay
+    /// merges the hints under them without touching either.
+    fn vtsls_config() -> LanguageServerConfig {
+        toml::from_str(
+            r#"
+name = "vtsls"
+command = "vtsls"
+[initialization-options.typescript.preferences]
+useAliasesForRenames = false
+"#,
+        )
+        .expect("vtsls row parses")
+    }
+
+    #[test]
+    fn vtsls_options_gain_the_inlay_hint_tree() {
+        let mut cfg = vtsls_config();
+        apply_server_overrides(&mut cfg);
+        let options = cfg.initialization_options.expect("options present");
+        // The toml's own preference survives the merge.
+        assert_eq!(
+            options["typescript"]["preferences"]["useAliasesForRenames"].as_bool(),
+            Some(false),
+            "existing preferences survive"
+        );
+        let hints = &options["typescript"]["inlayHints"];
+        assert_eq!(hints["parameterTypes"]["enabled"].as_bool(), Some(true));
+        assert_eq!(hints["parameterNames"]["enabled"].as_str(), Some("all"));
+        assert_eq!(hints["variableTypes"]["suppressWhenTypeMatchesName"].as_bool(), Some(false));
+        assert_eq!(
+            options["javascript"]["inlayHints"]["functionLikeReturnTypes"]["enabled"].as_bool(),
+            Some(true),
+            "the javascript section rides along"
+        );
+    }
+
+    #[test]
+    fn vtsls_options_merge_without_options_and_kept_kinds() {
+        // No toml options: the hints tree is the whole payload.
+        let mut bare: LanguageServerConfig =
+            toml::from_str("name = \"vtsls\"\ncommand = \"vtsls\"\n").expect("bare row parses");
+        apply_server_overrides(&mut bare);
+        let hints = &bare.initialization_options.expect("filled")["typescript"]["inlayHints"];
+        assert_eq!(hints["enumMemberValues"]["enabled"].as_bool(), Some(true));
+
+        // A project's own kind is never clobbered.
+        let mut preset: LanguageServerConfig = toml::from_str(
+            "name = \"vtsls\"\ncommand = \"vtsls\"\n[initialization-options.typescript.inlayHints.parameterTypes]\nenabled = false\n",
+        )
+        .expect("preset row parses");
+        apply_server_overrides(&mut preset);
+        assert_eq!(
+            preset.initialization_options.expect("kept")["typescript"]["inlayHints"]["parameterTypes"]["enabled"]
+                .as_bool(),
+            Some(false),
+            "an existing hint kind wins"
         );
     }
 }

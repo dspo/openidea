@@ -5073,7 +5073,15 @@ pub async fn organize_imports_action(
 ) -> IdeResult<Option<ide_lsp::types::CodeAction>> {
     const SOURCE_ORGANIZE: &str = "source.organizeImports";
     let mut actions = lsp.code_actions(doc, range, vec![SOURCE_ORGANIZE.to_owned()]).await?;
-    actions.retain(|action| action.kind.as_deref() == Some(SOURCE_ORGANIZE) && action.disabled_reason.is_none());
+    // Sub-kinds count (ruff answers `source.organizeImports.ruff`, the
+    // tsserver family `.ts`): the LSP convention narrows a parent kind, so
+    // the match is by prefix (M14a — python's save-organize rides ruff).
+    actions.retain(|action| {
+        let kind = action.kind.as_deref().unwrap_or_default();
+        let wanted =
+            kind == SOURCE_ORGANIZE || kind.strip_prefix(SOURCE_ORGANIZE).is_some_and(|rest| rest.starts_with('.'));
+        wanted && action.disabled_reason.is_none()
+    });
     let Some(action) = actions.into_iter().next() else { return Ok(None) };
     if action.edit.is_some() {
         return Ok(Some(action));
@@ -7153,6 +7161,41 @@ mod tests {
             assert!(buf.line_block(count, count).is_empty(), "case {text:?} empty run");
             assert!(buf.line_block(count + 3, count + 9).is_empty(), "case {text:?} out-of-range run");
         }
+    }
+
+    /// The organize filter keeps the parent kind and its sub-kinds, drops
+    /// everything else (and disabled actions).
+    #[test]
+    fn organize_filter_widens_to_sub_kinds() {
+        let keep = |kind: Option<&str>, disabled: Option<&str>| {
+            let action = ide_lsp::types::CodeAction {
+                title: "t".into(),
+                kind: kind.map(str::to_owned),
+                disabled_reason: disabled.map(str::to_owned),
+                is_preferred: false,
+                edit: None,
+                command: None,
+                data: None,
+                server: ide_core::ServerId::next(),
+            };
+            let kinds = [action];
+            let mut actions: Vec<_> = kinds.into_iter().collect();
+            const SOURCE_ORGANIZE: &str = "source.organizeImports";
+            actions.retain(|action| {
+                let kind = action.kind.as_deref().unwrap_or_default();
+                let wanted = kind == SOURCE_ORGANIZE
+                    || kind.strip_prefix(SOURCE_ORGANIZE).is_some_and(|rest| rest.starts_with('.'));
+                wanted && action.disabled_reason.is_none()
+            });
+            actions.len()
+        };
+        assert_eq!(keep(Some("source.organizeImports"), None), 1, "the parent kind");
+        assert_eq!(keep(Some("source.organizeImports.ruff"), None), 1, "ruff's sub-kind");
+        assert_eq!(keep(Some("source.organizeImports.ts"), None), 1, "tsserver's sub-kind");
+        assert_eq!(keep(Some("source.fixAll.ruff"), None), 0, "a sibling kind");
+        assert_eq!(keep(Some("source.organizeImportsX"), None), 0, "prefix lookalikes stay out");
+        assert_eq!(keep(None, None), 0, "kindless actions stay out");
+        assert_eq!(keep(Some("source.organizeImports.ruff"), Some("disabled")), 0);
     }
 
     /// `line_blocks` groups contiguous runs and covers every requested line.
