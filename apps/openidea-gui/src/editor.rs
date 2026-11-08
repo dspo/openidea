@@ -1475,7 +1475,14 @@ impl EditorPane {
         let first_visible = self.scroll.get().floor().max(0.0) as u32;
         let slack = viewport.max(12);
         let first = first_visible.saturating_sub(slack);
-        let last = (first_visible + viewport + slack).min(self.buf.line_count());
+        let count = self.buf.line_count();
+        // The end is an inclusive line index clamped into the buffer, with
+        // the last line's own length: an end at `line_count` (one past the
+        // last line) reads as "to the end" for gopls, but rust-analyzer
+        // validates it strictly and rejects every request (M14a probes —
+        // the M6 clamp lesson, second server).
+        let last = (first_visible + viewport + slack).min(count).saturating_sub(1).max(first);
+        let last_col = if last + 1 < count { 0 } else { self.buf.line_span(last).len() as u32 };
         if let Some((lo, hi)) = self.inlay_cover
             && lo <= first
             && last <= hi
@@ -1489,11 +1496,25 @@ impl EditorPane {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let lsp = self.host.lsp.clone();
         let doc = self.doc_id;
-        let range = ide_core::Range::new(ide_core::Pos::new(first, 0), ide_core::Pos::new(last, 0));
+        let range = ide_core::Range::new(ide_core::Pos::new(first, 0), ide_core::Pos::new(last, last_col));
         self.host.runtime.spawn(async move {
             // The debounce lives on the tokio side (keystroke bursts collapse).
             tokio::time::sleep(Duration::from_millis(250)).await;
-            let result = lsp.inlay_hints(doc, range).await;
+            // rust-analyzer validates the range against its own (older)
+            // document while a paste's reanalysis is still in flight and
+            // rejects with `Invalid offset` instead of waiting (gopls
+            // clamps; M14a probes). The same request retries until the
+            // server catches up — the generation guard drops stale answers.
+            let mut result = lsp.inlay_hints(doc, range).await;
+            for _attempt in 0..5 {
+                match &result {
+                    Err(e) if e.message.contains("Invalid offset") => {
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        result = lsp.inlay_hints(doc, range).await;
+                    }
+                    _ => break,
+                }
+            }
             let _ = tx.send((range, result));
         });
         cx.spawn(async move |this, cx| {
