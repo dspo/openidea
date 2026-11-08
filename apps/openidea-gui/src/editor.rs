@@ -16,6 +16,7 @@
 //! ordinary range math.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -210,6 +211,18 @@ struct Buffer {
     doc: ide_text::Document,
     /// The in-flight composition, inline in `doc`.
     marked: Option<Range<usize>>,
+}
+
+/// One line fetched by [`Buffer::line_block`]: the exact data the paint loop
+/// used to derive per row through `line_span` + `slice_utf16` +
+/// `line_to_byte` (three rope walks).
+#[derive(Debug)]
+struct FetchedLine {
+    /// UTF-16 content span (the `\n` excluded).
+    span: Range<usize>,
+    /// The line's first byte (rope coordinates).
+    byte_start: usize,
+    text: String,
 }
 
 /// One cursor with optional selection. Offsets are UTF-16; `head` is the
@@ -422,6 +435,64 @@ impl Buffer {
         let start = self.line_start(line);
         let end = if line + 1 < self.line_count() { self.line_start(line + 1) - 1 } else { self.utf16_len() };
         start..end.max(start)
+    }
+
+    /// One sequential fetch for the contiguous run `lo..hi`: every line's
+    /// UTF-16 content span, first byte and text, computed with two offset
+    /// conversions and one copy for the whole run instead of one walk plus a
+    /// copy plus a byte conversion per line. The editor's prepaint fetches
+    /// the visible rows this way — the profiler sample showed ropey's
+    /// per-line offset scans topping the frame (M14a budget work).
+    fn line_block(&self, lo: u32, hi: u32) -> Vec<FetchedLine> {
+        let count = self.line_count();
+        let mut out = Vec::new();
+        if lo >= hi || lo >= count {
+            return out;
+        }
+        let hi = hi.min(count);
+        let run_start = self.line_start(lo);
+        let run_end = if hi >= count { self.utf16_len() } else { self.line_start(hi) };
+        let block = self.slice_utf16(run_start..run_end);
+        let mut utf16_at = run_start;
+        let mut byte_at = self.doc.rope().line_to_byte(lo as usize);
+        for piece in block.split_inclusive('\n') {
+            // A `\r` stays inside the line's span, matching `line_span`
+            // (only the `\n` is excluded); its UTF-16 and byte lengths ride
+            // the local strings, never back through the rope.
+            let (text, nl) = match piece.strip_suffix('\n') {
+                Some(head) => (head, 1usize),
+                None => (piece, 0usize),
+            };
+            let utf16_len = text.chars().map(char::len_utf16).sum::<usize>();
+            out.push(FetchedLine { span: utf16_at..utf16_at + utf16_len, byte_start: byte_at, text: text.to_owned() });
+            utf16_at += utf16_len + nl;
+            byte_at += text.len() + nl;
+        }
+        // A document ending in `\n` has an empty final line the split never
+        // yields; pad the run so it always covers `lo..hi`.
+        while out.len() < (hi - lo) as usize {
+            out.push(FetchedLine { span: utf16_at..utf16_at, byte_start: byte_at, text: String::new() });
+        }
+        out
+    }
+
+    /// Fetches `lines` (ascending, unique — the visible rows') in one pass
+    /// per contiguous run, keyed by line.
+    fn line_blocks(&self, lines: &[u32]) -> HashMap<u32, FetchedLine> {
+        let mut out = HashMap::new();
+        let mut index = 0;
+        while index < lines.len() {
+            let mut end = index + 1;
+            while end < lines.len() && lines[end] == lines[end - 1] + 1 {
+                end += 1;
+            }
+            let lo = lines[index];
+            for (offset, fetched) in self.line_block(lo, lines[end - 1] + 1).into_iter().enumerate() {
+                out.insert(lo + offset as u32, fetched);
+            }
+            index = end;
+        }
+        out
     }
 
     /// Char index of a UTF-16 offset (clamped, mid-surrogate rounds down).
@@ -1474,10 +1545,9 @@ impl EditorPane {
     /// buffer's hint list sliced to `line`. Called per visible row from the
     /// prepaint, which also publishes them into `hints_by_line` for the
     /// x-mapping helpers.
-    fn row_hints(&self, line: u32, window: &Window, font_size: Pixels) -> Vec<RowHint> {
+    fn row_hints(&self, line: u32, line_len: usize, window: &Window, font_size: Pixels) -> Vec<RowHint> {
         let start = self.inlays.partition_point(|hint| hint.position.line < line);
         let end = start + self.inlays[start..].partition_point(|hint| hint.position.line == line);
-        let line_len = self.buf.line_span(line).len();
         let mut hints = Vec::new();
         for hint in &self.inlays[start..end] {
             if hint.label.is_empty() {
@@ -6339,6 +6409,18 @@ impl Element for EditorElement {
         let mut frame_max_w = px(0.0);
         let mut hinted_rows = 0u32;
         pane.hints_by_line.borrow_mut().clear();
+        // The visible rows' buffer lines, fetched one sequential pass per
+        // contiguous run (M14a): `line_span` + `slice_utf16` + `line_to_byte`
+        // per row costed four-plus rope walks each, and a keystroke frame
+        // paid them for every visible row.
+        let mut visible_lines: Vec<u32> = Vec::with_capacity((last - first) as usize);
+        for display in first..last {
+            let (line, placeholder) = pane.resolve_display(display);
+            if placeholder.is_none() {
+                visible_lines.push(line);
+            }
+        }
+        let mut blocks = pane.buf.line_blocks(&visible_lines);
         for display in first..last {
             let (line, placeholder) = pane.resolve_display(display);
             let shaped = match placeholder {
@@ -6348,9 +6430,15 @@ impl Element for EditorElement {
                     window.text_system().shape_line(label.into(), font_size, &[run], None)
                 }
                 None => {
-                    let span = pane.buf.line_span(line);
-                    let content = pane.buf.slice_utf16(span.clone());
-                    let line_start_byte = pane.buf.doc.rope().line_to_byte(line as usize);
+                    let fetched = blocks.remove(&line).unwrap_or_else(|| FetchedLine {
+                        span: pane.buf.line_span(line),
+                        byte_start: pane.buf.doc.rope().line_to_byte(line as usize),
+                        text: pane.buf.slice_utf16(pane.buf.line_span(line)),
+                    });
+                    let span = fetched.span;
+                    let span_len = span.len();
+                    let content = fetched.text;
+                    let line_start_byte = fetched.byte_start;
                     // The line's diagnostics as line-local UTF-16 ranges. What
                     // starts here also marks the gutter.
                     let mut line_diags = Vec::new();
@@ -6394,7 +6482,7 @@ impl Element for EditorElement {
                     // Inlay hints join the row text inline: split the runs at
                     // each hint and interleave the labels (the rest of the
                     // line shifts right by their widths).
-                    let hints = pane.row_hints(line, window, font_size);
+                    let hints = pane.row_hints(line, span_len, window, font_size);
                     let (painted, runs) = if hints.is_empty() {
                         (content, runs)
                     } else {
@@ -6575,10 +6663,8 @@ impl Element for EditorElement {
         pane.hud.rows_laid_out.set(rows.len() as u32);
         pane.hud.hints_rows.set(hinted_rows);
         pane.hud.spans_total.set(pane.spans.len() as u32);
-        let visible_lo =
-            rows.iter().filter_map(|row| row.line.map(|line| pane.buf.line_start(line))).min().unwrap_or(usize::MAX);
-        let visible_hi =
-            rows.iter().filter_map(|row| row.line.map(|line| pane.buf.line_span(line).end)).max().unwrap_or(0);
+        let visible_lo = visible_lines.first().map(|line| pane.buf.line_start(*line)).unwrap_or(usize::MAX);
+        let visible_hi = visible_lines.last().map(|line| pane.buf.line_span(*line).end).unwrap_or(0);
         let lo_idx = pane.spans.partition_point(|(range, _)| range.end <= visible_lo);
         let hi_idx = pane.spans.partition_point(|(range, _)| range.start < visible_hi);
         pane.hud.spans_painted.set(hi_idx.saturating_sub(lo_idx) as u32);
@@ -7027,6 +7113,60 @@ mod tests {
 
     fn tc(from: u32, to: u32, insert: &str) -> TextChange {
         TextChange { from, to, insert: insert.into() }
+    }
+
+    /// `line_block` matches the per-line `line_span` + `slice_utf16` +
+    /// `line_to_byte` face it replaced — for plain lines, CRLF tails, CJK
+    /// double units, the trailing no-newline line and empty lines.
+    #[test]
+    fn line_block_matches_per_line_face() {
+        let cases = [
+            "alpha\nbeta\ngamma\n",
+            "win\r\nlines\r\nend",
+            "汉字 twice 漢字\nsecond 中文 line\n",
+            "last line has no newline",
+            "first\n\nthird\n",
+            "",
+            "one-liner",
+        ];
+        for text in cases {
+            let buf = Buffer::new(text);
+            let count = buf.line_count();
+            for lo in 0..count {
+                for hi in lo + 1..=count {
+                    let block = buf.line_block(lo, hi);
+                    assert_eq!(block.len(), (hi - lo) as usize, "case {text:?} run {lo}..{hi}");
+                    for (offset, fetched) in block.iter().enumerate() {
+                        let line = lo + offset as u32;
+                        let span = buf.line_span(line);
+                        assert_eq!(fetched.span, span, "case {text:?} line {line} span");
+                        assert_eq!(fetched.text, buf.slice_utf16(span.clone()), "case {text:?} line {line} text");
+                        assert_eq!(
+                            fetched.byte_start,
+                            buf.doc.rope().line_to_byte(line as usize),
+                            "case {text:?} line {line} byte_start"
+                        );
+                    }
+                }
+            }
+            // Degenerate runs stay empty.
+            assert!(buf.line_block(count, count).is_empty(), "case {text:?} empty run");
+            assert!(buf.line_block(count + 3, count + 9).is_empty(), "case {text:?} out-of-range run");
+        }
+    }
+
+    /// `line_blocks` groups contiguous runs and covers every requested line.
+    #[test]
+    fn line_blocks_covers_requested_lines() {
+        let buf = Buffer::new("a\nbb\nccc\ndddd\neeeee");
+        // Ascending request with a break: lines 1..4 as one run, then 0.
+        let fetched = buf.line_blocks(&[1, 2, 3, 0]);
+        assert_eq!(fetched.len(), 4);
+        for line in 0u32..4 {
+            let f = fetched.get(&line).expect("every requested line fetched");
+            assert_eq!(f.span, buf.line_span(line), "line {line} span");
+            assert_eq!(f.text, buf.slice_utf16(f.span.clone()), "line {line} text");
+        }
     }
 
     fn doc_info(language: &str, editorconfig: Option<ide_workspace::EditorConfigProps>) -> DocumentInfo {
