@@ -444,6 +444,24 @@ impl Host {
         repo.rebase(onto)
     }
 
+    /// The project's changelists (M13): upstream's per-project
+    /// `.openidea/changelists.json` (the Tauri host's face), loaded with the
+    /// module's normalization.
+    pub fn changelists_load(&self) -> ide_vcs::ChangelistState {
+        ide_vcs::changelists::load(&ide_core::project_dir::path(&self.root, "changelists.json"))
+    }
+
+    /// Persists the changelists; the per-user entries stay out of version
+    /// control like IDEA's `.idea/.gitignore` (upstream's helper).
+    pub fn changelists_save(&self, state: &ide_vcs::ChangelistState) -> IdeResult<()> {
+        ide_vcs::changelists::ensure_ignored(
+            &ide_core::project_dir::path(&self.root, ""),
+            &["/shelf/", "/changelists.json"],
+        )
+        .ok();
+        ide_vcs::changelists::save(&ide_core::project_dir::path(&self.root, "changelists.json"), state)
+    }
+
     /// Continues (or aborts) the merge/rebase in progress.
     pub fn git_continue_operation(&self) -> IdeResult<()> {
         let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;

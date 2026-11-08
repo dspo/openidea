@@ -207,3 +207,10 @@ pub const CONFLICT_CONTINUE: &str = "Continue";
 pub const CONFLICT_ABORT: &str = "Abort";
 pub const CONFLICT_NO_MORE: &str = "No more conflicts in this file";
 pub const CONFLICT_APPLY_FAILED: &str = "Cannot apply the resolution";
+
+// Changelists (M13).
+pub const CHANGELIST_MOVE_TO: &str = "Move to Changelist";
+pub const CHANGELIST_NEW: &str = "New Changelist…";
+pub const CHANGELIST_DELETE: &str = "Delete Changelist";
+pub const CHANGELIST_ACTIVATE: &str = "Set Active";
+pub const CHANGELIST_NAME_PLACEHOLDER: &str = "Changelist name (⏎ creates)";

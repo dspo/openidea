@@ -223,6 +223,7 @@ struct DiffState {
 }
 
 /// One checkbox row of the commit overlay.
+#[derive(Clone)]
 struct CommitFile {
     path: PathBuf,
     name: String,
@@ -242,6 +243,8 @@ struct CommitWindowState {
     /// The file whose diff preview shows (`None` = the hint placeholder).
     diff_for: Option<PathBuf>,
     diff_lines: Vec<DiffLine>,
+    /// The new-changelist inline input (M13), shown while arming.
+    new_list_input: Option<Entity<InputState>>,
 }
 
 /// How many log rows one Git window page loads (the brief's pagination face;
@@ -487,6 +490,8 @@ pub struct Workbench {
     commit_window: Option<CommitWindowState>,
     /// The window input's ⌘Enter subscription, alive while the state is.
     commit_window_sub: Option<gpui::Subscription>,
+    /// The commit window's new-changelist input's ⏎ subscription.
+    commit_new_list_sub: Option<gpui::Subscription>,
     /// The Git tool window's log state (M13), built at its first open.
     git_window: Option<GitWindowState>,
     /// The filter inputs' Enter subscriptions, alive while the state is.
@@ -498,6 +503,9 @@ pub struct Workbench {
     git_operation: Option<String>,
     /// The active tab's conflict blocks (M13's strip), `None` when clean.
     conflicts: Option<ConflictStrip>,
+    /// The project's changelists (M13): the Commit window's grouping and the
+    /// Git window's shared answer (both read this one value).
+    changelists: ide_vcs::ChangelistState,
     /// The message input's PressEnter subscription, alive while the overlay is.
     commit_sub: Option<gpui::Subscription>,
     /// The tree prompt overlay (M7 context menu: new file / folder, rename)
@@ -649,12 +657,14 @@ impl Workbench {
             last_edit_memory: None,
             commit_window: None,
             commit_window_sub: None,
+            commit_new_list_sub: None,
             git_window: None,
             git_filter_subs: Vec::new(),
             branches_popup: None,
             branches_new_sub: None,
             git_operation: None,
             conflicts: None,
+            changelists: ide_vcs::ChangelistState::initial(),
             trust_prompt: pending_trust
                 .as_ref()
                 .map(|path| TrustPrompt { path: path.clone(), focus: cx.focus_handle() }),
@@ -876,6 +886,8 @@ impl Workbench {
         self.branches_new_sub = None;
         self.git_operation = None;
         self.conflicts = None;
+        // The changelists belong to the incoming project (upstream's file).
+        self.changelists = host.changelists_load();
         self.closed_tabs.clear();
         // The usages answer belongs to the outgoing project; the Structure
         // window refetches for the (initially) empty active tab.
@@ -1696,12 +1708,22 @@ impl Workbench {
         self.toggle_window("commit", cx);
         if self.commit_window.is_none() {
             let input = cx.new(|cx| TextareaState::new(window, cx).placeholder(strings::COMMIT_MESSAGE_PLACEHOLDER));
+            let new_list_input =
+                cx.new(|cx| InputState::new(window, cx).placeholder(strings::CHANGELIST_NAME_PLACEHOLDER));
             self.commit_window = Some(CommitWindowState {
                 files: Vec::new(),
                 input: input.clone(),
                 diff_for: None,
                 diff_lines: Vec::new(),
+                new_list_input: Some(new_list_input.clone()),
             });
+            // ⏎ in the name input creates the changelist.
+            self.commit_new_list_sub =
+                Some(cx.subscribe_in(&new_list_input, window, |this, _, event: &InputEvent, window, cx| {
+                    if let InputEvent::PressEnter { .. } = event {
+                        this.changelist_create(window, cx);
+                    }
+                }));
             // ⌘Enter commits (the ⌘K dialog's face, in the window too).
             self.commit_window_sub = Some(cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
                 if let InputEvent::PressEnter { secondary: true, .. } = event {
@@ -1726,7 +1748,8 @@ impl Workbench {
         files.sort_by(|a, b| a.name.cmp(&b.name));
         let diff_for = existing.diff_for.clone().filter(|path| files.iter().any(|file| &file.path == path));
         let diff_lines = existing.diff_lines.clone();
-        self.commit_window = Some(CommitWindowState { files, input, diff_for, diff_lines });
+        let new_list_input = existing.new_list_input.clone();
+        self.commit_window = Some(CommitWindowState { files, input, diff_for, diff_lines, new_list_input });
         cx.notify();
     }
 
@@ -5780,6 +5803,30 @@ fn file_name(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
 }
 
+/// The Commit window's grouping: the files grouped by their changelist
+/// (unassigned files ride the active list; a stale assignment to a deleted
+/// list falls back to it), the active group first (IDEA's face).
+fn changelist_groups(
+    lists: &[ide_vcs::Changelist],
+    active: &str,
+    assignments: &std::collections::BTreeMap<String, String>,
+    files: &[CommitFile],
+) -> Vec<(ide_vcs::Changelist, Vec<usize>)> {
+    let mut groups: Vec<(ide_vcs::Changelist, Vec<usize>)> =
+        lists.iter().map(|list| (list.clone(), Vec::new())).collect();
+    for (index, file) in files.iter().enumerate() {
+        let assigned =
+            assignments.get(file.path.to_string_lossy().as_ref()).cloned().unwrap_or_else(|| active.to_owned());
+        let index_of = groups.iter().position(|(list, _)| list.id == assigned);
+        let index_of = index_of.or_else(|| groups.iter().position(|(list, _)| list.id == active));
+        if let Some(position) = index_of {
+            groups[position].1.push(index);
+        }
+    }
+    groups.sort_by_key(|(list, _)| list.id != active);
+    groups
+}
+
 /// The `LogQuery` the Git window's filters build: branch scope, the applied
 /// author/message needles, the active file (when the Path chip is on), and
 /// `skip` pagination over upstream's filtered result.
@@ -7036,6 +7083,79 @@ impl Workbench {
         Some(div().id("window-scroll-usages").flex_1().min_h_0().overflow_y_scroll().children(rows).into_any_element())
     }
 
+    // -- changelists (M13) -------------------------------------------------------
+
+    /// Persists the changelist state (the single save face).
+    fn changelists_persist(&mut self, cx: &mut Context<Self>) {
+        if let Some(host) = self.host.as_ref()
+            && let Err(e) = host.changelists_save(&self.changelists)
+        {
+            self.toast(NotifyLevel::Warning, e.message);
+        }
+        self.rebuild_commit_files(cx);
+        cx.notify();
+    }
+
+    /// Creates the changelist the inline input names (⏎ or the button); the
+    /// new list becomes active (the next changes land in it — IDEA's face).
+    fn changelist_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = self.commit_window.as_ref().and_then(|w| w.new_list_input.clone()) else { return };
+        let name = input.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let id = format!("cl-{}", self.changelists.lists.len() + 1);
+        self.changelists.lists.push(ide_vcs::Changelist {
+            id: id.clone(),
+            name: name.to_owned(),
+            comment: String::new(),
+        });
+        self.changelists.active = id;
+        input.update(cx, |input, cx| input.set_value("", window, cx));
+        self.changelists_persist(cx);
+    }
+
+    /// "New Changelist…": the inline input takes the focus (⏎ creates).
+    fn changelist_arm_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = self.commit_window.as_ref().and_then(|w| w.new_list_input.clone()) {
+            window.focus(&input.read(cx).focus_handle(cx), cx);
+            cx.notify();
+        }
+    }
+
+    /// Moves a file to `list` (the row's Move-to menu).
+    fn changelist_move(&mut self, path: PathBuf, list: String, cx: &mut Context<Self>) {
+        self.changelists.files.insert(path.to_string_lossy().into_owned(), list);
+        self.changelists_persist(cx);
+    }
+
+    /// Deletes a changelist: its files return to the active list (IDEA's
+    /// face); the default list cannot be deleted.
+    fn changelist_delete(&mut self, list: String, cx: &mut Context<Self>) {
+        if list == ide_vcs::changelists::DEFAULT_ID || !self.changelists.lists.iter().any(|l| l.id == list) {
+            return;
+        }
+        self.changelists.lists.retain(|l| l.id != list);
+        self.changelists.files.retain(|_, assigned| assigned != &list);
+        if self.changelists.active == list {
+            self.changelists.active = ide_vcs::changelists::DEFAULT_ID.to_owned();
+        }
+        self.changelists_persist(cx);
+    }
+
+    /// Sets the changelist the next changes land in.
+    fn changelist_activate(&mut self, list: String, cx: &mut Context<Self>) {
+        if self.changelists.lists.iter().any(|l| l.id == list) {
+            self.changelists.active = list;
+            self.changelists_persist(cx);
+        }
+    }
+
+    /// The Commit window's grouping (the pure face below).
+    fn changelist_groups(&self, files: &[CommitFile]) -> Vec<(ide_vcs::Changelist, Vec<usize>)> {
+        changelist_groups(&self.changelists.lists, &self.changelists.active, &self.changelists.files, files)
+    }
+
     /// The Commit window's body (M10, the IDEA 2020+ left-side Commit): the
     /// changelist checkbox rows beside the selected file's diff preview, the
     /// message history above the message input, and the Commit button. The
@@ -7047,51 +7167,154 @@ impl Workbench {
         };
         let empty = window.files.is_empty();
         let workbench = cx.entity().downgrade();
-        // The changelist: a checkbox + the git-kind-colored name per file; a
+        // The changelist groups (M13): headers with their counts and the
+        // move/delete/activate menus, then the checkbox rows beneath — a
         // row click (outside the checkbox) loads the diff preview.
         let mut list = div().id("commit-window-files").min_h_0().overflow_y_scroll();
         if empty {
             list = list.child(self.render_window_placeholder(strings::COMMIT_NO_CHANGES));
         }
-        for (index, file) in window.files.iter().enumerate() {
-            let color = theme::git_status_color(file.kind);
-            let path = file.path.clone();
+        let groups = self.changelist_groups(&window.files);
+        for (group, members) in &groups {
+            let active = group.id == self.changelists.active;
+            let default = group.id == ide_vcs::changelists::DEFAULT_ID;
+            let workbench_header = cx.entity().downgrade();
+            let group_id = group.id.clone();
             list = list.child(
                 div()
-                    .id(SharedString::from(format!("commit-window-row-{index}")))
-                    .h(px(26.0))
+                    .id(SharedString::from(format!("changelist-header-{id}", id = group.id)))
+                    .h(px(24.0))
                     .px_2()
+                    .mt_1()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .text_size(px(12.))
-                    .hover(|row| row.bg(theme::raised_bg()))
-                    .on_click(
-                        cx.listener(move |this, _: &ClickEvent, _, cx| this.preview_commit_file(path.clone(), cx)),
-                    )
-                    .child(Checkbox::new(("commit-window-check", index)).checked(file.selected).on_click({
-                        let workbench = workbench.clone();
-                        move |checked, _, cx| {
-                            workbench
-                                .update(cx, |this, cx| {
-                                    if let Some(file) = this.commit_window.as_mut().and_then(|w| w.files.get_mut(index))
-                                    {
-                                        file.selected = *checked;
-                                    }
-                                    cx.notify();
-                                })
-                                .ok();
+                    .gap_1()
+                    .text_size(px(11.))
+                    .context_menu(move |menu, _, _| {
+                        let mut menu = menu;
+                        if !default {
+                            let workbench = workbench_header.clone();
+                            let group_id = group_id.clone();
+                            menu = menu.item(PopupMenuItem::new(strings::CHANGELIST_ACTIVATE).on_click(
+                                move |_, _, cx| {
+                                    workbench
+                                        .update(cx, |this, cx| this.changelist_activate(group_id.clone(), cx))
+                                        .ok();
+                                },
+                            ));
                         }
-                    }))
+                        if !default {
+                            let workbench = workbench_header.clone();
+                            let group_id = group_id.clone();
+                            menu =
+                                menu.item(PopupMenuItem::new(strings::CHANGELIST_DELETE).on_click(move |_, _, cx| {
+                                    workbench.update(cx, |this, cx| this.changelist_delete(group_id.clone(), cx)).ok();
+                                }));
+                        }
+                        menu
+                    })
+                    .when(active, |header| header.text_color(theme::accent()))
+                    .when(!active, |header| header.text_color(theme::fg_muted()))
+                    .child(SharedString::from(if active { format!("● {}", group.name) } else { group.name.clone() }))
+                    .child(div().text_color(theme::fg_muted()).child(SharedString::from(format!("{}", members.len())))),
+            );
+            for index in members.iter().copied() {
+                let file = window.files[index].clone();
+                let color = theme::git_status_color(file.kind);
+                let path = file.path.clone();
+                let path_for_menu = file.path.clone();
+                let workbench_row = cx.entity().downgrade();
+                let move_targets: Vec<ide_vcs::Changelist> = self.changelists.lists.to_vec();
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("commit-window-row-{index}")))
+                        .h(px(26.0))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_size(px(12.))
+                        .hover(|row| row.bg(theme::raised_bg()))
+                        .on_click(
+                            cx.listener(move |this, _: &ClickEvent, _, cx| this.preview_commit_file(path.clone(), cx)),
+                        )
+                        .context_menu(move |menu, _, _| {
+                            let mut menu = menu;
+                            let workbench = workbench_row.clone();
+                            for target in &move_targets {
+                                let workbench = workbench.clone();
+                                let target_id = target.id.clone();
+                                let target_name = target.name.clone();
+                                let path2 = path_for_menu.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(format!("{} — {}", strings::CHANGELIST_MOVE_TO, target_name))
+                                        .on_click(move |_, _, cx| {
+                                            workbench
+                                                .update(cx, |this, cx| {
+                                                    this.changelist_move(path2.clone(), target_id.clone(), cx)
+                                                })
+                                                .ok();
+                                        }),
+                                );
+                            }
+                            menu.item(PopupMenuItem::new(strings::CHANGELIST_NEW).on_click({
+                                let workbench = workbench.clone();
+                                move |_, window, cx| {
+                                    workbench.update(cx, |this, cx| this.changelist_arm_new(window, cx)).ok();
+                                }
+                            }))
+                        })
+                        .child(Checkbox::new(("commit-window-check", index)).checked(file.selected).on_click({
+                            let workbench = workbench.clone();
+                            move |checked, _, cx| {
+                                workbench
+                                    .update(cx, |this, cx| {
+                                        if let Some(file) =
+                                            this.commit_window.as_mut().and_then(|w| w.files.get_mut(index))
+                                        {
+                                            file.selected = *checked;
+                                        }
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            }
+                        }))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .when_some(color, |name, c| name.text_color(c))
+                                .child(SharedString::from(file.name.clone())),
+                        ),
+                );
+            }
+        }
+        // The new-changelist inline input (M13): ⏎ or the button creates
+        // (and activates) the named list.
+        if let Some(new_input) = &window.new_list_input {
+            list = list.child(
+                div()
+                    .h(px(28.0))
+                    .px_2()
+                    .mt_1()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .border_t_1()
+                    .border_color(theme::border())
+                    .child(div().flex_1().child(Input::new(new_input).small().bordered(false).h(px(22.0))))
                     .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .when_some(color, |name, c| name.text_color(c))
-                            .child(SharedString::from(file.name.clone())),
+                        Button::new("changelist-create")
+                            .label(strings::CHANGELIST_NEW.trim_end_matches("…"))
+                            .xsmall()
+                            .ghost()
+                            .on_click(
+                                cx.listener(|this, _: &ClickEvent, window, cx| this.changelist_create(window, cx)),
+                            ),
                     ),
             );
         }
+
         // The diff preview: the selected file's hunks, or the hint.
         let diff = div()
             .id("commit-window-diff")
@@ -9306,5 +9529,53 @@ mod terminal_tests {
         assert_eq!(terminal_cwd_of("https://example.com/x"), None);
 
         assert_eq!(terminal_cwd_of("file://localhost"), None);
+    }
+}
+
+#[cfg(test)]
+mod changelist_tests {
+    use super::*;
+
+    /// The grouping face: unassigned files ride the active list, the active
+    /// group renders first, and an assignment to a deleted list falls back
+    /// to the active one (the persisted map can go stale).
+    #[test]
+    fn files_group_by_their_changelist_with_the_active_first() {
+        let lists = vec![
+            ide_vcs::Changelist {
+                id: ide_vcs::changelists::DEFAULT_ID.into(),
+                name: "Changes".into(),
+                comment: String::new(),
+            },
+            ide_vcs::Changelist { id: "cl-2".into(), name: "Feature".into(), comment: String::new() },
+        ];
+        let mut assignments = std::collections::BTreeMap::new();
+        assignments.insert("/r/a.go".to_owned(), ide_vcs::changelists::DEFAULT_ID.to_owned());
+        assignments.insert("/r/b.go".to_owned(), "cl-2".to_owned());
+        assignments.insert("/r/c.go".to_owned(), "gone".to_owned());
+        let files: Vec<CommitFile> = ["/r/a.go", "/r/b.go", "/r/c.go", "/r/d.go"]
+            .iter()
+            .map(|p| CommitFile {
+                path: PathBuf::from(*p),
+                name: "x".into(),
+                kind: ChangeKind::Modified,
+                selected: true,
+            })
+            .collect();
+        let groups = changelist_groups(&lists, "cl-2", &assignments, &files);
+        // The active list first, then the default.
+        assert_eq!(groups[0].0.id, "cl-2");
+        assert_eq!(groups[1].0.id, ide_vcs::changelists::DEFAULT_ID);
+        let members = |id: &str| -> Vec<String> {
+            groups
+                .iter()
+                .find(|(list, _)| list.id == id)
+                .map(|(_, members)| members.iter().map(|i| files[*i].path.to_string_lossy().into_owned()).collect())
+                .unwrap()
+        };
+        // b was assigned to cl-2; c's stale assignment and the unassigned d
+        // ride the ACTIVE list; a keeps its explicit default assignment.
+        assert_eq!(members("cl-2"), vec!["/r/b.go", "/r/c.go", "/r/d.go"]);
+        assert_eq!(members(ide_vcs::changelists::DEFAULT_ID), vec!["/r/a.go"]);
     }
 }
