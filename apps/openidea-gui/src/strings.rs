@@ -164,3 +164,16 @@ pub const TRUST_TITLE: &str = "Trust and Open Project?";
 pub const TRUST_HINT: &str = "Projects in the trusted list open without this prompt.";
 pub const TRUST_ACCEPT: &str = "Trust Project";
 pub const TRUST_DECLINE: &str = "Don't Open";
+
+// The Git window's log graph (M13).
+pub const GIT_FILTER_ALL_BRANCHES: &str = "All Branches";
+pub const GIT_FILTER_AUTHOR: &str = "Author";
+pub const GIT_FILTER_MESSAGE: &str = "Message";
+pub const GIT_FILTER_PATH: &str = "Path";
+pub const GIT_LOAD_MORE: &str = "Load more";
+pub const GIT_LOADING: &str = "loading…";
+pub const GIT_NO_COMMITS: &str = "No commits match the filters";
+pub const GIT_LOG_FAILED: &str = "Git log failed";
+pub const GIT_DETAIL_HINT: &str = "Select a commit to see its message and files";
+pub const GIT_REFRESH: &str = "Refresh";
+pub const TW_NOTHING_GIT: &str = "No repository";

@@ -50,6 +50,9 @@ actions!(
         // M12: the duplicate-code inspection (Code menu; the Duplicates
         // window earns its OnUse stripe at the first run).
         AnalyzeDuplicates,
+        // M13: the Git window (⌘9, the preset's toolwindow.git slot) — the
+        // log graph's home.
+        ToggleGit,
         DebugStepInto,
         DebugStepOver,
         DebugResume,
@@ -236,6 +239,7 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("editor::Rename", "Rename…", "Refactor", "⇧F6"),
     action_info!("editor::CodeActions", "Quick Fix…", "Refactor", "⌥⏎"),
     action_info!("workbench::AnalyzeDuplicates", "Locate Duplicates…", "Code", "⌘⇧D"),
+    action_info!("workbench::ToggleGit", "Git", "View", "⌘9"),
     action_info!("editor::FormatDocument", "Format Document", "Code", "⌘⌥L"),
     action_info!("editor::OrganizeImports", "Organize Imports", "Code", "⌃⌥O"),
     action_info!("editor::ToggleInlayHints", "Toggle Inlay Hints", "View", "⌥⌘I"),

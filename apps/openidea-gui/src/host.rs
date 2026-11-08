@@ -196,6 +196,13 @@ impl Host {
         };
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let repo = Repo::discover(&root).ok().flatten().map(Arc::new);
+        // The log window's cache (M13): upstream's disposable, content-
+        // addressed log index outside the worktree, keyed per repository.
+        if let Some(repo) = &repo
+            && let Some(cache) = dirs::cache_dir()
+        {
+            repo.enable_log_index(&cache.join("openidea-gui").join("log"));
+        }
         eprintln!("[vcs] {} repository at {}", if repo.is_some() { "found" } else { "no" }, root.display());
         Ok(Self {
             root,
@@ -353,6 +360,40 @@ impl Host {
     pub fn git_commit(&self, message: &str) -> IdeResult<String> {
         let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
         repo.commit(message, false, false)
+    }
+
+    // -- git log / branches (M13) -------------------------------------------
+
+    /// One page of the log (call on a background thread): `query` carries the
+    /// branch/author/path/text filters and `skip`/`limit` pagination; the
+    /// commits arrive newest-first with upstream's graph connections.
+    pub fn git_log(&self, query: &ide_vcs::LogQuery) -> IdeResult<Vec<ide_vcs::Commit>> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        repo.log(query)
+    }
+
+    /// Files changed by `commit` relative to its first parent.
+    pub fn git_commit_files(&self, commit: &str) -> IdeResult<Vec<ide_vcs::ChangedFile>> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        repo.commit_files(commit)
+    }
+
+    /// Added/deleted lines per file between two revisions.
+    pub fn git_diff_numstat(&self, from: &str, to: &str) -> IdeResult<Vec<ide_vcs::FileLineStats>> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        repo.diff_numstat(from, to, &[])
+    }
+
+    /// Content of `path` at `rev` (default HEAD); `None` if absent there.
+    pub fn git_file_at(&self, path: &Path, rev: Option<&str>) -> IdeResult<Option<String>> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        repo.file_at(path, rev, encoding_rs::UTF_8)
+    }
+
+    /// Local and remote branches, the current first.
+    pub fn git_branches(&self) -> IdeResult<Vec<ide_vcs::Branch>> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        repo.branches()
     }
 }
 

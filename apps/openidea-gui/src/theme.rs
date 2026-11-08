@@ -189,6 +189,24 @@ pub fn diff_added() -> gpui::Hsla {
     rgba((GIT_ADDED << 8) | 0xff).into()
 }
 
+// The log graph's lane palette (M13): eight hues in the app's dark family,
+// assigned by lane index (a branch's line keeps its color down its lane).
+const GRAPH_LANES: [u32; 8] = [
+    0x74a3f0, // blue (the modified tone)
+    0x6fbf7f, // green (the added tone)
+    0xd6a55f, // amber
+    0xd19a66, // orange
+    0xb48ce0, // purple
+    0x5fbdb0, // teal
+    0xd16b55, // red (the deleted tone)
+    0x8fb0d9, // steel
+];
+
+/// The color of graph lane `index` (wrapping past the palette).
+pub fn graph_lane_color(index: u16) -> gpui::Hsla {
+    rgba((GRAPH_LANES[(index as usize) % GRAPH_LANES.len()] << 8) | 0xff).into()
+}
+
 // The terminal surface's palette (M11): the app's dark greys bridge into the
 // ghostty core's RGB (programs' own palette/OSC colors still win per-index;
 // these are the defaults the render state resolves against).

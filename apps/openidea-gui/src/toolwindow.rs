@@ -92,7 +92,9 @@ pub const WINDOWS: &[WindowDesc] = &[
     // -- deferred (data rows only; the milestone that lights them) -----------
     window!("debug", "Debug", Bug, Bottom, 4, Some(5), Shown, Some("toolwindow.debug"), true),
     window!("services", "Services", Server, Bottom, 5, Some(8), Shown, Some("toolwindow.services"), true),
-    window!("git", "Git", GitBranch, Bottom, 6, Some(9), Shown, Some("toolwindow.git"), false),
+    // M13: the Git window lights up — the log graph (the bottom slot ⌘9 the
+    // preset's toolwindow.git row names).
+    window!("git", "Git", GitBranch, Bottom, 6, Some(9), Shown, Some("toolwindow.git"), true),
     window!("terminal", "Terminal", SquareTerminal, Bottom, 7, None, OnUse, Some("toolwindow.terminal"), true),
     // M12: the duplicate-code inspection (the Code menu's Locate
     // Duplicates… runs the analysis and lights the OnUse button).
@@ -223,10 +225,10 @@ mod tests {
         for (digit, id) in expect {
             assert_eq!(l.slot_window(digit).map(|d| d.id), Some(id), "slot {digit}");
         }
-        // M11 lights Debug (⌘5) and Services (⌘8); Git's ⌘9 stays dark.
+        // M11 lights Debug (⌘5) and Services (⌘8); M13 lights Git (⌘9).
         assert_eq!(l.slot_window(5).map(|d| d.id), Some("debug"));
         assert_eq!(l.slot_window(8).map(|d| d.id), Some("services"));
-        assert!(l.slot_window(9).is_none());
+        assert_eq!(l.slot_window(9).map(|d| d.id), Some("git"));
     }
 
     #[test]
@@ -253,8 +255,8 @@ mod tests {
         let bottom: Vec<&str> = l.stripe_buttons(Anchor::Bottom).iter().map(|(d, _)| d.id).collect();
         assert_eq!(
             bottom,
-            vec!["problems", "run", "debug", "services"],
-            "find is OnUse and unused; usages has no button yet; M11 lights debug/services"
+            vec!["problems", "run", "debug", "services", "git"],
+            "find is OnUse and unused; usages has no button yet; M13 lights git"
         );
     }
 
@@ -264,7 +266,7 @@ mod tests {
         used.used = true;
         let l = layout(&[("find", used)], None, None);
         let bottom: Vec<&str> = l.stripe_buttons(Anchor::Bottom).iter().map(|(d, _)| d.id).collect();
-        assert_eq!(bottom, vec!["problems", "find", "run", "debug", "services"]);
+        assert_eq!(bottom, vec!["problems", "find", "run", "debug", "services", "git"]);
     }
 
     #[test]

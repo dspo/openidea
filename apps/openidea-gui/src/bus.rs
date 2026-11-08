@@ -193,6 +193,25 @@ pub enum BusMessage {
         container: Option<String>,
         file_run: bool,
     },
+    /// One Git-log page arrived (M13; the read ran on the background
+    /// executor through upstream's `Repo::log`). `reset` replaces the
+    /// window's rows (a filter change), otherwise the page appends (Load
+    /// more).
+    GitLogPage {
+        reset: bool,
+        result: IdeResult<Vec<ide_vcs::Commit>>,
+    },
+    /// A commit's detail fetch finished (M13): the changed files and their
+    /// per-file line stats. `id` matches against the window's selection.
+    GitCommitDetail {
+        id: String,
+        result: IdeResult<(Vec<ide_vcs::ChangedFile>, Vec<ide_vcs::FileLineStats>)>,
+    },
+    /// The repository's branch list arrived (M13): the log window's branch
+    /// filter menu.
+    GitBranches {
+        result: IdeResult<Vec<ide_vcs::Branch>>,
+    },
 }
 
 /// The UI end of the event bus. Cheap to clone; `send` never blocks

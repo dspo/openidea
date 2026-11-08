@@ -15,6 +15,7 @@ mod editor;
 mod file_tree;
 mod find_panel;
 mod fuzzy;
+mod git_graph;
 mod highlight;
 mod host;
 mod ime;

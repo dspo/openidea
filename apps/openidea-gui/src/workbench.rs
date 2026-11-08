@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable as _, InteractiveElement, IntoElement,
-    KeyDownEvent, ModifiersChangedEvent, MouseButton, ParentElement, Render, SharedString,
-    StatefulInteractiveElement as _, Styled, Window, canvas, div, px,
+    AppContext as _, Bounds, ClickEvent, Context, Entity, FocusHandle, Focusable as _, InteractiveElement, IntoElement,
+    KeyDownEvent, ModifiersChangedEvent, MouseButton, ParentElement, PathBuilder, Pixels, Render, SharedString,
+    StatefulInteractiveElement as _, Styled, Window, canvas, div, fill, point, px, size,
 };
 use gpui_component::Disableable as _;
 use gpui_component::WindowExt as _;
@@ -32,7 +32,7 @@ use gpui_component::{Icon, Selectable as _, Sizable as _};
 use gpui_kit_assets::IconName;
 use ide_core::event::NotifyLevel;
 use ide_core::event::ServerStatus;
-use ide_core::{Diagnostic, DocId, IdeError, IdeEvent, OutlineItem, ServerId, Severity};
+use ide_core::{Diagnostic, DocId, IdeError, IdeEvent, IdeResult, OutlineItem, ServerId, Severity};
 use ide_index::{FileMatch, SymbolFilter, SymbolMatch};
 use ide_run::RunConfig;
 use ide_vcs::ChangeKind;
@@ -51,6 +51,7 @@ use crate::editor::EditorPane;
 use crate::file_tree::{FileTree, Row};
 use crate::find_panel::FindPanel;
 use crate::fuzzy;
+use crate::git_graph;
 use crate::host::Host;
 use crate::keymap;
 use crate::navigation;
@@ -76,6 +77,8 @@ enum DockPage {
     Debug,
     // M12: the duplicate-code inspection's face (the right stripe).
     Duplicates,
+    // M13: the Git window (⌘9) — the log graph.
+    Git,
 }
 
 /// An active dock/tree drag (M7): which handle, where the press started, and
@@ -239,6 +242,47 @@ struct CommitWindowState {
     /// The file whose diff preview shows (`None` = the hint placeholder).
     diff_for: Option<PathBuf>,
     diff_lines: Vec<DiffLine>,
+}
+
+/// How many log rows one Git window page loads (the brief's pagination face;
+/// Load more appends the next page).
+const GIT_LOG_PAGE: u32 = 500;
+
+/// A commit's detail (M13): the files it changed (against its first parent)
+/// and their added/deleted line counts.
+#[derive(Clone)]
+struct GitCommitDetail {
+    files: Vec<ide_vcs::ChangedFile>,
+    stats: Vec<ide_vcs::FileLineStats>,
+}
+
+/// The Git tool window's state (M13): the accumulated log pages with their
+/// derived graph lanes, the minimal filter set, and the selected commit's
+/// detail. Rebuilt per project (the log belongs to one repository).
+struct GitWindowState {
+    commits: Vec<ide_vcs::Commit>,
+    graph: Vec<git_graph::GraphRow>,
+    selected: Option<usize>,
+    detail: Option<GitCommitDetail>,
+    /// The repository's branches (the filter menu's rows).
+    branches: Vec<ide_vcs::Branch>,
+    /// `None` = all branches (upstream's log walks HEAD + every branch).
+    filter_branch: Option<String>,
+    /// The author needle input and the message needle input (empty = any).
+    author_input: Entity<InputState>,
+    text_input: Entity<InputState>,
+    /// The values the running filters hold (the inputs change freely; Enter
+    /// applies them).
+    applied_author: Option<String>,
+    applied_text: Option<String>,
+    /// Limit the log to the active tab's file.
+    filter_path: bool,
+    page: u32,
+    /// The log's total size (upstream reports it with the rows).
+    total: Option<u32>,
+    loading: bool,
+    /// The last page came back short: nothing more to load.
+    exhausted: bool,
 }
 
 /// The commit overlay (M4): the changed files (checked = staged for this
@@ -418,6 +462,10 @@ pub struct Workbench {
     commit_window: Option<CommitWindowState>,
     /// The window input's ⌘Enter subscription, alive while the state is.
     commit_window_sub: Option<gpui::Subscription>,
+    /// The Git tool window's log state (M13), built at its first open.
+    git_window: Option<GitWindowState>,
+    /// The filter inputs' Enter subscriptions, alive while the state is.
+    git_filter_subs: Vec<gpui::Subscription>,
     /// The message input's PressEnter subscription, alive while the overlay is.
     commit_sub: Option<gpui::Subscription>,
     /// The tree prompt overlay (M7 context menu: new file / folder, rename)
@@ -569,6 +617,8 @@ impl Workbench {
             last_edit_memory: None,
             commit_window: None,
             commit_window_sub: None,
+            git_window: None,
+            git_filter_subs: Vec::new(),
             trust_prompt: pending_trust
                 .as_ref()
                 .map(|path| TrustPrompt { path: path.clone(), focus: cx.focus_handle() }),
@@ -782,6 +832,9 @@ impl Workbench {
         self.runs.clear();
         self.find_panel = None;
         self.dock_page = DockPage::Run(0);
+        // The log window belongs to the outgoing project's repository.
+        self.git_window = None;
+        self.git_filter_subs.clear();
         self.closed_tabs.clear();
         // The usages answer belongs to the outgoing project; the Structure
         // window refetches for the (initially) empty active tab.
@@ -1113,7 +1166,8 @@ impl Workbench {
             | DockPage::Usages
             | DockPage::Terminal
             | DockPage::Debug
-            | DockPage::Duplicates => None,
+            | DockPage::Duplicates
+            | DockPage::Git => None,
         };
         let target = selected
             .filter(|panel| panel.read(cx).running())
@@ -1165,6 +1219,7 @@ impl Workbench {
             DockPage::Terminal => !self.terminals.is_empty(),
             DockPage::Duplicates => self.duplicates.is_some(),
             DockPage::Debug => self.debug.is_some(),
+            DockPage::Git => self.git_window.is_some(),
             DockPage::Problems | DockPage::Run(_) => true,
         };
         if !page_live {
@@ -1188,7 +1243,7 @@ impl Workbench {
             self.settings.layout.windows.get(desc.id).cloned().unwrap_or_else(|| WindowState::defaults(desc));
         if desc.id == "project" {
             state.visible = self.settings.layout.tree_visible;
-        } else if matches!(desc.id, "find" | "problems" | "usages" | "run" | "terminal" | "debug") {
+        } else if matches!(desc.id, "find" | "problems" | "usages" | "run" | "terminal" | "debug" | "git") {
             state.visible = self.settings.layout.dock_visible && self.dock_page == self.page_for(desc.id);
         }
         state
@@ -1213,6 +1268,7 @@ impl Workbench {
             "terminal" => DockPage::Terminal,
             "debug" => DockPage::Debug,
             "duplicates" => DockPage::Duplicates,
+            "git" => DockPage::Git,
             _ => DockPage::Run(self.runs.len().saturating_sub(1)),
         }
     }
@@ -1227,6 +1283,7 @@ impl Workbench {
             DockPage::Terminal => Some("terminal"),
             DockPage::Debug => Some("debug"),
             DockPage::Duplicates => Some("duplicates"),
+            DockPage::Git => Some("git"),
         }
     }
 
@@ -1234,7 +1291,7 @@ impl Workbench {
     /// fields, not the map) and persists.
     fn set_win_state(&mut self, desc: &WindowDesc, state: WindowState, cx: &mut Context<Self>) {
         let stored = match desc.id {
-            "project" | "find" | "problems" | "usages" | "run" | "terminal" | "debug" => {
+            "project" | "find" | "problems" | "usages" | "run" | "terminal" | "debug" | "git" => {
                 WindowState { visible: false, ..state }
             }
             _ => state,
@@ -1676,6 +1733,579 @@ impl Workbench {
             })
             .detach();
         cx.notify();
+    }
+
+    // -- the Git tool window (M13): the log graph -----------------------------
+
+    /// ⌘9: the Git window's stripe toggle. First open builds the filter
+    /// inputs (input entities need the window) and loads the first page of
+    /// the log through upstream's log API.
+    fn on_toggle_git(&mut self, _: &acts::ToggleGit, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_window("git", cx);
+        if self.git_window.is_none() {
+            let author = cx.new(|cx| InputState::new(window, cx).placeholder(strings::GIT_FILTER_AUTHOR));
+            let text = cx.new(|cx| InputState::new(window, cx).placeholder(strings::GIT_FILTER_MESSAGE));
+            self.git_window = Some(GitWindowState {
+                commits: Vec::new(),
+                graph: Vec::new(),
+                selected: None,
+                detail: None,
+                branches: Vec::new(),
+                filter_branch: None,
+                author_input: author.clone(),
+                text_input: text.clone(),
+                applied_author: None,
+                applied_text: None,
+                filter_path: false,
+                page: 0,
+                total: None,
+                loading: false,
+                exhausted: false,
+            });
+            // Enter in either filter input re-runs the query.
+            self.git_filter_subs = vec![
+                cx.subscribe_in(&author, window, |this, _, event: &InputEvent, _, cx| {
+                    if let InputEvent::PressEnter { .. } = event {
+                        this.git_apply_filters(cx);
+                    }
+                }),
+                cx.subscribe_in(&text, window, |this, _, event: &InputEvent, _, cx| {
+                    if let InputEvent::PressEnter { .. } = event {
+                        this.git_apply_filters(cx);
+                    }
+                }),
+            ];
+            self.git_log_load(cx);
+            self.git_load_branches(cx);
+        }
+    }
+
+    /// Loads page zero (a fresh query): the answer replaces the rows.
+    fn git_log_load(&mut self, cx: &mut Context<Self>) {
+        let Some(host) = self.host.clone() else { return };
+        let Some(state) = self.git_window.as_mut() else { return };
+        if host.repo.is_none() {
+            return;
+        }
+        let active = self.active.and_then(|index| self.tabs.get(index)).map(|tab| tab.path.clone());
+        let query = git_log_query(state, active, 0);
+        state.page = 0;
+        state.loading = true;
+        let bus = self.bus.clone();
+        eprintln!(
+            "[git] log load branch={:?} author={:?} text={:?} path={:?}",
+            query.branch,
+            query.author,
+            query.text,
+            query.path.as_ref().map(|p| p.0.display().to_string())
+        );
+        cx.background_executor()
+            .spawn(async move {
+                let result = host.git_log(&query);
+                bus.send(BusMessage::GitLogPage { reset: true, result });
+            })
+            .detach();
+        cx.notify();
+    }
+
+    /// Load more: the next page appends to the rows.
+    fn git_log_more(&mut self, cx: &mut Context<Self>) {
+        let Some(host) = self.host.clone() else { return };
+        let Some(state) = self.git_window.as_mut() else { return };
+        if state.loading || state.exhausted {
+            return;
+        }
+        let skip = state.commits.len() as u32;
+        let active = self.active.and_then(|index| self.tabs.get(index)).map(|tab| tab.path.clone());
+        let query = git_log_query(state, active, skip);
+        state.page += 1;
+        state.loading = true;
+        let bus = self.bus.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let result = host.git_log(&query);
+                bus.send(BusMessage::GitLogPage { reset: false, result });
+            })
+            .detach();
+        cx.notify();
+    }
+
+    /// A log page arrived: reset replaces the rows (and the selection — the
+    /// commits moved), append extends them; the lanes re-derive over the
+    /// whole visible set so the graph stays coherent across pages.
+    fn git_log_page(&mut self, reset: bool, result: IdeResult<Vec<ide_vcs::Commit>>, cx: &mut Context<Self>) {
+        let Some(state) = &mut self.git_window else { return };
+        state.loading = false;
+        match result {
+            Ok(mut page) => {
+                state.total = page.iter().filter_map(|c| c.log_total).max().or(state.total);
+                state.exhausted = page.len() < GIT_LOG_PAGE as usize;
+                if reset {
+                    state.commits.clear();
+                    state.selected = None;
+                    state.detail = None;
+                }
+                eprintln!(
+                    "[git] log page: {} commits (total {:?}, exhausted={})",
+                    page.len(),
+                    state.total,
+                    state.exhausted
+                );
+                state.commits.append(&mut page);
+                state.graph = git_graph::assign_lanes(&state.commits);
+            }
+            Err(e) => {
+                self.toast(NotifyLevel::Warning, format!("{}: {}", strings::GIT_LOG_FAILED, e.message));
+            }
+        }
+        cx.notify();
+    }
+
+    /// The branch filter menu's data.
+    fn git_load_branches(&mut self, cx: &mut Context<Self>) {
+        let Some(host) = self.host.clone() else { return };
+        if host.repo.is_none() {
+            return;
+        }
+        let bus = self.bus.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let result = host.git_branches();
+                bus.send(BusMessage::GitBranches { result });
+            })
+            .detach();
+        cx.notify();
+    }
+
+    /// Enter in a filter input (or a branch chip / Path chip click): apply
+    /// the inputs and reload from page zero.
+    fn git_apply_filters(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = &mut self.git_window else { return };
+        let read = |input: &Entity<InputState>, cx: &mut Context<Self>| {
+            let value = input.read(cx).value().to_string();
+            let trimmed = value.trim().to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
+        };
+        let author = read(&state.author_input, cx);
+        let text = read(&state.text_input, cx);
+        state.applied_author = author;
+        state.applied_text = text;
+        self.git_log_load(cx);
+    }
+
+    /// A log row click: select the commit and fetch its detail (the files it
+    /// changed plus their line counts) on the background executor.
+    fn git_select_commit(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some((host, state)) = self.host.clone().zip(self.git_window.as_mut()) else { return };
+        let Some(commit) = state.commits.get(index) else { return };
+        let id = commit.id.clone();
+        let parent = commit.parents.first().cloned();
+        state.selected = Some(index);
+        state.detail = None;
+        let bus = self.bus.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let result = git_commit_detail(&host, &id, parent);
+                bus.send(BusMessage::GitCommitDetail { id, result });
+            })
+            .detach();
+        cx.notify();
+    }
+
+    /// A detail file-row click: the file's commit diff (parent ↔ commit)
+    /// opens the same overlay the ⌃D diff rides.
+    fn git_open_commit_file(&mut self, rel: String, cx: &mut Context<Self>) {
+        let Some(host) = self.host.clone() else { return };
+        let Some(state) = &self.git_window else { return };
+        let Some(index) = state.selected else { return };
+        let Some(commit) = state.commits.get(index) else { return };
+        let parent = commit.parents.first().cloned();
+        let id = commit.id.clone();
+        let short = commit.short_id.clone();
+        let abs = host.root.join(&rel);
+        let name = file_name(&PathBuf::from(&rel));
+        let bus = self.bus.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let old = match &parent {
+                    Some(p) => host.git_file_at(&abs, Some(p)).ok().flatten(),
+                    None => None,
+                };
+                let new = host.git_file_at(&abs, Some(&id)).ok().flatten();
+                let lines = match (old, new) {
+                    (Some(old), Some(new)) => diff_view::from_hunks(&ide_vcs::diff_hunks(&old, &new), &new),
+                    (None, Some(new)) => diff_view::from_hunks(&ide_vcs::diff_hunks("", &new), &new),
+                    (Some(old), None) => diff_view::from_hunks(&ide_vcs::diff_hunks(&old, ""), ""),
+                    (None, None) => Vec::new(),
+                };
+                let title = format!("{name} @ {short}");
+                bus.send(BusMessage::DiffReady { path: abs, title, result: Ok(lines) });
+            })
+            .detach();
+    }
+
+    /// The Git window's body: the filter row, the log rows (graph lanes +
+    /// refs + summary + author + date) with Load more at the end, and the
+    /// selected commit's detail on the right.
+    fn render_git_body(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(state) = &self.git_window else {
+            return self.render_window_placeholder(strings::TW_NOTHING_GIT);
+        };
+        if self.host.as_ref().and_then(|host| host.repo.as_ref()).is_none() {
+            return self.render_window_placeholder(strings::GIT_NOT_A_REPO);
+        }
+        // The filter row: the branch scope menu, the two needles, the path
+        // toggle, and the refresh button.
+        let branch_label = state.filter_branch.clone().unwrap_or_else(|| strings::GIT_FILTER_ALL_BRANCHES.to_owned());
+        let branches: Vec<(String, bool)> = state
+            .branches
+            .iter()
+            .filter(|branch| !branch.remote)
+            .map(|branch| (branch.name.clone(), branch.current))
+            .collect();
+        let workbench = cx.entity().downgrade();
+        let current_filter_branch = state.filter_branch.clone();
+        let mut header = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(theme::border())
+            .text_size(px(11.))
+            .child(Button::new("git-filter-branch").label(branch_label).xsmall().ghost().dropdown_menu_with_anchor(
+                gpui::Anchor::BottomLeft,
+                move |mut menu, _, _| {
+                    let wb = workbench.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(strings::GIT_FILTER_ALL_BRANCHES)
+                            .checked(current_filter_branch.is_none())
+                            .on_click(move |_, _, cx| {
+                                wb.update(cx, |this, cx| {
+                                    if let Some(state) = &mut this.git_window {
+                                        state.filter_branch = None;
+                                    }
+                                    this.git_apply_filters(cx);
+                                })
+                                .ok();
+                            }),
+                    );
+                    for (name, current) in &branches {
+                        let wb = workbench.clone();
+                        let name = name.clone();
+                        let checked = current_filter_branch.as_deref() == Some(name.as_str());
+                        menu = menu.item(
+                            PopupMenuItem::new(if *current { format!("● {name}") } else { name.clone() })
+                                .checked(checked)
+                                .on_click(move |_, _, cx| {
+                                    wb.update(cx, |this, cx| {
+                                        if let Some(state) = &mut this.git_window {
+                                            state.filter_branch = Some(name.clone());
+                                        }
+                                        this.git_apply_filters(cx);
+                                    })
+                                    .ok();
+                                }),
+                        );
+                    }
+                    menu
+                },
+            ))
+            .child(div().w(px(110.0)).child(Input::new(&state.author_input).small().bordered(false).h(px(22.0))))
+            .child(div().w(px(140.0)).child(Input::new(&state.text_input).small().bordered(false).h(px(22.0))));
+        let path_on = state.filter_path;
+        let active_file = self.active.and_then(|index| self.tabs.get(index)).map(|tab| file_name(&tab.path));
+        let workbench_chip = cx.entity().downgrade();
+        header = header.child(
+            Button::new("git-filter-path")
+                .label(match (&path_on, active_file) {
+                    (true, Some(name)) => format!("{}: {}", strings::GIT_FILTER_PATH, name),
+                    _ => strings::GIT_FILTER_PATH.to_owned(),
+                })
+                .xsmall()
+                .ghost()
+                .when(path_on, |chip| chip.text_color(theme::accent()))
+                .on_click(move |_, _, cx| {
+                    workbench_chip
+                        .update(cx, |this, cx| {
+                            if let Some(state) = &mut this.git_window {
+                                state.filter_path = !state.filter_path;
+                            }
+                            this.git_apply_filters(cx);
+                        })
+                        .ok();
+                }),
+        );
+        let workbench_refresh = cx.entity().downgrade();
+        header = header.child(
+            Button::new("git-refresh")
+                .icon(IconName::RotateCw)
+                .xsmall()
+                .ghost()
+                .tooltip(strings::GIT_REFRESH)
+                .on_click(move |_, _, cx| {
+                    workbench_refresh.update(cx, |this, cx| this.git_apply_filters(cx)).ok();
+                }),
+        );
+
+        // The log rows. The graph column's width follows the widest row's
+        // lane count (capped, so a busy history cannot eat the summary).
+        let lanes = state.graph.iter().map(|row| row.width).max().unwrap_or(1);
+        let graph_w = px((17.0 * lanes.min(12) as f32) + 8.0);
+        let selected = state.selected;
+        let mut rows = div().id("git-log-rows").flex_1().min_h_0().overflow_y_scroll().py_1();
+        if state.commits.is_empty() && !state.loading {
+            rows = rows.child(self.render_window_placeholder(if state.total == Some(0) {
+                strings::GIT_NO_COMMITS
+            } else {
+                strings::GIT_LOADING
+            }));
+        }
+        for (index, commit) in state.commits.iter().enumerate() {
+            let graph = state.graph.get(index).cloned();
+            let refs = commit.refs.clone();
+            let summary =
+                if commit.message_truncated { format!("{}…", commit.summary) } else { commit.summary.clone() };
+            let author = commit.author.clone();
+            let date = git_graph::format_date_ms(commit.time_ms);
+            let on_branch = commit.on_current_branch.unwrap_or(false);
+            rows = rows.child(
+                div()
+                    .id(("git-row", index))
+                    .h(px(24.0))
+                    .pr_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.))
+                    .when(selected == Some(index), |row| row.bg(theme::selected_bg()))
+                    .hover(|row| row.bg(theme::raised_bg()))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.git_select_commit(index, cx);
+                    }))
+                    .child(div().w(graph_w).h_full().flex_none().child(canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| {
+                            if let Some(graph) = &graph {
+                                paint_graph_row(graph, bounds, window);
+                            }
+                        },
+                    )))
+                    .child(
+                        div()
+                            .w(px(64.0))
+                            .flex_none()
+                            .font_family(theme::FONT_FAMILY)
+                            .text_size(px(10.))
+                            .text_color(theme::fg_muted())
+                            .child(SharedString::from(commit.short_id.clone())),
+                    )
+                    .child(div().flex_none().max_w(px(160.0)).flex().gap_1().children(refs.iter().take(3).map(
+                        |name| {
+                            let head = name == "HEAD";
+                            div()
+                                .px_1()
+                                .rounded(px(3.0))
+                                .text_size(px(10.))
+                                .when(head, |chip| chip.bg(theme::selected_bg()).text_color(theme::accent()))
+                                .when(!head, |chip| {
+                                    chip.border_1().border_color(theme::border()).text_color(theme::fg_muted())
+                                })
+                                .child(SharedString::from(name.clone()))
+                        },
+                    )))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .when(on_branch, |label| label.text_color(theme::fg()))
+                            .when(!on_branch, |label| label.text_color(theme::fg_muted()))
+                            .child(SharedString::from(summary)),
+                    )
+                    .child(
+                        div()
+                            .w(px(120.0))
+                            .flex_none()
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(theme::fg_muted())
+                            .child(SharedString::from(author)),
+                    )
+                    .child(
+                        div()
+                            .w(px(96.0))
+                            .flex_none()
+                            .text_size(px(11.))
+                            .text_color(theme::fg_muted())
+                            .child(SharedString::from(date)),
+                    ),
+            );
+        }
+        if !state.exhausted && !state.commits.is_empty() {
+            let totals = state.total.map(|t| format!(" / {t}")).unwrap_or_default();
+            let loading = state.loading;
+            rows = rows.child(
+                div()
+                    .id("git-load-more")
+                    .h(px(26.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(11.))
+                    .text_color(theme::fg_muted())
+                    .hover(|row| row.bg(theme::raised_bg()))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.git_log_more(cx)))
+                    .child(SharedString::from(format!(
+                        "{} {}{}{}",
+                        strings::GIT_LOAD_MORE,
+                        state.commits.len(),
+                        totals,
+                        if loading { format!(" · {}", strings::GIT_LOADING) } else { String::new() }
+                    ))),
+            );
+        }
+
+        // The detail panel (right): message, author, date, files with their
+        // +/- counts; a file row opens the parent↔commit diff.
+        let detail = state.detail.clone();
+        let selected_commit = selected.and_then(|index| state.commits.get(index));
+        let mut panel =
+            div().w(px(340.0)).flex_none().h_full().flex().flex_col().border_l_1().border_color(theme::border());
+        match (selected_commit, detail) {
+            (None, _) => {
+                panel = panel.child(self.render_window_placeholder(strings::GIT_DETAIL_HINT));
+            }
+            (Some(commit), detail) => {
+                let refs = commit.refs.join(" · ");
+                panel = panel
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .font_family(theme::FONT_FAMILY)
+                                    .text_size(px(12.))
+                                    .text_color(theme::accent())
+                                    .child(SharedString::from(commit.short_id.clone())),
+                            )
+                            .when(!refs.is_empty(), |header| {
+                                header.child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(10.))
+                                        .text_color(theme::fg_muted())
+                                        .child(SharedString::from(refs)),
+                                )
+                            }),
+                    )
+                    .child(div().px_2().text_size(px(11.)).text_color(theme::fg_muted()).child(SharedString::from(
+                        format!("{} · {}", commit.author, git_graph::format_date_ms(commit.time_ms)),
+                    )))
+                    .child(
+                        div()
+                            .id("git-detail-message")
+                            .max_h(px(140.0))
+                            .overflow_y_scroll()
+                            .px_2()
+                            .py_1()
+                            .text_size(px(12.))
+                            .child(SharedString::from(commit.message.clone())),
+                    );
+                match detail {
+                    None => {
+                        panel = panel.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .text_size(px(11.))
+                                .text_color(theme::fg_muted())
+                                .child(SharedString::from(strings::GIT_LOADING)),
+                        );
+                    }
+                    Some(detail) => {
+                        let mut files = div().id("git-detail-files").flex_1().min_h_0().overflow_y_scroll();
+                        for file in &detail.files {
+                            let rel = file.path.clone();
+                            let (added, removed) = detail
+                                .stats
+                                .iter()
+                                .find(|s| s.path == file.path || s.old_path.as_deref() == Some(file.path.as_str()))
+                                .map(|s| (s.added, s.removed))
+                                .unwrap_or((0, 0));
+                            let color = theme::git_status_color(file.kind);
+                            files = files.child(
+                                div()
+                                    .id(SharedString::from(format!("git-detail-file-{}", rel)))
+                                    .h(px(22.0))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_size(px(11.))
+                                    .hover(|row| row.bg(theme::raised_bg()))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.git_open_commit_file(rel.clone(), cx);
+                                    }))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .truncate()
+                                            .when_some(color, |name, c| name.text_color(c))
+                                            .child(SharedString::from(file.path.clone())),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_color(theme::diff_added())
+                                            .child(SharedString::from(format!("+{added}"))),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_color(theme::error())
+                                            .child(SharedString::from(format!("-{removed}"))),
+                                    ),
+                            );
+                        }
+                        if detail.files.is_empty() {
+                            files = files.child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .text_size(px(11.))
+                                    .text_color(theme::fg_muted())
+                                    .child(SharedString::from(strings::DIFF_NO_CHANGES)),
+                            );
+                        }
+                        panel = panel.child(
+                            div()
+                                .px_2()
+                                .pt_1()
+                                .text_size(px(10.))
+                                .text_color(theme::fg_muted())
+                                .child(SharedString::from(format!("{} files changed", detail.files.len()))),
+                        );
+                        panel = panel.child(files);
+                    }
+                }
+            }
+        }
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(div().flex_1().min_h_0().flex().child(rows).child(panel))
+            .into_any_element()
     }
 
     /// Hands the focus to the topmost live surface: the still-open overlays
@@ -2382,6 +3012,9 @@ impl Workbench {
         }
         rows.push(PickerRow::Dock(DockPage::Find, "Find".to_owned()));
         rows.push(PickerRow::Dock(DockPage::Problems, "Problems".to_owned()));
+        if self.git_window.is_some() {
+            rows.push(PickerRow::Dock(DockPage::Git, "Git".to_owned()));
+        }
         for index in 0..self.runs.len() {
             rows.push(PickerRow::Dock(DockPage::Run(index), format!("Run {}", index + 1)));
         }
@@ -2997,7 +3630,8 @@ impl Workbench {
             | DockPage::Usages
             | DockPage::Terminal
             | DockPage::Debug
-            | DockPage::Duplicates => None,
+            | DockPage::Duplicates
+            | DockPage::Git => None,
         };
         let panel = selected
             .or_else(|| self.runs.iter().find(|panel| panel.read(cx).running()))
@@ -3450,6 +4084,34 @@ impl Workbench {
             }
             BusMessage::RunTestAt { doc, name, container, file_run } => {
                 self.run_test_at(doc, &name, container.as_deref(), file_run, cx);
+            }
+            BusMessage::GitLogPage { reset, result } => {
+                self.git_log_page(reset, result, cx);
+            }
+            BusMessage::GitBranches { result } => {
+                if let Some(state) = &mut self.git_window
+                    && let Ok(branches) = result
+                {
+                    state.branches = branches;
+                    cx.notify();
+                }
+            }
+            BusMessage::GitCommitDetail { id, result } => {
+                if let Some(state) = &mut self.git_window {
+                    // Only the still-selected commit may take the answer.
+                    let selected = state.selected.and_then(|index| state.commits.get(index)).map(|c| c.id.clone());
+                    if selected.as_deref() == Some(id.as_str()) {
+                        match result {
+                            Ok((files, stats)) => {
+                                state.detail = Some(GitCommitDetail { files, stats });
+                            }
+                            Err(e) => {
+                                self.toast(NotifyLevel::Warning, format!("{}: {}", strings::GIT_LOG_FAILED, e.message));
+                            }
+                        }
+                        cx.notify();
+                    }
+                }
             }
             BusMessage::DuplicatesReady { result } => {
                 self.duplicates_running.set(false);
@@ -4315,6 +4977,93 @@ fn file_name(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
 }
 
+/// The `LogQuery` the Git window's filters build: branch scope, the applied
+/// author/message needles, the active file (when the Path chip is on), and
+/// `skip` pagination over upstream's filtered result.
+fn git_log_query(state: &GitWindowState, active: Option<PathBuf>, skip: u32) -> ide_vcs::LogQuery {
+    ide_vcs::LogQuery {
+        branch: state.filter_branch.clone(),
+        author: state.applied_author.clone(),
+        text: state.applied_text.clone(),
+        path: state.filter_path.then_some(active).flatten().map(ide_core::IpcPath::from),
+        skip,
+        limit: GIT_LOG_PAGE,
+        order: ide_vcs::LogOrder::Topo,
+        ..Default::default()
+    }
+}
+
+/// Git's empty tree — the root commit's diff base (`git diff <empty-tree>
+/// <commit>` works in any repository; git special-cases the object).
+fn empty_tree_id() -> String {
+    "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_owned()
+}
+
+/// The commit detail fetch (runs on the background executor): the files the
+/// commit changed against its first parent, with their added/deleted counts
+/// (the root commit diffs against the empty tree).
+fn git_commit_detail(
+    host: &crate::host::Host,
+    id: &str,
+    parent: Option<String>,
+) -> IdeResult<(Vec<ide_vcs::ChangedFile>, Vec<ide_vcs::FileLineStats>)> {
+    let files = host.git_commit_files(id)?;
+    let from = parent.unwrap_or_else(empty_tree_id);
+    let stats = host.git_diff_numstat(&from, id).unwrap_or_default();
+    Ok((files, stats))
+}
+
+/// One log row's graph drawing: the pass-through lane verticals, the
+/// incoming line to the dot, the dot itself, the first parent's continuation
+/// (straight down its lane, or converging diagonally when the parent is
+/// shared), and the merge edges (dashed when upstream marked the parent as
+/// outside the visible range). Lane colors carry the branch topology.
+fn paint_graph_row(graph: &git_graph::GraphRow, bounds: Bounds<Pixels>, window: &mut Window) {
+    let h = bounds.size.height;
+    let lane_x = |lane: u16| bounds.origin.x + px(7.0 + 17.0 * lane as f32);
+    let mid = bounds.origin.y + h / 2.0;
+    fn line(window: &mut Window, from: gpui::Point<Pixels>, to: gpui::Point<Pixels>, color: gpui::Hsla, dashed: bool) {
+        let mut builder = PathBuilder::stroke(px(1.5));
+        if dashed {
+            builder = builder.dash_array(&[px(3.0), px(3.0)]);
+        }
+        builder.move_to(from);
+        builder.line_to(to);
+        if let Ok(path) = builder.build() {
+            window.paint_path(path, color);
+        }
+    }
+    for lane in &graph.through {
+        let x = lane_x(*lane);
+        line(window, point(x, bounds.origin.y), point(x, bounds.origin.y + h), theme::graph_lane_color(*lane), false);
+    }
+    if graph.incoming {
+        let x = lane_x(graph.lane);
+        line(window, point(x, bounds.origin.y), point(x, mid), theme::graph_lane_color(graph.lane), false);
+    }
+    let dot = Bounds::new(point(lane_x(graph.lane) - px(3.0), mid - px(3.0)), size(px(6.0), px(6.0)));
+    window.paint_quad(fill(dot, theme::graph_lane_color(graph.lane)));
+    if let Some(first_out) = graph.first_out {
+        let to_x = lane_x(first_out);
+        line(
+            window,
+            point(lane_x(graph.lane), mid),
+            point(to_x, bounds.origin.y + h),
+            theme::graph_lane_color(first_out),
+            false,
+        );
+    }
+    for edge in &graph.edges {
+        line(
+            window,
+            point(lane_x(edge.from), mid),
+            point(lane_x(edge.to), bounds.origin.y + h),
+            theme::graph_lane_color(edge.to),
+            edge.dashed,
+        );
+    }
+}
+
 /// The JSON report file one test run writes (`--outputFile`): unique per
 /// start, under the platform temp dir, read once at the run's exit.
 /// The project's test configuration for a language (the run gutter's
@@ -4624,6 +5373,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_toggle_terminal))
             .on_action(cx.listener(Self::on_new_terminal_tab))
             .on_action(cx.listener(Self::on_analyze_duplicates))
+            .on_action(cx.listener(Self::on_toggle_git))
             .on_action(cx.listener(Self::on_debug))
             .on_action(cx.listener(Self::on_debug_step_into))
             .on_action(cx.listener(Self::on_debug_step_over))
@@ -5057,6 +5807,7 @@ impl Workbench {
             "debug" => self.render_debug_body(cx),
             "services" => self.render_services_body(cx),
             "duplicates" => self.render_duplicates_body(cx),
+            "git" => Some(self.render_git_body(cx)),
             _ => None,
         }
     }
@@ -5707,9 +6458,12 @@ impl Workbench {
             .selected_index(match self.dock_page {
                 DockPage::Run(index) => index,
                 DockPage::Find => self.runs.len(),
-                DockPage::Problems | DockPage::Usages | DockPage::Terminal | DockPage::Debug | DockPage::Duplicates => {
-                    0
-                }
+                DockPage::Problems
+                | DockPage::Usages
+                | DockPage::Terminal
+                | DockPage::Debug
+                | DockPage::Duplicates
+                | DockPage::Git => 0,
             })
             .on_click(cx.listener(|this, index: &usize, _, cx| {
                 let runs = this.runs.len();
@@ -6526,6 +7280,7 @@ impl Workbench {
             "usages" => self.usages.is_some(),
             "terminal" => !self.terminals.is_empty(),
             "debug" => self.debug.is_some(),
+            "git" => self.git_window.is_some(),
             _ => self.win_state(desc).used,
         };
         if !has_content {

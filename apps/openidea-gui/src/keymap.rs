@@ -94,6 +94,8 @@ pub static BINDINGS: &[Binding] = &[
     // M11: the terminal window rides the preset's Alt+F12 row.
     binding!("alt-f12", "workbench::ToggleTerminal", None, Some("toolwindow.terminal")),
     binding!("ctrl-cmd-t", "workbench::NewTerminalTab", None, None),
+    // M13: the Git window (the preset's toolwindow.git slot).
+    binding!("cmd-9", "workbench::ToggleGit", None, Some("toolwindow.git")),
     // M12: Locate Duplicates (no IDEA preset row — the ⌃⌘T precedent for
     // app-added keys; ⌘⇧D is free in the preset and unambiguous on macOS,
     // where ⌥-modified letters arrive composed).
