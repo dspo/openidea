@@ -9,6 +9,7 @@
 mod actions;
 mod blame;
 mod bus;
+mod conflicts;
 mod debug;
 mod diff_view;
 mod duplicates;

@@ -195,3 +195,15 @@ pub const BRANCHES_PROTECTED: &str = "the checked-out branch cannot be deleted";
 // Blame (M13).
 pub const BLAME_FAILED: &str = "Blame failed";
 pub const BLAME_NOT_A_REPO: &str = "Annotate needs a git repository";
+
+// Conflicts (M13).
+pub const CONFLICT_STRIP: &str = "conflicts";
+pub const CONFLICT_PREV: &str = "\u{2039} Prev";
+pub const CONFLICT_NEXT: &str = "Next \u{203a}";
+pub const CONFLICT_YOURS: &str = "Accept Yours";
+pub const CONFLICT_THEIRS: &str = "Accept Theirs";
+pub const CONFLICT_RESOLVED: &str = "Mark Resolved";
+pub const CONFLICT_CONTINUE: &str = "Continue";
+pub const CONFLICT_ABORT: &str = "Abort";
+pub const CONFLICT_NO_MORE: &str = "No more conflicts in this file";
+pub const CONFLICT_APPLY_FAILED: &str = "Cannot apply the resolution";

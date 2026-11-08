@@ -443,6 +443,17 @@ impl Host {
         let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
         repo.rebase(onto)
     }
+
+    /// Continues (or aborts) the merge/rebase in progress.
+    pub fn git_continue_operation(&self) -> IdeResult<()> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        repo.continue_operation(&ide_core::CancellationToken::new(), &|_| {})
+    }
+
+    pub fn git_abort_operation(&self) -> IdeResult<()> {
+        let repo = self.repo.as_ref().ok_or_else(|| IdeError::not_found("the project is not a git repository"))?;
+        repo.abort_operation(&ide_core::CancellationToken::new(), &|_| {})
+    }
 }
 
 /// Stable per-project cache-directory name (FNV-1a of the root), the same

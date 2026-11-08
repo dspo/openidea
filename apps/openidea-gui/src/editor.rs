@@ -2307,6 +2307,22 @@ impl EditorPane {
         cx.notify();
     }
 
+    /// Moves the primary caret to the next (or previous) conflict block's
+    /// start marker; answers whether one was found (the caller surfaces the
+    /// "no more conflicts" face).
+    pub fn goto_conflict(&mut self, next: bool, cx: &mut gpui::Context<Self>) -> bool {
+        let blocks = crate::conflicts::parse(&self.buffer_text());
+        let line = self.cursor_pos().line;
+        let target = if next {
+            crate::conflicts::next_block(&blocks, line)
+        } else {
+            crate::conflicts::prev_block(&blocks, line)
+        };
+        let Some(index) = target else { return false };
+        self.jump_to_offset(Pos::new(blocks[index].start_line, 0), cx);
+        true
+    }
+
     /// The primary caret as an IDE position (0-based line, UTF-16 column —
     /// the IPC convention): the session record's shape (M8).
     pub fn cursor_pos(&self) -> Pos {
@@ -5107,6 +5123,24 @@ impl Render for EditorPane {
             )
             .on_action(cx.listener(|this, _: &acts::Cancel, window, cx| this.command(Command::Cancel, window, cx)))
             .on_action(cx.listener(|this, _: &acts::ToggleBreakpoint, _, cx| this.toggle_breakpoint(cx)))
+            .on_action(cx.listener(|this, _: &acts::NextConflict, _, cx| {
+                if !this.goto_conflict(true, cx) {
+                    this.host.sink.emit(ide_core::IdeEvent::Notify {
+                        level: ide_core::event::NotifyLevel::Info,
+                        title: crate::strings::CONFLICT_NO_MORE.to_owned(),
+                        body: None,
+                    });
+                }
+            }))
+            .on_action(cx.listener(|this, _: &acts::PrevConflict, _, cx| {
+                if !this.goto_conflict(false, cx) {
+                    this.host.sink.emit(ide_core::IdeEvent::Notify {
+                        level: ide_core::event::NotifyLevel::Info,
+                        title: crate::strings::CONFLICT_NO_MORE.to_owned(),
+                        body: None,
+                    });
+                }
+            }))
             .on_action(cx.listener(|this, _: &acts::BreakpointCondition, window, cx| {
                 this.start_breakpoint_condition(window, cx)
             }))

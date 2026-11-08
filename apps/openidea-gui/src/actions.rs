@@ -168,6 +168,11 @@ actions!(
         ParameterInfo,
         GotoImplementation,
         GotoTypeDeclaration,
+        // M13 conflicts: the block walk over the buffer's conflict markers
+        // (no preset rows; ⌘⌥↓ / ⌘⌥↑ are the app-added keys — ⌃⌥↓ is
+        // Mission Control territory on macOS).
+        NextConflict,
+        PrevConflict,
     ]
 );
 
@@ -216,6 +221,8 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("workbench::LastEditLocation", "Last Edit Location", "Navigate", "⌘⇧⌫"),
     action_info!("editor::GotoImplementation", "Go to Implementation(s)", "Navigate", "⌘⌥B"),
     action_info!("editor::GotoTypeDeclaration", "Go to Type Declaration", "Navigate", "⌘⇧B"),
+    action_info!("editor::NextConflict", "Next Conflict", "Git", "⌘⌥↓"),
+    action_info!("editor::PrevConflict", "Previous Conflict", "Git", "⌘⌥↑"),
     action_info!("workbench::SearchEverywhere", "Search Everywhere", "Navigate", "Double ⇧"),
     action_info!("workbench::FindInFiles", "Find in Files", "Edit", "⇧⌘F"),
     action_info!("workbench::Run", "Run…", "Run", "⌃R"),

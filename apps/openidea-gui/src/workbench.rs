@@ -285,6 +285,16 @@ struct GitWindowState {
     exhausted: bool,
 }
 
+/// The conflict strip's state (M13): the active tab's conflict blocks (the
+/// editor's buffer is the source; the parse rides the events that change
+/// it). `None` when the active file carries no markers.
+#[derive(Clone)]
+struct ConflictStrip {
+    doc: DocId,
+    path: PathBuf,
+    blocks: Vec<crate::conflicts::ConflictBlock>,
+}
+
 /// The branches popup (M13): the repository's branches with IDEA's minimal
 /// action set — checkout (the row click), create (the name input, ⏎),
 /// delete (two-step; the checked-out branch is protected), and the merge /
@@ -486,6 +496,8 @@ pub struct Workbench {
     branches_new_sub: Option<gpui::Subscription>,
     /// The merge/rebase operation in progress (M13: the status bar chip).
     git_operation: Option<String>,
+    /// The active tab's conflict blocks (M13's strip), `None` when clean.
+    conflicts: Option<ConflictStrip>,
     /// The message input's PressEnter subscription, alive while the overlay is.
     commit_sub: Option<gpui::Subscription>,
     /// The tree prompt overlay (M7 context menu: new file / folder, rename)
@@ -642,6 +654,7 @@ impl Workbench {
             branches_popup: None,
             branches_new_sub: None,
             git_operation: None,
+            conflicts: None,
             trust_prompt: pending_trust
                 .as_ref()
                 .map(|path| TrustPrompt { path: path.clone(), focus: cx.focus_handle() }),
@@ -862,6 +875,7 @@ impl Workbench {
         self.branches_popup = None;
         self.branches_new_sub = None;
         self.git_operation = None;
+        self.conflicts = None;
         self.closed_tabs.clear();
         // The usages answer belongs to the outgoing project; the Structure
         // window refetches for the (initially) empty active tab.
@@ -1808,6 +1822,189 @@ impl Workbench {
             self.git_load_branches(cx);
         }
         self.toggle_window("git", cx);
+    }
+
+    /// Re-parses the active tab's buffer for conflict markers (M13): the
+    /// strip's blocks follow the events that change the buffer (dirty,
+    /// backend patches, tab switches).
+    fn refresh_conflicts(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.active else {
+            self.conflicts = None;
+            return;
+        };
+        let (doc, path) = (self.tabs[index].doc, self.tabs[index].path.clone());
+        let text = self.tabs[index].pane.read(cx).buffer_text();
+        let blocks = crate::conflicts::parse(&text);
+        self.conflicts = (!blocks.is_empty()).then_some(ConflictStrip { doc, path, blocks });
+    }
+
+    /// The conflict strip (M13): the active tab's conflict count, the
+    /// marker walk, the ours/theirs application, and the operation's
+    /// continue/abort (the resolved files stage through git).
+    fn render_conflict_strip(&mut self, index: usize, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let strip = self.conflicts.as_ref()?;
+        if strip.doc != self.tabs[index].doc {
+            return None;
+        }
+        let workbench = cx.entity().downgrade();
+        let operation = self.git_operation.clone();
+        let count = strip.blocks.len();
+        let mut bar = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(theme::border())
+            .text_size(px(11.))
+            .child(
+                div()
+                    .text_color(theme::error())
+                    .child(SharedString::from(format!("{count} {}", strings::CONFLICT_STRIP))),
+            )
+            .when_some(operation.clone(), |bar, operation| {
+                bar.child(
+                    div().text_color(theme::warning()).child(SharedString::from(format!("{operation} in progress"))),
+                )
+            });
+        for (label, action) in [
+            (strings::CONFLICT_PREV, "prev"),
+            (strings::CONFLICT_NEXT, "next"),
+            (strings::CONFLICT_YOURS, "ours"),
+            (strings::CONFLICT_THEIRS, "theirs"),
+            (strings::CONFLICT_RESOLVED, "resolved"),
+        ] {
+            let workbench = workbench.clone();
+            bar = bar.child(
+                Button::new(SharedString::from(format!("conflict-{action}"))).label(label).xsmall().ghost().on_click(
+                    move |_, _, cx| {
+                        let workbench = workbench.clone();
+                        workbench.update(cx, |this, cx| this.conflict_action(action, cx)).ok();
+                    },
+                ),
+            );
+        }
+        if operation.is_some() {
+            for (label, action) in [(strings::CONFLICT_CONTINUE, "continue"), (strings::CONFLICT_ABORT, "abort")] {
+                let workbench = workbench.clone();
+                bar = bar.child(
+                    Button::new(SharedString::from(format!("conflict-{action}")))
+                        .label(label)
+                        .xsmall()
+                        .secondary()
+                        .on_click(move |_, _, cx| {
+                            let workbench = workbench.clone();
+                            workbench
+                                .update(cx, |this, cx| match action {
+                                    "continue" => this.git_run_op(
+                                        "merge --continue".to_owned(),
+                                        |host| {
+                                            host.git_continue_operation()?;
+                                            Ok(vec!["operation continued".to_owned()])
+                                        },
+                                        cx,
+                                    ),
+                                    _ => this.git_run_op(
+                                        "merge --abort".to_owned(),
+                                        |host| {
+                                            host.git_abort_operation()?;
+                                            Ok(vec!["operation aborted".to_owned()])
+                                        },
+                                        cx,
+                                    ),
+                                })
+                                .ok();
+                        }),
+                );
+            }
+        }
+        Some(bar.into_any_element())
+    }
+
+    /// One strip button: the walk (the pane's caret moves), the side
+    /// application (through the backend's workspace-edit funnel, so the
+    /// open tab reconciles via `DocPatched`), and the staging face.
+    fn conflict_action(&mut self, action: &str, cx: &mut Context<Self>) {
+        let Some(strip) = self.conflicts.clone() else { return };
+        let Some(index) = self.active else { return };
+        let tab = &self.tabs[index];
+        let pane = tab.pane.clone();
+        match action {
+            "prev" | "next" => {
+                let found = pane.update(cx, |pane, cx| pane.goto_conflict(action == "next", cx));
+                if !found {
+                    self.toast(NotifyLevel::Info, strings::CONFLICT_NO_MORE.to_owned());
+                }
+                cx.notify();
+            }
+            "ours" | "theirs" => {
+                let side = if action == "ours" { crate::conflicts::Side::Ours } else { crate::conflicts::Side::Theirs };
+                let text = pane.read(cx).buffer_text();
+                let caret_line = pane.read(cx).cursor_pos().line;
+                let blocks = &strip.blocks;
+                let index_of = crate::conflicts::block_containing(blocks, caret_line).or(if blocks.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                });
+                let Some(index_of) = index_of else {
+                    self.toast(NotifyLevel::Info, strings::CONFLICT_NO_MORE.to_owned());
+                    cx.notify();
+                    return;
+                };
+                let block = blocks[index_of].clone();
+                let new_text = crate::conflicts::apply_side(&text, &block, side);
+                let kept = match side {
+                    crate::conflicts::Side::Ours => block.ours.join("\n"),
+                    crate::conflicts::Side::Theirs => block.theirs.join("\n"),
+                };
+                let edit = ide_core::WorkspaceEdit {
+                    files: vec![ide_core::FileEdit::Edit {
+                        path: ide_core::IpcPath::from(strip.path.clone()),
+                        edits: vec![ide_core::TextEdit {
+                            range: ide_core::Range::new(
+                                ide_core::Pos::new(block.start_line, 0),
+                                ide_core::Pos::new(block.end_line, 0),
+                            ),
+                            new_text: kept,
+                        }],
+                        version: None,
+                    }],
+                    preconditions: Vec::new(),
+                };
+                let _ = new_text;
+                match self.host.as_ref().map(|host| host.apply_workspace_edit(&edit)) {
+                    Some(Ok(())) => {
+                        eprintln!("[conflict] applied {} at line {}", action, block.start_line + 1);
+                    }
+                    other => {
+                        let message = other.and_then(|r| r.err()).map_or("no project".to_owned(), |e| e.message);
+                        self.toast(NotifyLevel::Warning, format!("{}: {}", strings::CONFLICT_APPLY_FAILED, message));
+                    }
+                }
+                self.refresh_conflicts(cx);
+                cx.notify();
+            }
+            "resolved" => {
+                let Some(host) = self.host.clone() else { return };
+                let path = strip.path.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        let result = host.git_stage(std::slice::from_ref(&path));
+                        eprintln!(
+                            "[conflict] resolved (staged) {}: {}",
+                            path.display(),
+                            result.as_ref().map(|_| "ok").unwrap_or("failed")
+                        );
+                    })
+                    .detach();
+                self.refresh_git(cx);
+                self.refresh_conflicts(cx);
+                cx.notify();
+            }
+            _ => {}
+        }
     }
 
     /// ⌃⌘G / the status-bar branch click / the VCS menu: the branches popup.
@@ -4230,6 +4427,8 @@ impl Workbench {
         if index < self.tabs.len() {
             self.active = Some(index);
             self.save_session(cx);
+            // The conflict strip follows the newly active tab (M13).
+            self.refresh_conflicts(cx);
             self.focus_active(window, cx);
             cx.notify();
         }
@@ -4296,7 +4495,6 @@ impl Workbench {
         }
         // The inline blame tail (M13): seeded with the entries when the
         // setting is on (the face is IDEA's default; the load is background).
-        eprintln!("[blame] seed {} inline={}", path.display(), self.settings.inline_blame);
         if self.settings.inline_blame {
             let blame_path = path.to_path_buf();
             let blame_doc = doc_id;
@@ -4329,6 +4527,9 @@ impl Workbench {
         self.push_breakpoints(cx);
         self.refresh_test_marks(&path, cx);
         self.active = Some(self.tabs.len() - 1);
+        // The conflict strip follows the opened tab (M13; it reads the
+        // active tab, so it runs after the activation).
+        self.refresh_conflicts(cx);
         // Every open feeds the index's recency (the empty palette query lists
         // recent files) and the workbench's own ⌘E list.
         if let Some(host) = &self.host {
@@ -4445,6 +4646,9 @@ impl Workbench {
                 if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.doc == doc) {
                     tab.pane.update(cx, |pane, cx| pane.backend_patched(base_version, changes, cx));
                 }
+                if self.active.and_then(|index| self.tabs.get(index)).is_some_and(|tab| tab.doc == doc) {
+                    self.refresh_conflicts(cx);
+                }
                 cx.notify();
             }
             BusMessage::Ide(IdeEvent::DocDirty { doc, dirty }) => {
@@ -4453,6 +4657,9 @@ impl Workbench {
                     if !dirty {
                         tab.stale = false;
                     }
+                }
+                if self.active.and_then(|index| self.tabs.get(index)).is_some_and(|tab| tab.doc == doc) {
+                    self.refresh_conflicts(cx);
                 }
                 cx.notify();
             }
@@ -7739,6 +7946,7 @@ impl Workbench {
                 let pane = self.tabs[index].pane.clone();
                 let tab_bar = self.render_tab_bar(index, cx);
                 area.child(tab_bar)
+                    .children(self.render_conflict_strip(index, cx))
                     .child(div().flex_1().min_h_0().border_t_1().border_color(theme::border()).child(pane))
             }
             None => {

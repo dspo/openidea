@@ -106,6 +106,10 @@ pub static BINDINGS: &[Binding] = &[
     // (no preset row; ⌃⌘B app-added).
     binding!("ctrl-cmd-a", "workbench::Annotate", None, None),
     binding!("ctrl-cmd-b", "workbench::ToggleInlineBlame", None, None),
+    // M13 conflicts: the marker walk (app-added keys; ⌃⌥↓ is Mission
+    // Control on macOS, so the ⌘⌥ face).
+    binding!("alt-cmd-down", "editor::NextConflict", Some("Editor"), None),
+    binding!("alt-cmd-up", "editor::PrevConflict", Some("Editor"), None),
     // M12: Locate Duplicates (no IDEA preset row — the ⌃⌘T precedent for
     // app-added keys; ⌘⇧D is free in the preset and unambiguous on macOS,
     // where ⌥-modified letters arrive composed).
