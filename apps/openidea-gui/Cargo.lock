@@ -4186,7 +4186,7 @@ dependencies = [
 
 [[package]]
 name = "ide-analysis"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "ast-grep-core",
  "ide-core",
@@ -4200,7 +4200,7 @@ dependencies = [
 
 [[package]]
 name = "ide-core"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "dunce",
  "encoding_rs",
@@ -4216,7 +4216,7 @@ dependencies = [
 
 [[package]]
 name = "ide-extension"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -4235,7 +4235,7 @@ dependencies = [
 
 [[package]]
 name = "ide-index"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "blake3",
  "dunce",
@@ -4255,7 +4255,7 @@ dependencies = [
 
 [[package]]
 name = "ide-jsonrpc"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "encoding_rs",
  "futures",
@@ -4271,7 +4271,7 @@ dependencies = [
 
 [[package]]
 name = "ide-language"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "blake3",
  "ide-core",
@@ -4325,7 +4325,7 @@ dependencies = [
 
 [[package]]
 name = "ide-lsp"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "dunce",
  "futures",
@@ -4350,11 +4350,12 @@ dependencies = [
 
 [[package]]
 name = "ide-run"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "dunce",
  "encoding_rs",
  "ide-core",
+ "ide-language",
  "libc",
  "parking_lot",
  "portable-pty",
@@ -4371,7 +4372,7 @@ dependencies = [
 
 [[package]]
 name = "ide-search"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "globset",
  "grep-matcher",
@@ -4388,7 +4389,7 @@ dependencies = [
 
 [[package]]
 name = "ide-text"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "ide-core",
  "ropey 1.6.1",
@@ -4399,7 +4400,7 @@ dependencies = [
 
 [[package]]
 name = "ide-vcs"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "blake3",
  "dunce",
@@ -4420,7 +4421,7 @@ dependencies = [
 
 [[package]]
 name = "ide-vfs"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "chardetng",
  "dunce",
@@ -4431,16 +4432,18 @@ dependencies = [
  "ignore",
  "notify",
  "parking_lot",
+ "rustix",
  "serde",
  "specta",
  "tracing",
  "trash",
+ "windows-sys 0.61.2",
  "zip",
 ]
 
 [[package]]
 name = "ide-workspace"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "blake3",
  "dunce",
