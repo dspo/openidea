@@ -35,6 +35,7 @@ mod reconcile_data;
 mod run_panel;
 mod semantic;
 mod settings;
+mod status_bar;
 mod strings;
 mod templates;
 // The test-tree data plane (M12): lands before its UI face (the tree window

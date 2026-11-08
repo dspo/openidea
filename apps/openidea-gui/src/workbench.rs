@@ -24,7 +24,6 @@ use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
-use gpui_component::status_bar::StatusBar;
 use gpui_component::tab::{Tab as ComponentTab, TabBar};
 use gpui_component::{Icon, Selectable as _, Sizable as _};
 // The full Lucide catalog: the legacy gpui_component subset misses the
@@ -57,6 +56,7 @@ use crate::keymap;
 use crate::navigation;
 use crate::reconcile;
 use crate::run_panel::{self, RunPanel, stream_of};
+use crate::status_bar::{self, SaveState, StatusBarView, StatusServer, StatusTask};
 use crate::test_tree::{self, TestFilter};
 use crate::toolwindow::{self, Anchor, WindowDesc, WindowState};
 use crate::{ProjectHost, settings, strings, theme};
@@ -564,10 +564,11 @@ pub struct Workbench {
     /// The active tab's caret (M10's line:col widget), 0-based from the
     /// pane's CaretMoved reports.
     caret: Cell<(u32, u32)>,
-    /// The caret widget's notify throttle: a caret move only re-renders the
-    /// workbench at ~10/s (typing bursts otherwise re-render the whole
-    /// shell per keystroke — the debug budget's key_to_px felt it).
-    caret_notify: Cell<(std::time::Instant, bool)>,
+    /// The status bar as its own entity (M14a): caret / doc / diagnostics /
+    /// server events sync into it through [`Self::sync_status`], which
+    /// notifies only on a displayed change — typing no longer re-renders
+    /// this shell (the M10 debug-budget carry-over's structural fix).
+    status: Entity<StatusBarView>,
     /// The open floating context menu (M8): a right-click menu is
     /// element-scoped gpui-component state, invisible to the Esc chain —
     /// when anything steals its focus, Esc lands here as a bare Cancel and
@@ -605,6 +606,10 @@ impl Workbench {
         {
             eprintln!("[workbench] project open: {}", e.message);
         }
+        let status = {
+            let workbench = cx.entity().downgrade();
+            cx.new(|_| StatusBarView::new(workbench))
+        };
         Self {
             host,
             settings,
@@ -682,7 +687,7 @@ impl Workbench {
             structure_gen: 0,
             usages: None,
             caret: Cell::new((0, 0)),
-            caret_notify: Cell::new((std::time::Instant::now(), false)),
+            status,
             open_menu: None,
             menu_sub: None,
         }
@@ -1360,7 +1365,23 @@ impl Workbench {
 
     /// The stripe/header/⌘digit toggle: activate raises and marks used; a
     /// second press on the raised window hides it (IDEA's slot behavior).
-    fn toggle_window(&mut self, id: &str, cx: &mut Context<Self>) {
+    /// The Status Bar Widgets menu's show/hide map (M10), read by the
+    /// status-bar entity at render.
+    pub(crate) fn status_widget_shown(&self, id: &str) -> bool {
+        self.settings.status_widgets.get(id).copied().unwrap_or(true)
+    }
+
+    /// The Status Bar Widgets menu's toggle: flips the check, persists, and
+    /// notifies the shell (the status-bar entity re-renders through its own
+    /// next sync or its menu closure's notify).
+    pub(crate) fn toggle_status_widget(&mut self, id: &str, cx: &mut Context<Self>) {
+        let shown = self.settings.status_widgets.get(id).copied().unwrap_or(true);
+        self.settings.status_widgets.insert(id.to_owned(), !shown);
+        settings::save(&self.settings);
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_window(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(desc) = toolwindow::window(id) else { return };
         let state = self.win_state(desc);
         let raised = match state.anchor_of(desc) {
@@ -2648,7 +2669,7 @@ impl Workbench {
     /// ⌃⌘G (and the status-bar branch click, the VCS menu): the branches
     /// popup over the repository's local and remote branches. `arm_new`
     /// hands the name input the focus (the ⌘⌥N face).
-    fn open_branches_popup(&mut self, arm_new: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_branches_popup(&mut self, arm_new: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.host.as_ref().and_then(|host| host.repo.as_ref()).is_none() {
             self.toast(NotifyLevel::Warning, strings::GIT_NOT_A_REPO.to_owned());
             cx.notify();
@@ -4680,15 +4701,25 @@ impl Workbench {
             }
             BusMessage::Ide(IdeEvent::DocDirty { doc, dirty }) => {
                 if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.doc == doc) {
+                    // The tab dot paints only when a visible flag flips
+                    // (dirty set/cleared, stale reset by a save); typing
+                    // keeps them stable, so the shell re-render rides the
+                    // transition, not the keystroke (the status bar's save
+                    // face follows through sync_status).
+                    let changed = tab.dirty != dirty || (!dirty && tab.stale);
                     tab.dirty = dirty;
                     if !dirty {
                         tab.stale = false;
                     }
-                }
-                if self.active.and_then(|index| self.tabs.get(index)).is_some_and(|tab| tab.doc == doc) {
+                    if self.active.and_then(|index| self.tabs.get(index)).is_some_and(|tab| tab.doc == doc) {
+                        self.refresh_conflicts(cx);
+                    }
+                    if changed {
+                        cx.notify();
+                    }
+                } else if self.active.and_then(|index| self.tabs.get(index)).is_some_and(|tab| tab.doc == doc) {
                     self.refresh_conflicts(cx);
                 }
-                cx.notify();
             }
             BusMessage::Ide(IdeEvent::Notify { level, title, .. }) => {
                 self.toast(level, title);
@@ -4697,19 +4728,10 @@ impl Workbench {
             BusMessage::CaretMoved { doc, line, col_utf16 } => {
                 // Only the active tab's caret drives the status widget (a
                 // background pane's render would lie about "the" position).
+                // The pump's sync_status lands it on the status-bar entity —
+                // no shell render, no throttle needed.
                 if self.active.and_then(|index| self.tabs.get(index)).is_some_and(|tab| tab.doc == doc) {
                     self.caret.set((line, col_utf16));
-                    let (last, pending) = self.caret_notify.get();
-                    // 300 ms: typing also lands a DocDirty render per
-                    // keystroke, so a caret notify inside that window just
-                    // doubles the shell renders (the debug budget felt it).
-                    // Slower caret moves (arrows, clicks) pass at once.
-                    if last.elapsed() >= std::time::Duration::from_millis(300) {
-                        self.caret_notify.set((std::time::Instant::now(), false));
-                        cx.notify();
-                    } else if !pending {
-                        self.caret_notify.set((last, true));
-                    }
                 }
             }
             BusMessage::DebugUpdated => {
@@ -4768,7 +4790,11 @@ impl Workbench {
             }
             BusMessage::Ide(IdeEvent::Diagnostics { path, source, items }) => {
                 // One producer's full replacement for one file; the pane
-                // squiggles what it shows, so hand it the merged list.
+                // squiggles what it shows, so hand it the merged list. The
+                // shell re-render rides the counts (the badge, the Problems
+                // totals) or a visible Problems window — not every publish
+                // round (the status bar follows through sync_status).
+                let before = (self.error_count(), self.warning_count());
                 let mut by_source = self.diagnostics.remove(&path.0).unwrap_or_default();
                 if items.is_empty() {
                     by_source.remove(&source);
@@ -4783,13 +4809,16 @@ impl Workbench {
                     let merged = merged.clone().unwrap_or_default();
                     tab.pane.update(cx, |pane, cx| pane.set_diagnostics(merged, cx));
                 }
-                cx.notify();
+                let after = (self.error_count(), self.warning_count());
+                if before != after || self.dock_page == DockPage::Problems {
+                    cx.notify();
+                }
             }
             BusMessage::Ide(IdeEvent::LanguageServer { server, name, status, message }) => {
                 eprintln!("[lsp] {name} -> {status:?} {message:?}");
-                // The status line shows one row per server; a missing binary
-                // also surfaces as a message (its text carries the install
-                // hint; downloading is out of M3 scope).
+                // The status line shows one row per server (sync_status);
+                // a missing binary also surfaces as a message (its text
+                // carries the install hint; downloading is out of M3 scope).
                 if let Some(row) = self.servers.iter_mut().find(|row| row.id == server) {
                     row.status = status;
                     row.message = message.clone();
@@ -4802,11 +4831,9 @@ impl Workbench {
                         message.clone().unwrap_or_else(|| format!("{name} is not running")),
                     );
                 }
-                cx.notify();
             }
             BusMessage::Ide(IdeEvent::LanguageServerRemoved { server }) => {
                 self.servers.retain(|row| row.id != server);
-                cx.notify();
             }
             BusMessage::RunStarted { index, name, result } => {
                 match result {
@@ -5245,10 +5272,62 @@ impl Workbench {
                 if indexing != self.indexing.replace(indexing) {
                     eprintln!("[perf] indexing {}", if indexing { "on" } else { "off" });
                 }
-                cx.notify();
+                // The task rows paint in the status bar only (sync_status).
             }
             BusMessage::Ide(_) => {}
         }
+        self.sync_status(cx);
+    }
+
+    /// One bulk push of everything the status bar paints (M14a): the entity
+    /// diffs the tuple and notifies only on a displayed change, so the hot
+    /// keystroke paths (caret, dirty, diagnostics publishes) repaint that
+    /// small view instead of this shell. Runs at every pump and every shell
+    /// render, which together cover every mutation path.
+    fn sync_status(&mut self, cx: &mut Context<Self>) {
+        let project = match &self.host {
+            Some(host) => host.name.clone(),
+            None => strings::NO_PROJECT.to_owned(),
+        };
+        let (file, save) = match (&self.host, self.active) {
+            (Some(_), Some(index)) => {
+                let tab = &self.tabs[index];
+                let state = if tab.stale {
+                    SaveState::Stale
+                } else if tab.dirty {
+                    SaveState::Unsaved
+                } else {
+                    SaveState::Saved
+                };
+                (Some(file_name(&tab.path)), state)
+            }
+            _ => (None, SaveState::Saved),
+        };
+        let servers =
+            self.servers.iter().map(|row| StatusServer { name: row.name.clone(), status: row.status }).collect();
+        let tasks = self
+            .tasks
+            .iter()
+            .map(|(_, title, message, fraction)| StatusTask {
+                title: title.clone(),
+                message: message.clone(),
+                fraction: *fraction,
+            })
+            .collect();
+        let run = self.run_status(cx);
+        let pushed = status_bar::Pushed {
+            project,
+            file,
+            save,
+            caret: self.caret.get(),
+            errors: self.error_count(),
+            branch: self.git_branch.clone(),
+            operation: self.git_operation.clone(),
+            servers,
+            tasks,
+            run: run.map(|(text, color)| (text, gpui::Rgba::from(color))),
+        };
+        self.status.update(cx, |bar, cx| bar.sync(pushed, cx));
     }
 
     // -- file tree events -------------------------------------------------
@@ -6181,17 +6260,9 @@ impl Render for Workbench {
         }
         // The toast queue drains here (the window exists from now on).
         self.flush_toasts(window, cx);
-        // A throttled caret position flushes on the next render (the editor
-        // pane's own redraws do not re-render this shell; any other bus
-        // event or interaction does — the 100ms throttle just caps the
-        // worst-case re-render rate while typing).
-        {
-            let (_, pending) = self.caret_notify.get();
-            if pending {
-                self.caret_notify.set((std::time::Instant::now(), false));
-                cx.notify();
-            }
-        }
+        // The status bar's own entity: a keystroke's caret / dirty /
+        // diagnostics updates landed while this shell stayed cached.
+        self.sync_status(cx);
         // A bus message closed an overlay (the commit landed): focus returns
         // to the topmost live surface.
         if self.restore_focus_pending.replace(false) {
@@ -6336,7 +6407,7 @@ impl Render for Workbench {
                     .children(self.render_stripe(Anchor::Bottom, cx))
                     .children(self.render_bottom_area(cx))
             })
-            .child(self.render_status(cx))
+            .child(self.status.clone())
             .children(self.render_picker(cx))
             .children(self.render_diff(cx))
             .children(self.render_commit(cx))
@@ -8470,170 +8541,6 @@ impl Workbench {
             .hover(|bar| bar.bg(theme::accent()))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_dock_handle_down))
             .into_any_element()
-    }
-
-    // -- status bar ----------------------------------------------------------------
-
-    fn render_status(&self, cx: &Context<Self>) -> impl IntoElement {
-        let widget_state = self.settings.status_widgets.clone();
-        let shown = |id: &str| widget_state.get(id).copied().unwrap_or(true);
-        // The menu closure owns its own copy of the visibility map.
-        let menu_state = widget_state.clone();
-        let menu_shown = move |id: &str| menu_state.get(id).copied().unwrap_or(true);
-        let (project, file, state) = match (&self.host, self.active) {
-            (Some(host), Some(index)) => {
-                let tab = &self.tabs[index];
-                let state = if tab.stale {
-                    (strings::SAVE_STATE_STALE, theme::warning())
-                } else if tab.dirty {
-                    (strings::SAVE_STATE_UNSAVED, theme::accent())
-                } else {
-                    (strings::SAVE_STATE_SAVED, theme::fg_muted())
-                };
-                (host.name.clone(), Some(file_name(&tab.path)), state)
-            }
-            (Some(host), None) => (host.name.clone(), None, (strings::SAVE_STATE_SAVED, theme::fg_muted())),
-            (None, _) => (strings::NO_PROJECT.to_owned(), None, (strings::SAVE_STATE_SAVED, theme::fg_muted())),
-        };
-        let mut left = div().flex().items_center().gap_2().text_size(px(12.));
-        if shown("project") {
-            left = left.child(div().text_color(theme::fg_muted()).child(SharedString::from(project)));
-        }
-        if shown("branch")
-            && let Some(branch) = &self.git_branch
-        {
-            // The branches popup's IDEA entry: the widget itself is the
-            // click target (the branch label rides along).
-            left = left
-                .child(
-                    div().text_color(theme::fg_muted()).child(SharedString::from(strings::GIT_BRANCH_LABEL.to_owned())),
-                )
-                .child(
-                    div()
-                        .id("status-branch")
-                        .cursor_pointer()
-                        .hover(|widget| widget.text_color(theme::accent()))
-                        .on_click(
-                            cx.listener(|this, _: &ClickEvent, window, cx| this.open_branches_popup(false, window, cx)),
-                        )
-                        .child(div().text_color(theme::fg()).child(SharedString::from(branch.clone()))),
-                );
-        }
-        if let Some(operation) = &self.git_operation {
-            left = left.child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(theme::warning())
-                    .child(SharedString::from(format!("{operation} in progress"))),
-            );
-        }
-        if shown("position") {
-            let (line, col) = self.caret.get();
-            let position = format!("{}:{}", line + 1, col + 1);
-            left = left.child(
-                div()
-                    .text_color(theme::fg())
-                    .when_some(file, |widget, name| widget.child(SharedString::from(format!("{name} "))))
-                    .child(SharedString::from(position)),
-            );
-        } else if let Some(file) = file {
-            left = left.child(div().text_color(theme::fg()).child(SharedString::from(file)));
-        }
-        let mut right = div().flex().items_center().gap_3().text_size(px(12.));
-        // The Problems count (the F2 walker's set); a click opens the window.
-        if shown("problems") {
-            let errors = self.error_count();
-            let count = if errors == 0 { strings::NO_PROBLEMS_SHORT.to_owned() } else { format!("{errors}") };
-            right = right.child(
-                div()
-                    .id("status-problems")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_window("problems", cx)))
-                    .when(errors > 0, |widget| widget.text_color(theme::error()))
-                    .child(SharedString::from(count)),
-            );
-        }
-        if shown("encoding") {
-            right =
-                right.child(div().text_color(theme::fg_muted()).child(SharedString::from(strings::STATUS_ENCODING)));
-        }
-        if shown("linesep") {
-            right = right.child(div().text_color(theme::fg_muted()).child(SharedString::from(strings::STATUS_LINESEP)));
-        }
-        // The run indicator (running · elapsed, or the exit code), from the
-        // selected run tab (or the live one when the Find page shows).
-        if shown("run")
-            && let Some((text, color)) = self.run_status(cx)
-        {
-            right = right.child(div().truncate().text_color(color).child(SharedString::from(text)));
-        }
-        // Language-server rows: name + status, colored by health.
-        if shown("servers") {
-            for row in &self.servers {
-                let (text, color) = match row.status {
-                    ServerStatus::Ready | ServerStatus::Busy => (strings::LS_READY.to_owned(), theme::fg_muted()),
-                    ServerStatus::Starting => (strings::LS_STARTING.to_owned(), theme::warning()),
-                    ServerStatus::Missing | ServerStatus::Crashed | ServerStatus::Misconfigured => {
-                        (strings::LS_DOWN.to_owned(), theme::error())
-                    }
-                    ServerStatus::Stopped => (strings::LS_STOPPED.to_owned(), theme::fg_muted()),
-                };
-                right = right.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(div().text_color(theme::fg()).child(SharedString::from(row.name.clone())))
-                        .child(div().text_color(color).child(SharedString::from(text))),
-                );
-            }
-        }
-        // Live server tasks (indexing, package loads): the anti-"hang" face.
-        if shown("tasks") {
-            for (_, title, message, fraction) in &self.tasks {
-                let mut text = message.clone().unwrap_or_else(|| title.clone());
-                if let Some(fraction) = fraction {
-                    text = format!("{text} {}%", (fraction * 100.0).round() as u32);
-                }
-                right = right.child(div().text_color(theme::fg()).child(SharedString::from(title.clone()))).child(
-                    div().max_w(px(160.0)).truncate().text_color(theme::warning()).child(SharedString::from(text)),
-                );
-            }
-        }
-        right = right.child(div().text_color(state.1).child(SharedString::from(state.0)));
-        // The Status Bar Widgets menu (M10): the named widgets' show/hide
-        // checks, persisted. Untitled faces (save state) stay always on.
-        let widgets: [(&str, &str); 7] = [
-            ("project", strings::W_PROJECT),
-            ("branch", strings::W_BRANCH),
-            ("position", strings::W_POSITION),
-            ("problems", strings::W_PROBLEMS),
-            ("encoding", strings::W_ENCODING),
-            ("linesep", strings::W_LINESEP),
-            ("servers", strings::W_SERVERS),
-        ];
-        let workbench = cx.entity().downgrade();
-        div()
-            .relative()
-            .context_menu(move |menu, _, _| {
-                let mut menu = menu.label(SharedString::from(strings::STATUS_WIDGETS_MENU));
-                for (id, title) in widgets {
-                    let workbench = workbench.clone();
-                    let shown = menu_shown(id);
-                    menu = menu.item(PopupMenuItem::new(title).checked(shown).on_click(move |_, _, cx| {
-                        workbench
-                            .update(cx, |this, cx| {
-                                let shown = this.settings.status_widgets.get(id).copied().unwrap_or(true);
-                                this.settings.status_widgets.insert(id.to_owned(), !shown);
-                                settings::save(&this.settings);
-                                cx.notify();
-                            })
-                            .ok();
-                    }));
-                }
-                menu
-            })
-            .child(StatusBar::new().left(left).right(right))
     }
 }
 
