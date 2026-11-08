@@ -29,6 +29,15 @@ EXTRA_DONE = [
     "editor.cloneCaretAbove",
     "editor.cloneCaretBelow",
     "runAnything.show",  # completes the ⌃⌃ chord; the action itself toasts as not-yet-available
+    # M11 (terminal + debugger): the preset rows carry the app's own keys.
+    "terminal.new",  # ⌃⌘T new terminal tab
+    "debug.evaluate",  # the Debug console's evaluate face
+    # M12 (tests): the run gutter and the tree's rerun buttons carry no preset keys.
+    "run.runContext",  # the run gutter runs that one test
+    "run.rerun",  # the Run window's header / per-node rerun
+    # M13 (vcs): the app-added keys the M13 report documents.
+    "vcs.branches",  # ⌃⌘G branches popup, menu, status-bar widget
+    "vcs.annotate",  # ⌃⌘A blame swimlane
 ]
 
 # Real faces that landed late, described per row in the report; the roadmap's

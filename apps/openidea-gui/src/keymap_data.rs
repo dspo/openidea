@@ -24,6 +24,7 @@ pub struct Preset {
 pub static INTELLIJ_MACOS: Preset = Preset {
     name: "intellijMacos",
     rows: &[
+        PresetRow { action: "editor.addOrRemoveCaret", keys: &["Alt+Shift+Button1"] },
         PresetRow { action: "navigate.searchEverywhere", keys: &["Shift Shift"] },
         PresetRow { action: "navigate.gotoClass", keys: &["Meta+O"] },
         PresetRow { action: "navigate.gotoFile", keys: &["Meta+Shift+O"] },
@@ -35,8 +36,8 @@ pub static INTELLIJ_MACOS: Preset = Preset {
         PresetRow { action: "navigate.switcherBack", keys: &["Ctrl+Shift+Tab"] },
         PresetRow { action: "navigate.recentFiles", keys: &["Meta+E"] },
         PresetRow { action: "navigate.recentLocations", keys: &["Meta+Shift+E"] },
-        PresetRow { action: "navigate.back", keys: &["Meta+[", "Meta+Alt+Left", "Button4"] },
-        PresetRow { action: "navigate.forward", keys: &["Meta+]", "Meta+Alt+Right", "Button5"] },
+        PresetRow { action: "navigate.back", keys: &["Meta+[", "Meta+Alt+Left", "Button4", "SwipeRight"] },
+        PresetRow { action: "navigate.forward", keys: &["Meta+]", "Meta+Alt+Right", "Button5", "SwipeLeft"] },
         PresetRow { action: "navigate.gotoLine", keys: &["Meta+L"] },
         PresetRow { action: "navigate.declaration", keys: &["Meta+B"] },
         PresetRow { action: "navigate.implementation", keys: &["Meta+Alt+B", "Meta+Alt+Button1"] },
@@ -184,6 +185,7 @@ pub static INTELLIJ_MACOS: Preset = Preset {
         PresetRow { action: "refactor.pushMembersDown", keys: &[] },
         PresetRow { action: "file.save", keys: &["Meta+S"] },
         PresetRow { action: "file.settings", keys: &["Meta+,"] },
+        PresetRow { action: "file.projectStructure", keys: &["Meta+;"] },
         PresetRow { action: "file.openProject", keys: &["Meta+Shift+Alt+O"] },
         PresetRow { action: "file.newScratchFile", keys: &["Meta+Shift+N"] },
         PresetRow { action: "editor.closeTab", keys: &["Meta+W"] },
@@ -201,7 +203,8 @@ pub static INTELLIJ_MACOS: Preset = Preset {
         PresetRow { action: "window.next", keys: &["Meta+Alt+`"] },
         PresetRow { action: "window.previous", keys: &["Meta+Alt+Shift+`"] },
         PresetRow { action: "file.reloadFromDisk", keys: &["Meta+Alt+Y"] },
-        PresetRow { action: "editor.copyPath", keys: &["Meta+Shift+C"] },
+        PresetRow { action: "editor.copyPath", keys: &[] },
+        PresetRow { action: "editor.copyPathReference", keys: &["Meta+Shift+C"] },
         PresetRow { action: "project.newFile", keys: &["Meta+N"] },
         PresetRow { action: "project.newInThisDirectory", keys: &["Ctrl+Alt+N"] },
         PresetRow { action: "project.rename", keys: &["Shift+F6"] },
@@ -381,12 +384,15 @@ pub static INTELLIJ_MACOS: Preset = Preset {
         PresetRow { action: "find.openInWindow", keys: &["Alt+F7"] },
         PresetRow { action: "find.field.newLine", keys: &["Meta+Shift+Enter"] },
         PresetRow { action: "find.field.recentSearches", keys: &["Alt+Down"] },
+        PresetRow { action: "editor.pasteHistory.paste", keys: &["Enter"] },
+        PresetRow { action: "editor.pasteHistory.remove", keys: &["Delete", "Backspace"] },
     ],
 };
 
 pub static INTELLIJ_WINDOWS: Preset = Preset {
     name: "intellijWindows",
     rows: &[
+        PresetRow { action: "editor.addOrRemoveCaret", keys: &["Alt+Shift+Button1"] },
         PresetRow { action: "navigate.searchEverywhere", keys: &["Shift Shift"] },
         PresetRow { action: "navigate.gotoClass", keys: &["Ctrl+N"] },
         PresetRow { action: "navigate.gotoFile", keys: &["Ctrl+Shift+N"] },
@@ -547,6 +553,7 @@ pub static INTELLIJ_WINDOWS: Preset = Preset {
         PresetRow { action: "refactor.pushMembersDown", keys: &[] },
         PresetRow { action: "file.save", keys: &["Ctrl+S"] },
         PresetRow { action: "file.settings", keys: &["Ctrl+Alt+S"] },
+        PresetRow { action: "file.projectStructure", keys: &["Ctrl+Alt+Shift+S"] },
         PresetRow { action: "file.openProject", keys: &[] },
         PresetRow { action: "file.newScratchFile", keys: &["Ctrl+Alt+Shift+Insert"] },
         PresetRow { action: "editor.closeTab", keys: &["Ctrl+F4"] },
@@ -564,7 +571,8 @@ pub static INTELLIJ_WINDOWS: Preset = Preset {
         PresetRow { action: "window.next", keys: &["Ctrl+Alt+]"] },
         PresetRow { action: "window.previous", keys: &["Ctrl+Alt+["] },
         PresetRow { action: "file.reloadFromDisk", keys: &["Ctrl+Alt+Y"] },
-        PresetRow { action: "editor.copyPath", keys: &["Ctrl+Shift+C"] },
+        PresetRow { action: "editor.copyPath", keys: &[] },
+        PresetRow { action: "editor.copyPathReference", keys: &["Ctrl+Shift+C"] },
         PresetRow { action: "project.newFile", keys: &["Alt+Insert"] },
         PresetRow { action: "project.newInThisDirectory", keys: &["Ctrl+Alt+Insert"] },
         PresetRow { action: "project.rename", keys: &["Shift+F6"] },
@@ -744,12 +752,15 @@ pub static INTELLIJ_WINDOWS: Preset = Preset {
         PresetRow { action: "find.openInWindow", keys: &["Alt+F7"] },
         PresetRow { action: "find.field.newLine", keys: &["Ctrl+Shift+Enter"] },
         PresetRow { action: "find.field.recentSearches", keys: &["Alt+Down"] },
+        PresetRow { action: "editor.pasteHistory.paste", keys: &["Enter"] },
+        PresetRow { action: "editor.pasteHistory.remove", keys: &["Delete", "Backspace"] },
     ],
 };
 
 pub static VSCODE_MACOS: Preset = Preset {
     name: "vscodeMacos",
     rows: &[
+        PresetRow { action: "editor.addOrRemoveCaret", keys: &["Alt+Shift+Button1"] },
         PresetRow { action: "navigate.searchEverywhere", keys: &["Shift Shift"] },
         PresetRow { action: "navigate.gotoClass", keys: &[] },
         PresetRow { action: "navigate.gotoFile", keys: &["Meta+P"] },
@@ -760,8 +771,8 @@ pub static VSCODE_MACOS: Preset = Preset {
         PresetRow { action: "navigate.switcherBack", keys: &["Ctrl+Shift+Tab"] },
         PresetRow { action: "navigate.recentFiles", keys: &[] },
         PresetRow { action: "navigate.recentLocations", keys: &[] },
-        PresetRow { action: "navigate.back", keys: &["Ctrl+-", "Button4"] },
-        PresetRow { action: "navigate.forward", keys: &["Ctrl+Shift+-", "Button5"] },
+        PresetRow { action: "navigate.back", keys: &["Ctrl+-", "Button4", "SwipeRight"] },
+        PresetRow { action: "navigate.forward", keys: &["Ctrl+Shift+-", "Button5", "SwipeLeft"] },
         PresetRow { action: "navigate.gotoLine", keys: &["Ctrl+G"] },
         PresetRow { action: "navigate.declaration", keys: &["F12"] },
         PresetRow { action: "navigate.implementation", keys: &["Meta+F12"] },
@@ -918,6 +929,7 @@ pub static VSCODE_MACOS: Preset = Preset {
         PresetRow { action: "file.save", keys: &["Meta+S"] },
         PresetRow { action: "file.new", keys: &["Meta+N"] },
         PresetRow { action: "file.settings", keys: &["Meta+,"] },
+        PresetRow { action: "file.projectStructure", keys: &[] },
         PresetRow { action: "file.openProject", keys: &["Meta+O"] },
         PresetRow { action: "file.newScratchFile", keys: &[] },
         PresetRow { action: "editor.closeTab", keys: &["Meta+W"] },
@@ -1044,6 +1056,7 @@ pub static VSCODE_MACOS: Preset = Preset {
         PresetRow { action: "code.cyclicExpandWord", keys: &[] },
         PresetRow { action: "code.cyclicExpandWordBackward", keys: &[] },
         PresetRow { action: "editor.copyReference", keys: &[] },
+        PresetRow { action: "editor.copyPathReference", keys: &[] },
         PresetRow { action: "code.pasteAsPlainText", keys: &[] },
         PresetRow { action: "code.expressionTypeInfo", keys: &[] },
         PresetRow { action: "code.implementMethods", keys: &[] },
@@ -1109,6 +1122,8 @@ pub static VSCODE_MACOS: Preset = Preset {
         PresetRow { action: "find.openInWindow", keys: &["Alt+F7"] },
         PresetRow { action: "find.field.newLine", keys: &["Meta+Shift+Enter"] },
         PresetRow { action: "find.field.recentSearches", keys: &["Alt+Down"] },
+        PresetRow { action: "editor.pasteHistory.paste", keys: &["Enter"] },
+        PresetRow { action: "editor.pasteHistory.remove", keys: &["Delete", "Backspace"] },
     ],
 };
 
