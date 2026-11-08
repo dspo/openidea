@@ -351,6 +351,15 @@ impl Host {
         self.documents.apply_workspace_edit(edit)
     }
 
+    /// Captures `edit`'s preconditions (disk + dirty-buffer fingerprints) at
+    /// the moment the user is shown it — the rename preview. Without the
+    /// capture, Apply rejects files the server versioned but the editor never
+    /// opened (gopls cross-file renames) as stale: `apply_workspace_edit`
+    /// trusts preconditions precisely for those.
+    pub fn prepare_workspace_edit(&self, edit: &mut ide_core::WorkspaceEdit) -> IdeResult<()> {
+        self.documents.prepare_workspace_edit(edit)
+    }
+
     /// Best-effort graceful server shutdown (`shutdown` request + `exit`),
     /// spawned onto the runtime; peers are killed regardless at process end.
     pub fn shutdown_lsp(&self) {

@@ -927,6 +927,16 @@ impl Workbench {
     /// failure falls back to the plain save, so saving is never blocked by
     /// the organizer; one flow at a time, a second ⌘S on the same doc while
     /// one runs saves plainly.
+    /// The languages whose ecosystem organizes imports on save (M14a): Go's
+    /// gopls flow was the M6 seed; Python rides ruff's
+    /// `source.organizeImports.ruff` and the ts/js family rides tsserver's
+    /// `.ts` kinds (both reach the same funnel through the sub-kind
+    /// widening). Rust has no LSP organize import — its ecosystem face is
+    /// the explicit ⌘⌥L rustfmt.
+    fn organizes_imports_on_save(language: &str) -> bool {
+        matches!(language, "go" | "python" | "typescript" | "javascript")
+    }
+
     fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.active else { return };
         let Some(host) = self.host.clone() else { return };
@@ -943,7 +953,7 @@ impl Workbench {
             (tab.doc, tab.path.clone(), file_name(&tab.path))
         };
         let organizable = self.tabs[index].dirty
-            && host.languages.detect(&path, None).as_str() == "go"
+            && Self::organizes_imports_on_save(host.languages.detect(&path, None).as_str())
             && self.save_flow.get().is_none_or(|busy| busy != doc);
         if organizable {
             self.save_flow.set(Some(doc));

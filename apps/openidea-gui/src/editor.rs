@@ -2504,7 +2504,18 @@ impl EditorPane {
     fn rename_preview(&mut self, result: IdeResult<Renamed>, name: String, cx: &mut gpui::Context<Self>) {
         match result {
             Ok(renamed) if !renamed.edit.files.is_empty() => {
-                self.rename = Some(RenameFlow::Preview { edit: renamed.edit, name });
+                let mut edit = renamed.edit;
+                if let Err(e) = self.host.prepare_workspace_edit(&mut edit) {
+                    self.rename = None;
+                    self.host.sink.emit(ide_core::IdeEvent::Notify {
+                        level: ide_core::event::NotifyLevel::Error,
+                        title: format!("Rename failed: {}", e.message),
+                        body: None,
+                    });
+                    cx.notify();
+                    return;
+                }
+                self.rename = Some(RenameFlow::Preview { edit, name });
             }
             Ok(_) => {
                 self.rename = None;
