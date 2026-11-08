@@ -214,3 +214,6 @@ pub const CHANGELIST_NEW: &str = "New Changelist…";
 pub const CHANGELIST_DELETE: &str = "Delete Changelist";
 pub const CHANGELIST_ACTIVATE: &str = "Set Active";
 pub const CHANGELIST_NAME_PLACEHOLDER: &str = "Changelist name (⏎ creates)";
+
+// Find Usages window (M13).
+pub const USAGES_PREVIEW_EMPTY: &str = "Select a usage to preview its line";

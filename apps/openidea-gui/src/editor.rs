@@ -1122,6 +1122,9 @@ pub struct EditorPane {
     /// The queried symbol of an in-flight references request (M10): the
     /// Find Usages window's header shows it.
     usages_symbol: String,
+    /// ⌘⌥F7 (the preset's find.showUsages): even a single hit takes the
+    /// window (⌥F7 keeps the direct jump for one).
+    usages_force_window: bool,
     /// The caret position last reported to the status bar (M10's line:col
     /// widget): the render-time emission dedupes against it.
     reported_caret: Cell<(u32, u32)>,
@@ -1239,6 +1242,7 @@ impl EditorPane {
             completion_cancel: None,
             jump: None,
             usages_symbol: String::new(),
+            usages_force_window: false,
             reported_caret: Cell::new((u32::MAX, u32::MAX)),
             rename: None,
             code_actions: None,
@@ -2180,6 +2184,18 @@ impl EditorPane {
     pub fn find_usages(&mut self, cx: &mut gpui::Context<Self>) {
         // The queried symbol rides the answer to the Find Usages window (M10
         // routes multi-hit references there instead of the in-pane list).
+        self.usages_force_window = false;
+        self.request_references(cx);
+    }
+
+    /// ⌘⌥F7 (the preset's find.showUsages): the window opens even for a
+    /// single hit (⌥F7 keeps its direct jump).
+    pub fn show_usages(&mut self, cx: &mut gpui::Context<Self>) {
+        self.usages_force_window = true;
+        self.request_references(cx);
+    }
+
+    fn request_references(&mut self, cx: &mut gpui::Context<Self>) {
         self.usages_symbol = self.word_at_caret();
         self.request_locations(
             "references",
@@ -2254,8 +2270,9 @@ impl EditorPane {
         result: IdeResult<Vec<Location>>,
         cx: &mut gpui::Context<Self>,
     ) {
+        let to_window = std::mem::take(&mut self.usages_force_window);
         match result {
-            Ok(locations) if locations.len() == 1 => {
+            Ok(locations) if locations.len() == 1 && !to_window => {
                 if let Some(only) = locations.into_iter().next() {
                     self.jump_to(&only, cx);
                 }
@@ -2263,7 +2280,8 @@ impl EditorPane {
             Ok(locations) if !locations.is_empty() => {
                 if feature == "references" {
                     // M10: multi-hit references open the Find Usages tool
-                    // window (the pane's jump list keeps the goto flows).
+                    // window (the pane's jump list keeps the goto flows);
+                    // M13's ⌘⌥F7 sends single hits there too.
                     self.bus.send(BusMessage::UsagesFound {
                         path: self.path.clone(),
                         symbol: std::mem::take(&mut self.usages_symbol),
@@ -5123,6 +5141,7 @@ impl Render for EditorPane {
             )
             .on_action(cx.listener(|this, _: &acts::Cancel, window, cx| this.command(Command::Cancel, window, cx)))
             .on_action(cx.listener(|this, _: &acts::ToggleBreakpoint, _, cx| this.toggle_breakpoint(cx)))
+            .on_action(cx.listener(|this, _: &acts::ShowUsages, _, cx| this.show_usages(cx)))
             .on_action(cx.listener(|this, _: &acts::NextConflict, _, cx| {
                 if !this.goto_conflict(true, cx) {
                     this.host.sink.emit(ide_core::IdeEvent::Notify {

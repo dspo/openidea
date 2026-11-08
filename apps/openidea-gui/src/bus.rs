@@ -223,6 +223,12 @@ pub enum BusMessage {
         result: IdeResult<()>,
         output: Vec<String>,
     },
+    /// A usage row's preview line arrived (M13): the clicked row's text
+    /// (the dirty buffer wins over the disk).
+    UsagesPreview {
+        index: usize,
+        line: Option<String>,
+    },
     /// A file's blame finished (M13): the editor pane's swimlane/inline
     /// faces take the entries (routed by the document). `annotate` is the
     /// request's swimlane switch (the tab-open seed passes false — only the

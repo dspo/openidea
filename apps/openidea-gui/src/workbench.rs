@@ -373,6 +373,10 @@ struct UsagesAnswer {
     source: PathBuf,
     symbol: String,
     locations: Vec<ide_core::Location>,
+    /// The clicked row (the preview follows it).
+    selected: Option<usize>,
+    /// The selected row's line text (loaded behind a background read).
+    preview: Option<String>,
 }
 
 /// The Project trust prompt (M10): a directory outside the trusted list
@@ -4747,7 +4751,7 @@ impl Workbench {
             BusMessage::UsagesFound { path, symbol, locations } => {
                 // The references answer becomes the Find Usages window's
                 // rows; the dock opens on its page (IDEA's ⌥F7 face).
-                self.usages = Some(UsagesAnswer { source: path, symbol, locations });
+                self.usages = Some(UsagesAnswer { source: path, symbol, locations, selected: None, preview: None });
                 self.open_window("usages", cx);
             }
             BusMessage::OpenLocation { path, pos } => {
@@ -4878,6 +4882,14 @@ impl Workbench {
             }
             BusMessage::RunTestAt { doc, name, container, file_run } => {
                 self.run_test_at(doc, &name, container.as_deref(), file_run, cx);
+            }
+            BusMessage::UsagesPreview { index, line } => {
+                if let Some(answer) = &mut self.usages
+                    && answer.selected == Some(index)
+                {
+                    answer.preview = line;
+                    cx.notify();
+                }
             }
             BusMessage::GitLogPage { reset, result } => {
                 self.git_log_page(reset, result, cx);
@@ -5840,6 +5852,20 @@ fn git_log_query(state: &GitWindowState, active: Option<PathBuf>, skip: u32) -> 
         limit: GIT_LOG_PAGE,
         order: ide_vcs::LogOrder::Topo,
         ..Default::default()
+    }
+}
+
+/// The preview line's runs: the symbol's first occurrence highlighted (the
+/// find-match face), the rest in the muted text color.
+fn usage_line_runs(line: &str, symbol: &str) -> gpui::SharedString {
+    // The highlight rides gpui's rich text via two styled spans is more than
+    // this face needs: the line renders once with the match bracketed.
+    match line.find(symbol) {
+        Some(at) if !symbol.is_empty() => {
+            let end = (at + symbol.len()).min(line.len());
+            format!("{}[{}]{}", &line[..at], &line[at..end], &line[end..]).into()
+        }
+        _ => line.to_owned().into(),
     }
 }
 
@@ -7030,7 +7056,19 @@ impl Workbench {
     /// The Find Usages window's body: the last references answer.
     fn render_usages_body(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let answer = self.usages.as_ref()?;
-        let mut rows = Vec::new();
+        let symbol = answer.symbol.clone();
+        let selected = answer.selected;
+        // The results grouped by file (first-hit order): file header rows
+        // with their counts, the usage rows beneath.
+        let mut groups: Vec<(PathBuf, Vec<usize>)> = Vec::new();
+        for (index, location) in answer.locations.iter().enumerate() {
+            let path = location.path.0.clone();
+            match groups.last_mut() {
+                Some((last, members)) if *last == path => members.push(index),
+                _ => groups.push((path, vec![index])),
+            }
+        }
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
         rows.push(
             div()
                 .h(px(22.0))
@@ -7042,50 +7080,138 @@ impl Workbench {
                 .text_size(px(11.0))
                 .text_color(theme::fg_muted())
                 .child(SharedString::from(format!(
-                    "\"{}\" in {} — {} usages",
+                    "\"{}\" in {} — {} usages in {} files",
                     answer.symbol,
                     file_name(&answer.source),
-                    answer.locations.len()
+                    answer.locations.len(),
+                    groups.len()
                 )))
                 .into_any_element(),
         );
-        for location in &answer.locations {
-            let path = location.path.0.clone();
-            let jump_path = path.clone();
-            let start = location.range.start;
+        for (path, members) in &groups {
             rows.push(
                 div()
-                    .id(SharedString::from(format!("usage-row-{}-{}-{}", path.display(), start.line, start.col)))
-                    .h(px(24.0))
-                    .pr_2()
-                    .pl(px(20.0))
+                    .h(px(22.0))
+                    .px_2()
                     .flex()
                     .items_center()
                     .gap_1()
-                    .hover(|this| this.bg(theme::raised_bg()))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.push_nav(cx);
-                        this.open_path(&jump_path, cx);
-                        this.jump_active_to(start.line, start.col, cx);
-                        this.focus_active(window, cx);
-                    }))
-                    .child(div().truncate().text_color(theme::fg()).child(SharedString::from(file_name(&path))))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(11.0))
-                            .text_color(theme::fg_muted())
-                            .child(SharedString::from(format!(":{}", start.line + 1))),
-                    )
+                    .text_size(px(11.))
+                    .child(div().text_color(theme::fg()).child(SharedString::from(file_name(path))))
+                    .child(div().text_color(theme::fg_muted()).child(SharedString::from(format!("{}", members.len()))))
                     .into_any_element(),
             );
+            for index in members.iter().copied() {
+                let location = &answer.locations[index];
+                let path = location.path.0.clone();
+                let start = location.range.start;
+                let is_selected = selected == Some(index);
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("usage-row-{}-{}-{}", path.display(), start.line, start.col)))
+                        .h(px(24.0))
+                        .pr_2()
+                        .pl(px(36.0))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .when(is_selected, |row| row.bg(theme::selected_bg()))
+                        .hover(|row| row.bg(theme::raised_bg()))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.usage_selected(index, cx);
+                        }))
+                        .child(
+                            div()
+                                .w(px(44.0))
+                                .flex_none()
+                                .text_size(px(10.0))
+                                .text_color(theme::fg_muted())
+                                .child(SharedString::from(format!("{}:{}", start.line + 1, start.col + 1))),
+                        )
+                        .children(answer.preview.as_ref().filter(|_| is_selected).map(|line| {
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .font_family(theme::FONT_FAMILY)
+                                .text_size(px(11.0))
+                                .child(usage_line_runs(line, &symbol))
+                        }))
+                        .when(answer.preview.is_none() || !is_selected, |row| {
+                            row.child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_color(theme::fg_muted())
+                                    .child(SharedString::from(file_name(&path))),
+                            )
+                        })
+                        .into_any_element(),
+                );
+            }
         }
-        Some(div().id("window-scroll-usages").flex_1().min_h_0().overflow_y_scroll().children(rows).into_any_element())
+        // The preview pane (M13): the selected usage's line, the symbol
+        // bracketed (IDEA's preview face, stripped to one line).
+        let preview = div()
+            .h(px(64.0))
+            .flex_none()
+            .px_2()
+            .py_1()
+            .border_t_1()
+            .border_color(theme::border())
+            .font_family(theme::FONT_FAMILY)
+            .text_size(px(11.0))
+            .overflow_hidden()
+            .child(match (&answer.preview, &answer.selected) {
+                (Some(line), Some(_)) => div().truncate().child(usage_line_runs(line, &symbol)).into_any_element(),
+                _ => div()
+                    .text_color(theme::fg_muted())
+                    .child(SharedString::from(strings::USAGES_PREVIEW_EMPTY))
+                    .into_any_element(),
+            });
+        Some(
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(div().id("window-scroll-usages").flex_1().min_h_0().overflow_y_scroll().children(rows))
+                .child(preview)
+                .into_any_element(),
+        )
     }
 
-    // -- changelists (M13) -------------------------------------------------------
+    /// A usage row's click: the row selects (the preview follows it) and the
+    /// pane jumps to the hit (the M10 face, kept).
+    fn usage_selected(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(answer) = &mut self.usages else { return };
+        answer.selected = Some(index);
+        answer.preview = None;
+        let Some(location) = answer.locations.get(index).cloned() else { return };
+        let path = location.path.0.clone();
+        let line = location.range.start.line;
+        // The dirty buffer wins over the disk (the preview shows the edit).
+        let current = match self.tabs.iter().find(|tab| tab.path == path) {
+            Some(tab) if tab.dirty => Some(tab.pane.read(cx).buffer_text()),
+            _ => None,
+        };
+        let bus = self.bus.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let line_text = current
+                    .or_else(|| std::fs::read_to_string(&path).ok())
+                    .and_then(|text| text.lines().nth(line as usize).map(|l| l.to_string()));
+                bus.send(BusMessage::UsagesPreview { index, line: line_text });
+            })
+            .detach();
+        cx.notify();
+        self.push_nav(cx);
+        let jump_path = location.path.0.clone();
+        let start = location.range.start;
+        self.open_path(&jump_path, cx);
+        self.jump_active_to(start.line, start.col, cx);
+    }
 
-    /// Persists the changelist state (the single save face).
     fn changelists_persist(&mut self, cx: &mut Context<Self>) {
         if let Some(host) = self.host.as_ref()
             && let Err(e) = host.changelists_save(&self.changelists)

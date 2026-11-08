@@ -140,6 +140,7 @@ pub static BINDINGS: &[Binding] = &[
     binding!("cmd-b", "editor::GotoDefinition", Some("Editor"), Some("navigate.declaration")),
     binding!("shift-f6", "editor::Rename", Some("Editor"), Some("refactor.rename")),
     binding!("alt-f7", "editor::FindUsages", Some("Editor"), Some("find.usages")),
+    binding!("alt-cmd-f7", "editor::ShowUsages", Some("Editor"), Some("find.showUsages")),
     binding!("left", "editor::CursorLeft", Some("Editor"), None),
     binding!("right", "editor::CursorRight", Some("Editor"), None),
     binding!("up", "editor::CursorUp", Some("Editor"), None),

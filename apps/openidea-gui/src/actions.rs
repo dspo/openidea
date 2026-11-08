@@ -133,6 +133,9 @@ actions!(
         Paste,
         GotoDefinition,
         FindUsages,
+        // M13: ⌘⌥F7 (the preset's find.showUsages) — the window opens even
+        // for a single hit.
+        ShowUsages,
         Rename,
         CodeActions,
         FormatDocument,
@@ -251,6 +254,7 @@ pub const REGISTRY: &[ActionInfo] = &[
     action_info!("editor::TabIndent", "Indent / Expand Template", "Edit", "⇥"),
     action_info!("editor::OutdentLine", "Outdent Line", "Edit", "⇧⇥"),
     action_info!("editor::FindUsages", "Find Usages", "Navigate", "⌥F7"),
+    action_info!("editor::ShowUsages", "Show Usages", "Navigate", "⌘⌥F7"),
     action_info!("editor::Rename", "Rename…", "Refactor", "⇧F6"),
     action_info!("editor::CodeActions", "Quick Fix…", "Refactor", "⌥⏎"),
     action_info!("workbench::AnalyzeDuplicates", "Locate Duplicates…", "Code", "⌘⇧D"),
